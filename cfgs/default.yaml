@@ -4,11 +4,13 @@ device:                "cuda:0"
 eval:                  False # Render the optimized Image-GS representation
 render_height:         2048 # Image height for rendering (aspect ratio is maintained)
 # Bit precision
-quantize:              False # Enable bit precision control of Gaussian parameters
+quantize:              True # Enable bit precision control of Gaussian parameters
 pos_bits:              16 # Bit precision of individual coordinate dimension
 scale_bits:            16 # Bit precision of individual scale dimension
 rot_bits:              16 # Bit precision of Gaussian orientation angle
-feat_bits:             16 # Bit precision of individual feature dimension
+feat_bits:             16 # Bit precision of individual feature dimension (RGB mode, and single-channel images in YUV mode)
+y_bits:                16 # Bit precision of the Y feature dimension (YUV mode only)
+uv_bits:               16 # Bit precision of individual U and V feature dimensions (YUV mode only)
 # Logging
 log_root:              "results"
 exp_name:              "test/anime-1_2k" # Path to the logging directory
@@ -20,6 +22,7 @@ save_image_steps:      100000 # Frequency of rendering intermediate results duri
 save_ckpt_steps:       100000 # Frequency of checkpointing during optimization
 eval_steps:            100
 # Target images
+color_space:           "rgb" # Color space of Gaussian features and training losses, valid values include "yuv" and "rgb" (metrics and saved images are always RGB)
 gamma:                 1.0 # Optimize in a gamma-corrected space, modify with caution
 data_root:             "media"
 input_path:            "images/anime-1_2k.png" # Path to an image file or a directory containing a texture stack
@@ -57,3 +60,9 @@ initial_ratio:         0.5
 add_steps:             500
 add_times:             4
 post_min_steps:        3000
+# Pruning
+prune_ratio:           0.0 # Fraction of num_gaussians with the lowest score to prune once progressive optimization has added all Gaussians (the compression rate is based on the remaining Gaussians)
+prune_times:           1 # Number of pruning rounds, each removing an equal share
+prune_steps:           500 # Optimization steps before each pruning round
+prune_score:           "loo" # Ranking of Gaussians for pruning, valid values include "contribution" (total blending weight) and "loo" (leave-one-out increase of the L1 loss)
+relocate_ratio:        0.0 # Fraction of the Gaussians with the lowest score to replace at each densification step by additional error-guided Gaussians (keeps the number of Gaussians unchanged)

@@ -15,10 +15,14 @@ from pytorch_msssim import MS_SSIM
 from torchvision.transforms.functional import gaussian_blur
 
 from gsplat import (
+    bin_and_sort_gaussians,
+    compute_cumulative_intersects,
     project_gaussians_2d_scale_rot,
     rasterize_gaussians_no_tiles,
     rasterize_gaussians_sum,
 )
+from gsplat.cuda import nd_rasterize_forward_topk_norm
+from utils.color_utils import get_color_transforms, get_yuv_channel_indices, transform_images
 from utils.flip import LDRFLIPLoss
 from utils.image_utils import (
     compute_image_gradients,
@@ -50,6 +54,7 @@ class GaussianSplatting2D(nn.Module):
         self.dtype = torch.float32
         self._init_logging(args)
         self._init_target(args)
+        self._init_color_space(args)
         self._init_bit_precision(args)
         self._init_gaussians(args)
         self._init_loss(args)
@@ -135,12 +140,49 @@ class GaussianSplatting2D(nn.Module):
             suffix = "" if len(images_sep) == 1 else f"_{idx:d}"
             save_image(image, f"{path}{suffix}.{self.save_image_format}", gamma=self.gamma)
 
+    def _init_color_space(self, args):
+        self.color_space = args.color_space
+        if self.color_space not in ["rgb", "yuv"]:
+            raise ValueError(f"Unsupported color space '{self.color_space}', valid values include 'rgb' and 'yuv'")
+        if self.color_space == "yuv":
+            self.rgb_to_yuv, self.yuv_to_rgb = get_color_transforms(self.input_channels, dtype=self.dtype, device=self.device)
+            self.y_channels, self.uv_channels, self.other_channels = get_yuv_channel_indices(self.input_channels, device=self.device)
+        # Optimization target in the color space of the Gaussian features
+        self.target_images = self._from_rgb(self.gt_images)
+
+    def _from_rgb(self, images):
+        return transform_images(images, self.rgb_to_yuv) if self.color_space == "yuv" else images
+
+    def _to_rgb(self, images):
+        return transform_images(images, self.yuv_to_rgb) if self.color_space == "yuv" else images
+
     def _init_bit_precision(self, args):
         self.quantize = args.quantize
         self.pos_bits = args.pos_bits
         self.scale_bits = args.scale_bits
         self.rot_bits = args.rot_bits
         self.feat_bits = args.feat_bits
+        self.y_bits = args.y_bits
+        self.uv_bits = args.uv_bits
+
+    def _get_feat_bit_groups(self):
+        """
+        (channel indices, bit precision) of each separately quantized group of feature channels.
+        In YUV mode, single-channel images are not converted and keep using feat_bits.
+        """
+        if self.color_space != "yuv":
+            return [(None, self.feat_bits)]
+        groups = [(self.y_channels, self.y_bits), (self.uv_channels, self.uv_bits), (self.other_channels, self.feat_bits)]
+        return [(channels, bits) for channels, bits in groups if len(channels) > 0]
+
+    def _quantize_feat(self, feat):
+        groups = self._get_feat_bit_groups()
+        if groups[0][0] is None:
+            return ste_quantize(feat, groups[0][1])
+        q_feat = feat.clone()
+        for channels, bits in groups:
+            q_feat[:, channels] = ste_quantize(feat[:, channels], bits)
+        return q_feat
 
     def _init_gaussians(self, args):
         self.num_gaussians = args.num_gaussians
@@ -156,6 +198,7 @@ class GaussianSplatting2D(nn.Module):
             if args.max_steps < min_steps:
                 self.worklog.info(f"Max steps ({args.max_steps:d}) is too small for progressive optimization. Resetting to {min_steps:d}")
                 args.max_steps = min_steps
+        self._init_pruning(args)
         self.topk = args.topk  # Warning: Must match hardcoded value in CUDA kernel, modify with caution
         self.eps = 1e-7 if args.disable_tiles else 1e-4  # Warning: Must match hardcoded value in CUDA kernel, modify with caution
         self.init_scale = args.init_scale
@@ -170,6 +213,44 @@ class GaussianSplatting2D(nn.Module):
         self.vis_feat = nn.Parameter(torch.rand_like(self.feat), requires_grad=False)  # Only used for Gaussian ID visualization
         self._log_compression_rate()
 
+    def _init_pruning(self, args):
+        if not 0.0 <= args.prune_ratio < 1.0:
+            raise ValueError(f"Pruning ratio must be in [0, 1) but got: {args.prune_ratio}")
+        if not 0.0 <= args.relocate_ratio < 1.0:
+            raise ValueError(f"Relocation ratio must be in [0, 1) but got: {args.relocate_ratio}")
+        self.num_prune = round(args.prune_ratio * self.total_num_gaussians)
+        self.final_num_gaussians = self.total_num_gaussians - self.num_prune
+        self.num_pruned = 0
+        self.relocate_ratio = args.relocate_ratio
+        if self.evaluate:
+            self.num_gaussians = self.final_num_gaussians  # Checkpoints only contain the Gaussians that survived pruning
+            return
+        if self.relocate_ratio > 0.0 and self.disable_prog_optim:
+            raise ValueError("Relocation happens at densification steps and requires progressive optimization")
+        if self.num_prune > 0 or self.relocate_ratio > 0.0:
+            self.prune_score = args.prune_score
+            if self.prune_score not in ["contribution", "loo"]:
+                raise ValueError(f"Unsupported pruning score '{self.prune_score}', valid values include 'contribution' and 'loo'")
+            if self.prune_score == "loo" and (args.disable_tiles or args.disable_topk_norm):
+                raise ValueError("Pruning score 'loo' requires tile-based rendering with top-K normalization")
+        if self.num_prune > 0:
+            if args.prune_times < 1:
+                raise ValueError(f"Number of pruning rounds must be positive but got: {args.prune_times:d}")
+            self.prune_steps = args.prune_steps
+            self.max_prune_num = math.ceil(float(self.num_prune) / args.prune_times)
+            # Pruning starts once progressive optimization has added all Gaussians
+            self.prune_start_step = 0 if self.disable_prog_optim else self.add_steps * self.add_times
+            min_steps = self.prune_start_step + self.prune_steps * args.prune_times + args.post_min_steps
+            if args.max_steps < min_steps:
+                self.worklog.info(f"Max steps ({args.max_steps:d}) is too small for pruning. Resetting to {min_steps:d}")
+                args.max_steps = min_steps
+
+    def _is_final_num_gaussians(self):
+        """
+        Whether progressive optimization and pruning have both finished.
+        """
+        return self.num_pruned == self.num_prune and self.num_gaussians == self.final_num_gaussians
+
     def _log_compression_rate(self):
         bytes_uncompressed = 0.0
         curr_channel = 0
@@ -181,7 +262,8 @@ class GaussianSplatting2D(nn.Module):
             bpp_uncompressed += float(num_channels) * bit_depth
         bppc_uncompressed = bpp_uncompressed / self.feat_dim
         self.worklog.info(f"Uncompressed: {bytes_uncompressed/1e3:.2f} KB | {bpp_uncompressed:.3f} bpp | {bppc_uncompressed:.3f} bppc")
-        bits_compressed = (2*self.pos_bits + 2*self.scale_bits + self.rot_bits + self.feat_dim*self.feat_bits) * self.total_num_gaussians
+        feat_bits = sum((self.feat_dim if channels is None else len(channels)) * bits for channels, bits in self._get_feat_bit_groups())
+        bits_compressed = (2*self.pos_bits + 2*self.scale_bits + self.rot_bits + feat_bits) * self.final_num_gaussians
         bytes_compressed = bits_compressed / 8.0
         bpp_compressed = float(bits_compressed) / self.num_pixels
         bppc_compressed = bpp_compressed / self.feat_dim
@@ -264,8 +346,8 @@ class GaussianSplatting2D(nn.Module):
 
     def _get_target_features(self, positions):
         with torch.no_grad():
-            # gt_images [1, C, H, W]; positions [1, 1, P, 2]; top-left [-1, -1]; bottom-right [1, 1]
-            target_features = F.grid_sample(self.gt_images.unsqueeze(0), positions[None, None, ...] * 2.0 - 1.0, align_corners=False)
+            # target_images [1, C, H, W]; positions [1, 1, P, 2]; top-left [-1, -1]; bottom-right [1, 1]
+            target_features = F.grid_sample(self.target_images.unsqueeze(0), positions[None, None, ...] * 2.0 - 1.0, align_corners=False)
             target_features = target_features[0, :, 0, :].permute(1, 0)  # [P, C]
         return target_features
 
@@ -278,6 +360,9 @@ class GaussianSplatting2D(nn.Module):
                 raise FileNotFoundError(f"No checkpoint found in '{self.ckpt_dir}'")
             ckpt_path = os.path.join(self.ckpt_dir, f"ckpt_step-{latest_step:d}.pt")
         checkpoint = torch.load(ckpt_path, weights_only=False)
+        ckpt_color_space = checkpoint.get("color_space", "rgb")  # Checkpoints without this field were trained in RGB
+        if ckpt_color_space != self.color_space:
+            raise ValueError(f"Checkpoint was trained in '{ckpt_color_space}' but color_space is '{self.color_space}'")
         self.load_state_dict(checkpoint['state_dict'])
         self.optimizer.load_state_dict(checkpoint['optim_state_dict'])
         self.start_step = checkpoint["step"]+1
@@ -297,6 +382,7 @@ class GaussianSplatting2D(nn.Module):
                      "msssim": self.msssim_final,
                      "bytes": self.num_bytes,
                      "time": self.total_time_accum,
+                     "color_space": self.color_space,
                      "state_dict": self.state_dict(),
                      "optim_state_dict": self.optimizer.state_dict()}
         save_path = f"{self.ckpt_dir}/ckpt_step-{self.step:d}.pt"
@@ -311,7 +397,7 @@ class GaussianSplatting2D(nn.Module):
             self.xy.copy_(ste_quantize(self.xy, self.pos_bits))
             self.scale.copy_(ste_quantize(self.scale, self.scale_bits))
             self.rot.copy_(ste_quantize(self.rot, self.rot_bits))
-            self.feat.copy_(ste_quantize(self.feat, self.feat_bits))
+            self.feat.copy_(self._quantize_feat(self.feat))
 
     def render(self, render_height=None):
         img_h, img_w = self.img_h, self.img_w
@@ -324,6 +410,7 @@ class GaussianSplatting2D(nn.Module):
             for _ in range(num_prep_runs):
                 self.forward(img_h, img_w, tile_bounds, upsample_ratio, benchmark=True)
             images, render_time = self.forward(img_h, img_w, tile_bounds, upsample_ratio)
+            images = self._to_rgb(images)
             path = f"{self.eval_dir}/render_upsample-{upsample_ratio:.1f}_res-{img_h:d}x{img_w:d}"
             self._separate_and_save_images(images=images, channels=self.input_channels, path=path)
         self.worklog.info(f"Step: {self.start_step-1:d} | Time: {render_time:.6f} s")
@@ -351,7 +438,7 @@ class GaussianSplatting2D(nn.Module):
         xy, rot, feat = self.xy, self.rot, self.feat
         if self.quantize:
             xy, scale, rot, feat = ste_quantize(xy, self.pos_bits), ste_quantize(
-                scale, self.scale_bits), ste_quantize(rot, self.rot_bits), ste_quantize(feat, self.feat_bits)
+                scale, self.scale_bits), ste_quantize(rot, self.rot_bits), self._quantize_feat(feat)
         begin = perf_counter()
         tmp = project_gaussians_2d_scale_rot(xy, scale, rot, img_h, img_w, tile_bounds)
         xy, radii, conics, num_tiles_hit = tmp
@@ -377,12 +464,17 @@ class GaussianSplatting2D(nn.Module):
         return scale
 
     def _visualize_gaussian_id(self, img_h, img_w, tile_bounds, upsample_ratio=None):
+        feat = self._quantize_feat(self.feat) if self.quantize else self.feat
+        return self._render_features(self.vis_feat * feat.norm(dim=-1, keepdim=True), img_h, img_w, tile_bounds, upsample_ratio)
+
+    def _render_features(self, feat, img_h, img_w, tile_bounds, upsample_ratio=None):
+        """
+        Render arbitrary per-Gaussian features [P, C] with the current Gaussian geometry.
+        """
         scale = self._get_scale(upsample_ratio=upsample_ratio)
-        xy, rot, feat = self.xy, self.rot, self.feat
+        xy, rot = self.xy, self.rot
         if self.quantize:
-            xy, scale, rot, feat = ste_quantize(xy, self.pos_bits), ste_quantize(
-                scale, self.scale_bits), ste_quantize(rot, self.rot_bits), ste_quantize(feat, self.feat_bits)
-        feat = self.vis_feat * feat.norm(dim=-1, keepdim=True)
+            xy, scale, rot = ste_quantize(xy, self.pos_bits), ste_quantize(scale, self.scale_bits), ste_quantize(rot, self.rot_bits)
         tmp = project_gaussians_2d_scale_rot(xy, scale, rot, img_h, img_w, tile_bounds)
         xy, radii, conics, num_tiles_hit = tmp
         if not self.disable_tiles:
@@ -392,7 +484,7 @@ class GaussianSplatting2D(nn.Module):
         else:
             tmp = xy, conics, feat, img_h, img_w
             out_image = rasterize_gaussians_no_tiles(*tmp)
-        out_image = out_image.view(-1, img_h, img_w, self.feat_dim).permute(0, 3, 1, 2).contiguous()
+        out_image = out_image.view(-1, img_h, img_w, feat.shape[-1]).permute(0, 3, 1, 2).contiguous()
         return out_image.squeeze(dim=0)
 
     def optimize(self):
@@ -422,14 +514,22 @@ class GaussianSplatting2D(nn.Module):
             with torch.no_grad():
                 if self.step % self.eval_steps == 0:
                     self._evaluate(log=True, upsample=False)
-                    if not self.disable_lr_schedule and self.num_gaussians == self.total_num_gaussians:
+                    if not self.disable_lr_schedule and self._is_final_num_gaussians():
                         terminate = self._lr_schedule()
                 if self.step % self.save_image_steps == 0:
                     self._log_images(log_final=False, plot_gaussians=self.vis_gaussians)
-                if self.step % self.save_ckpt_steps == 0 and self.num_gaussians == self.total_num_gaussians:
+                if self.step % self.save_ckpt_steps == 0 and self._is_final_num_gaussians():
                     self._save_model()
-                if not self.disable_prog_optim and self.step % self.add_steps == 0 and self.num_gaussians < self.total_num_gaussians:
-                    self._add_gaussians(self.max_add_num, plot_gaussians=self.vis_gaussians)
+                # Pruned Gaussians are not added back
+                if not self.disable_prog_optim and self.step % self.add_steps == 0 and self.num_gaussians + self.num_pruned < self.total_num_gaussians:
+                    # Relocation: replace the Gaussians with the lowest score by additional error-guided Gaussians
+                    relocate_num = round(self.relocate_ratio * self.num_gaussians)
+                    if relocate_num > 0:
+                        self._remove_gaussians(relocate_num, action="Relocating", plot_gaussians=self.vis_gaussians)
+                    self._add_gaussians(self.max_add_num + relocate_num, plot_gaussians=self.vis_gaussians)
+                if (self.num_pruned < self.num_prune and self.step > self.prune_start_step
+                        and (self.step - self.prune_start_step) % self.prune_steps == 0):
+                    self._prune_gaussians(self.max_prune_num, plot_gaussians=self.vis_gaussians)
                 if terminate:
                     break
         with torch.no_grad():
@@ -444,17 +544,17 @@ class GaussianSplatting2D(nn.Module):
     def _get_total_loss(self, images):
         self.total_loss = 0
         if self.l1_loss_ratio > 1e-7:
-            self.l1_loss = self.l1_loss_ratio * F.l1_loss(images, self.gt_images)
+            self.l1_loss = self.l1_loss_ratio * F.l1_loss(images, self.target_images)
             self.total_loss += self.l1_loss
         else:
             self.l1_loss = None
         if self.l2_loss_ratio > 1e-7:
-            self.l2_loss = self.l2_loss_ratio * F.mse_loss(images, self.gt_images)
+            self.l2_loss = self.l2_loss_ratio * F.mse_loss(images, self.target_images)
             self.total_loss += self.l2_loss
         else:
             self.l2_loss = None
         if self.ssim_loss_ratio > 1e-7:
-            self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), self.gt_images.unsqueeze(0)))
+            self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), self.target_images.unsqueeze(0)))
             self.total_loss += self.ssim_loss
         else:
             self.ssim_loss = None
@@ -519,11 +619,14 @@ class GaussianSplatting2D(nn.Module):
             self._separate_and_save_images(images=images, channels=self.input_channels, path=path)
 
     def _render_images(self, upsample=False):
+        """
+        Render images in RGB, regardless of the color space of the Gaussian features.
+        """
         if upsample:
             images, _ = self.forward(self.img_h_upsampled, self.img_w_upsampled, self.tile_bounds_upsampled, upsample_ratio=self.downsample_ratio)
         else:
             images, _ = self.forward(self.img_h, self.img_w, self.tile_bounds)
-        return images
+        return self._to_rgb(images)
 
     def _lr_schedule(self):
         if (self.psnr_curr <= self.best_psnr + 100*self.decay_threshold or self.ssim_curr <= self.best_ssim + self.decay_threshold):
@@ -545,7 +648,7 @@ class GaussianSplatting2D(nn.Module):
             return False
 
     def _add_gaussians(self, add_num, plot_gaussians=False):
-        add_num = min(add_num, self.max_add_num, self.total_num_gaussians-self.num_gaussians)
+        add_num = min(add_num, self.total_num_gaussians-self.num_gaussians)
         if add_num <= 0:
             return
         raw_images = self._render_images(upsample=False)
@@ -566,7 +669,7 @@ class GaussianSplatting2D(nn.Module):
         init_scale = self.init_scale
         new_scale.fill_(init_scale if self.disable_inverse_scale else 1.0/init_scale)
         new_rot = torch.zeros(add_num, 1, dtype=self.dtype, device=self.device)
-        new_feat = diff_map.permute(1, 2, 0).reshape(-1, self.feat_dim)[selected]
+        new_feat = self._from_rgb(diff_map).permute(1, 2, 0).reshape(-1, self.feat_dim)[selected]
         new_vis_feat = torch.rand_like(new_feat)
         # Old Gaussians
         old_xy = self.xy.detach().clone()
@@ -599,4 +702,98 @@ class GaussianSplatting2D(nn.Module):
                                            {'params': self.rot, 'lr': self.rot_lr},
                                            {'params': self.feat, 'lr': self.feat_lr}])
         self.worklog.info(f"Step: {self.step:d} | Adding {add_num:d} Gaussians ({self.num_gaussians-add_num:d} -> {self.num_gaussians:d})")
+        self.worklog.info("***********************************************")
+
+    def _get_contribution(self):
+        """
+        Contribution of each Gaussian to the rendered image, measured as its total blending weight summed over all pixels.
+        Rendered images are linear in the features, so these weights are the gradients of the image sum w.r.t. all-one features.
+        """
+        ones = torch.ones(self.num_gaussians, 1, dtype=self.dtype, device=self.device, requires_grad=True)
+        with torch.enable_grad():
+            images = self._render_features(ones, self.img_h, self.img_w, self.tile_bounds)
+            contribution, = torch.autograd.grad(images.sum(), ones)
+        return contribution.squeeze(dim=-1)
+
+    def _get_loo_loss_increase(self, chunk_size=2**18):
+        """
+        Increase of the L1 loss when removing each Gaussian on its own (leave-one-out), computed from a single rendering pass.
+        Removing Gaussian k from the top-K list of a pixel changes its value from S_f / (S_w + eps) to (S_f - w_k f_k) / (S_w - w_k + eps),
+        where S_w and S_f are the sums of the top-K weights and weighted features. Ignores the Gaussian that would move into the top-K list.
+        """
+        scale = self._get_scale()
+        xy, rot, feat = self.xy, self.rot, self.feat
+        if self.quantize:
+            xy, scale, rot, feat = ste_quantize(xy, self.pos_bits), ste_quantize(
+                scale, self.scale_bits), ste_quantize(rot, self.rot_bits), self._quantize_feat(feat)
+        xy, radii, conics, num_tiles_hit = project_gaussians_2d_scale_rot(xy, scale, rot, self.img_h, self.img_w, self.tile_bounds)
+        num_intersects, cum_tiles_hit = compute_cumulative_intersects(num_tiles_hit)
+        _, _, _, gaussian_ids_sorted, tile_bins = bin_and_sort_gaussians(
+            self.num_gaussians, num_intersects, xy, radii, cum_tiles_hit, self.tile_bounds)
+        _, pixel_topk = nd_rasterize_forward_topk_norm(self.tile_bounds, (self.block_w, self.block_h, 1), (self.img_w, self.img_h, 1),
+                                                       gaussian_ids_sorted, tile_bins, xy.contiguous(), conics.contiguous(), feat.contiguous())
+        pixel_topk = pixel_topk.view(-1, self.topk).long()  # [H*W, K], -1 for empty entries
+        rows, cols = torch.meshgrid(torch.arange(self.img_h, device=self.device), torch.arange(self.img_w, device=self.device), indexing="ij")
+        pixels = torch.stack([cols, rows], dim=-1).reshape(-1, 1, 2).to(self.dtype)  # Pixel coordinates used by the rasterizer
+        targets = self.target_images.permute(1, 2, 0).reshape(-1, self.feat_dim)
+        loss_increase = torch.zeros(self.num_gaussians, dtype=self.dtype, device=self.device)
+        # Process pixels in chunks to bound memory usage at high resolutions
+        for begin in range(0, len(pixel_topk), chunk_size):
+            ids = pixel_topk[begin:begin+chunk_size]
+            valid = ids >= 0
+            ids = ids.clamp(min=0)
+            delta = xy[ids] - pixels[begin:begin+chunk_size]  # [P, K, 2]
+            conic = conics[ids]  # [P, K, 3]
+            sigma = 0.5 * (conic[..., 0] * delta[..., 0]**2 + conic[..., 2] * delta[..., 1]**2) + conic[..., 1] * delta[..., 0] * delta[..., 1]
+            weights = torch.exp(-sigma) * valid  # [P, K]
+            weighted_feat = weights.unsqueeze(-1) * feat[ids]  # [P, K, C]
+            sum_weights = weights.sum(dim=1, keepdim=True)  # [P, 1]
+            sum_feat = weighted_feat.sum(dim=1)  # [P, C]
+            target = targets[begin:begin+chunk_size]
+            error = (sum_feat / (sum_weights + self.eps) - target).abs().sum(dim=-1, keepdim=True)  # [P, 1]
+            loo_values = (sum_feat.unsqueeze(1) - weighted_feat) / (sum_weights - weights + self.eps).unsqueeze(-1)  # [P, K, C]
+            loo_error = (loo_values - target.unsqueeze(1)).abs().sum(dim=-1)  # [P, K]
+            loss_increase.index_add_(0, ids[valid], (loo_error - error)[valid])
+        return loss_increase / targets.numel()
+
+    def _prune_gaussians(self, prune_num, plot_gaussians=False):
+        prune_num = min(prune_num, self.max_prune_num, self.num_prune-self.num_pruned)
+        if prune_num <= 0:
+            return
+        self._remove_gaussians(prune_num, action="Pruning", plot_gaussians=plot_gaussians)
+        self.num_pruned += prune_num
+
+    def _remove_gaussians(self, remove_num, action, plot_gaussians=False):
+        """
+        Remove the Gaussians with the lowest pruning score.
+        """
+        score = self._get_contribution() if self.prune_score == "contribution" else self._get_loo_loss_increase()
+        pruned = torch.topk(score, remove_num, largest=False).indices
+        keep = torch.ones(self.num_gaussians, dtype=torch.bool, device=self.device)
+        keep[pruned] = False
+        # Plot Gaussians (red: kept, green: removed)
+        if plot_gaussians:
+            path = f"{self.train_dir}/{action.lower()}-gaussians_step-{self.step:d}_num-{self.num_gaussians-remove_num:d}_res-{self.img_h:d}x{self.img_w:d}"
+            every_n = max(1, self.total_num_gaussians // 2000)
+            size = (self.img_h * self.img_w) / 1e4
+            visualize_added_gaussians(path, self._render_images(upsample=False), self.xy[keep], self.xy[pruned], self.input_channels, size=size,
+                                      every_n=every_n, alpha=0.8, gamma=self.gamma, save_image_format=self.save_plot_format)
+        # Update trainable parameters, keeping the optimizer state of the remaining Gaussians
+        for name, param_group in zip(["xy", "scale", "rot", "feat"], self.optimizer.param_groups):
+            old_param = param_group["params"][0]
+            new_param = nn.Parameter(old_param.detach()[keep], requires_grad=True)
+            state = self.optimizer.state.pop(old_param, None)
+            if state is not None:
+                state["exp_avg"], state["exp_avg_sq"] = state["exp_avg"][keep], state["exp_avg_sq"][keep]
+                self.optimizer.state[new_param] = state
+            param_group["params"] = [new_param]
+            setattr(self, name, new_param)
+        self.vis_feat = nn.Parameter(self.vis_feat.detach()[keep], requires_grad=False)
+        self.num_gaussians -= remove_num
+        if self.prune_score == "contribution":
+            score_info = f"Pruned contribution: {100.0*score[pruned].sum().item()/score.sum().item():.2f}%"
+        else:
+            score_info = f"Predicted L1 increase: {score[pruned].sum().item():.5f}"
+        self.worklog.info(
+            f"Step: {self.step:d} | {action} {remove_num:d} Gaussians ({self.num_gaussians+remove_num:d} -> {self.num_gaussians:d}) | {score_info}")
         self.worklog.info("***********************************************")

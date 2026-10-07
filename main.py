@@ -8,18 +8,22 @@ from utils.misc_utils import load_cfg
 
 def get_gaussian_cfg(args):
     gaussian_cfg = f"num-{args.num_gaussians:d}"
+    if args.prune_ratio > 0.0:
+        gaussian_cfg += f"_prune-{args.prune_ratio:.2f}"
+    if args.relocate_ratio > 0.0:
+        gaussian_cfg += f"_reloc-{args.relocate_ratio:.2f}"
     if args.disable_inverse_scale:
         gaussian_cfg += f"_scale-{args.init_scale:.1f}"
     else:
         gaussian_cfg += f"_inv-scale-{args.init_scale:.1f}"
     if not args.quantize:
-        args.pos_bits, args.scale_bits, args.rot_bits, args.feat_bits = 32, 32, 32, 32
-    min_bits = min(args.pos_bits, args.scale_bits, args.rot_bits, args.feat_bits)
-    max_bits = max(args.pos_bits, args.scale_bits, args.rot_bits, args.feat_bits)
-    if min_bits < 4 or max_bits > 32:
-        raise ValueError(
-            f"Bit precision must be between 4 and 32 but got: {args.pos_bits:d}, {args.scale_bits:d}, {args.rot_bits:d}, {args.feat_bits:d}")
+        args.pos_bits, args.scale_bits, args.rot_bits, args.feat_bits, args.y_bits, args.uv_bits = 32, 32, 32, 32, 32, 32
+    all_bits = [args.pos_bits, args.scale_bits, args.rot_bits, args.feat_bits, args.y_bits, args.uv_bits]
+    if min(all_bits) < 4 or max(all_bits) > 32:
+        raise ValueError(f"Bit precision must be between 4 and 32 but got: {', '.join(f'{bits:d}' for bits in all_bits)}")
     gaussian_cfg += f"_bits-{args.pos_bits:d}-{args.scale_bits:d}-{args.rot_bits:d}-{args.feat_bits:d}"
+    if args.color_space == "yuv":
+        gaussian_cfg += f"_yuv-{args.y_bits:d}-{args.uv_bits:d}"
     if not args.disable_topk_norm:
         gaussian_cfg += f"_top-{args.topk:d}"
     gaussian_cfg += f"_{args.init_mode[0]}-{args.init_random_ratio:.1f}"

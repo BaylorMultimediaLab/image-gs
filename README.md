@@ -119,7 +119,9 @@ Please refer to `cfgs/default.yaml` for the full list of arguments and their def
 - `--pos_bits` bit precision of individual coordinate dimension.
 - `--scale_bits` bit precision of individual scale dimension.
 - `--rot_bits` bit precision of Gaussian orientation angle.
-- `--feat_bits` bit precision of individual feature dimension.
+- `--feat_bits` bit precision of individual feature dimension (RGB mode, and single-channel images in YUV mode).
+- `--y_bits` bit precision of the Y feature dimension (YUV mode only).
+- `--uv_bits` bit precision of individual U and V feature dimensions (YUV mode only).
 
 **Logging**
 - `--exp_name` path to the logging directory.
@@ -131,6 +133,7 @@ Please refer to `cfgs/default.yaml` for the full list of arguments and their def
 - `--input_path` path to an image file or a directory containing a texture stack.
 - `--downsample` load a downsampled version of the input image or texture stack as the optimization target to evaluate image upsampling performance.
 - `--downsample_ratio` downsampling ratio.
+- `--color_space` color space of Gaussian features and training losses, valid values include "yuv" (default) and "rgb". Metrics and saved images are always in RGB.
 - `--gamma` optimize in a gamma-corrected space, modify with caution.
 
 **Gaussian**
@@ -150,6 +153,13 @@ Please refer to `cfgs/default.yaml` for the full list of arguments and their def
 - `--feat_lr` Gaussian feature learning rate.
 - `--disable_lr_schedule` disable learning rate decay and early stopping schedule.
 - `--disable_prog_optim` disable error-guided progressive optimization.
+
+**Pruning**: disabled by default
+- `--prune_ratio` fraction of `num_gaussians` to prune once progressive optimization has added all Gaussians. The Gaussians with the lowest score are pruned first. The compression rate is based on the remaining Gaussians, e.g., `--num_gaussians 1000 --prune_ratio 0.1` stores 900 Gaussians.
+- `--prune_times` number of pruning rounds, each removing an equal share.
+- `--prune_steps` number of optimization steps before each pruning round.
+- `--prune_score` ranking of Gaussians for pruning, valid values include "contribution" (total blending weight over all pixels) and "loo" (increase of the L1 loss when removing a single Gaussian, computed in one rendering pass; requires tile-based rendering with top-K normalization).
+- `--relocate_ratio` fraction of the Gaussians with the lowest score to replace at each step of progressive optimization by additional Gaussians at high-error locations. Does not change the number of Gaussians and can be combined with `--prune_ratio`.
 
 ## Acknowledgements
 We would like to thank the [gsplat](https://github.com/nerfstudio-project/gsplat) team, as well as the authors of [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting), [Fused SSIM](https://github.com/rahul-goel/fused-ssim), and [EML-Net](https://github.com/SenJia/EML-NET-Saliency) for their outstanding work, which provided an important foundation for the development of Image-GS. We also thank [Károly Zsolnai-Fehér](https://users.cg.tuwien.ac.at/zsolnai/about/) for featuring our work on [Two Minute Papers](https://www.youtube.com/watch?v=_WjU5d26Cc4) and introducing it to a broader audience, and [Shubham Anand](https://www.linkedin.com/in/shubham-anand-91a10b211/) for creating a clear, thorough, and well-explained tutorial on our work on [LearnOpenCV](https://learnopencv.com/image-gs-image-reconstruction-using-2d-gaussians/).
