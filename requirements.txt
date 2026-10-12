@@ -1,12 +1,24 @@
-torch==2.4.1
-torchvision==0.19.1
-torchaudio==2.4.1
-flip-evaluator
+# Matches the A100 cluster toolchain (wICE: Python 3.13.1, PyTorch-bundle 2.9.1 with CUDA 12.8, SciPy-bundle 2025.06), see slurm/setup.slurm.
+# Locally, install torch and torchvision with CUDA 12.8 first:
+#   pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
+torch==2.9.1
+torchvision==0.24.1
+numpy==2.3.1
+scipy==1.16.0
+pandas==2.3.0
+flip-evaluator==1.7
+imageio==2.38.1
+jaxtyping==0.3.11
 lpips==0.1.4
-matplotlib==3.9.2
-numpy==2.0.2
-opencv-python==4.12.0.88
+matplotlib==3.11.2
+ninja==1.13.2
+opencv-python-headless==5.0.0.93
 pytorch-msssim==1.0.0
-scikit-image==0.24.0
-scipy==1.13.1
-torchmetrics==1.5.2
+pyyaml==6.0.3
+rich==15.0.0
+scikit-image==0.26.0
+tqdm==4.70.1
+# CUDA extensions, built with the CUDA 12.8 toolkit for the GPU's compute capability (e.g., TORCH_CUDA_ARCH_LIST="8.6" for an RTX 2050,
+# "8.0" for an A100), without build isolation so that they compile against the installed torch:
+#   pip install ./gsplat --no-build-isolation
+#   pip install git+https://github.com/rahul-goel/fused-ssim/@a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38 --no-build-isolation

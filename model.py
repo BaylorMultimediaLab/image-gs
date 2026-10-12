@@ -15,6 +15,7 @@ from lpips import LPIPS
 from pytorch_msssim import MS_SSIM
 from torchvision.transforms.functional import gaussian_blur
 
+from compress import decode_bitstream, encode_bitstream
 from gsplat import (
     bin_and_sort_gaussians,
     compute_cumulative_intersects,
@@ -23,7 +24,6 @@ from gsplat import (
     rasterize_gaussians_sum,
 )
 from gsplat.cuda import nd_rasterize_forward_topk_norm
-from utils.bitstream_utils import decode_bitstream, encode_bitstream
 from utils.color_utils import get_color_transforms, get_yuv_channel_indices, transform_images
 from utils.flip import LDRFLIPLoss
 from utils.image_utils import (
@@ -179,10 +179,29 @@ class GaussianSplatting2D(nn.Module):
         self.uv_step = args.uv_step
         self.wrap_rot = args.wrap_rot
         self.bitstream_codec = args.bitstream_codec
-        if self.bitstream_codec not in ["none", "lzma"]:
-            raise ValueError(f"Unsupported bitstream codec '{self.bitstream_codec}', valid values include 'none' and 'lzma'")
+        if self.bitstream_codec not in ["none", "lzma", "rans"]:
+            raise ValueError(f"Unsupported bitstream codec '{self.bitstream_codec}', valid values include 'none', 'lzma', and 'rans'")
         if self.bitstream_codec != "none" and self.quant_mode == "none":
             raise ValueError("Writing a bitstream requires quantization")
+        self.color_transform = args.color_transform
+        if self.color_transform not in ["none", "subtract-green"]:
+            raise ValueError(f"Unsupported color transform '{self.color_transform}', valid values include 'none' and 'subtract-green'")
+        if self.color_transform != "none" and self.color_space != "rgb":
+            raise ValueError("Color transforms of the bitstream require color_space 'rgb'")
+
+    def _get_channel_refs(self):
+        """
+        Reference channels of each attribute for the lossless color transform before entropy coding: subtract-green codes each
+        RGB image as R-G, G, B-G, and leaves the other channels unchanged.
+        """
+        feat_refs = []
+        for num_channels in self.input_channels:
+            base = len(feat_refs)
+            if self.color_transform == "subtract-green" and num_channels == 3:
+                feat_refs += [base + 1, -1, base + 1]
+            else:
+                feat_refs += [-1] * num_channels
+        return [None, None, None, feat_refs]
 
     def _get_feat_groups(self):
         """
@@ -252,6 +271,9 @@ class GaussianSplatting2D(nn.Module):
         self.init_scale = args.init_scale
         self.disable_topk_norm = args.disable_topk_norm
         self.disable_inverse_scale = args.disable_inverse_scale
+        self.max_scale = args.max_scale
+        if self.max_scale < 0.0:
+            raise ValueError(f"Maximum scale must be non-negative but got: {self.max_scale}")
         self.disable_color_init = args.disable_color_init
         self.xy = nn.Parameter(torch.rand(self.num_gaussians, 2, dtype=self.dtype, device=self.device), requires_grad=True)
         self.scale = nn.Parameter(torch.ones(self.num_gaussians, 2, dtype=self.dtype, device=self.device), requires_grad=True)
@@ -365,6 +387,14 @@ class GaussianSplatting2D(nn.Module):
             self.check_decay_steps = args.check_decay_steps
             self.max_decay_times = args.max_decay_times
             self.decay_threshold = args.decay_threshold
+        # Time-budgeted optimization: pruning rounds and a single learning rate decay at fixed fractions of the budget
+        self.max_time = args.max_time
+        self.prune_time_ratio = args.prune_time_ratio
+        self.decay_time_ratio = args.decay_time_ratio
+        if self.max_time < 0.0:
+            raise ValueError(f"Time budget must be non-negative but got: {self.max_time}")
+        if self.max_time > 0.0 and not (0.0 < self.prune_time_ratio <= 1.0 and 0.0 < self.decay_time_ratio <= 1.0):
+            raise ValueError(f"Time ratios must be in (0, 1] but got: {self.prune_time_ratio}, {self.decay_time_ratio}")
 
     def _init_pos_scale_feat(self, args):
         self.init_mode = args.init_mode
@@ -484,7 +514,7 @@ class GaussianSplatting2D(nn.Module):
             attributes = [(q.cpu().numpy().astype(np.int64), steps.cpu().numpy().astype(np.float64), origins.cpu().numpy().astype(np.float64))
                           for q, steps, origins in symbols]
             meta = struct.pack("<IIBB", self.img_h, self.img_w, ["minmax", "step"].index(self.quant_mode), ["rgb", "yuv"].index(self.color_space))
-            data, order, attribute_bytes = encode_bitstream(attributes, meta)
+            data, order, attribute_bytes = encode_bitstream(attributes, meta, codec=self.bitstream_codec, channel_refs=self._get_channel_refs())
             with open(path, "wb") as file:
                 file.write(data)
             with open(path, "rb") as file:
@@ -502,7 +532,7 @@ class GaussianSplatting2D(nn.Module):
         self.worklog.info(f"Bitstream ({self.bitstream_codec}): {len(data)/1e3:.2f} KB | {num_bits/self.num_pixels:.3f} bpp | "
                           f"{num_bits/fixed_length_bits*100.0:.2f}% of fixed-length codes | Saved to '{path}'")
         self.worklog.info(f"Bits per Gaussian: {num_bits/self.num_gaussians:.2f} (fixed-length: {fixed_length_bits/self.num_gaussians:.2f}) | "
-                          f"{' | '.join(bits_per_gaussian)} | Header {len(data)-sum(attribute_bytes):d} bytes")
+                          f"{' | '.join(bits_per_gaussian)} | Header {len(data)-sum(attribute_bytes):.0f} bytes")
         self.worklog.info(f"Lossless decoding verified | PSNR: {decoded_psnr:.4f} decoded, {psnr:.4f} encoder side")
         self.worklog.info("***********************************************")
         return len(data)
@@ -560,6 +590,18 @@ class GaussianSplatting2D(nn.Module):
             return render_time
         out_image = out_image.view(-1, img_h, img_w, self.feat_dim).permute(0, 3, 1, 2).contiguous()
         return out_image.squeeze(dim=0), render_time
+
+    def _clamp_scale(self):
+        """
+        Project the Gaussian scales onto at most max_scale pixels. Inverse scales are kept away from zero, which also keeps them from
+        changing sign through a huge Gaussian.
+        """
+        with torch.no_grad():
+            if self.disable_inverse_scale:
+                self.scale.clamp_(-self.max_scale, self.max_scale)
+            else:
+                bound = 1.0 / self.max_scale
+                self.scale.copy_(torch.where(self.scale < 0.0, self.scale.clamp(max=-bound), self.scale.clamp(min=bound)))
 
     def _get_scale(self, upsample_ratio=None):
         scale = self.scale
@@ -632,18 +674,23 @@ class GaussianSplatting2D(nn.Module):
             self._get_total_loss(images)
             self.total_loss.backward()
             self.optimizer.step()
+            if self.max_scale > 0.0:
+                self._clamp_scale()
+            if self.max_time > 0.0:
+                torch.cuda.synchronize()  # Charge each step its GPU time
             self.total_time_accum += (perf_counter() - begin + render_time)
             # Logging
             terminate = False
             with torch.no_grad():
                 if self.step % self.eval_steps == 0:
                     self._evaluate(log=True, upsample=False)
-                    if not self.disable_lr_schedule and self._is_final_num_gaussians():
+                    if not self.disable_lr_schedule and self.max_time == 0.0 and self._is_final_num_gaussians():
                         terminate = self._lr_schedule()
                 if self.step % self.save_image_steps == 0:
                     self._log_images(log_final=False, plot_gaussians=self.vis_gaussians)
                 if self.step % self.save_ckpt_steps == 0 and self._is_final_num_gaussians():
                     self._save_model()
+                begin = perf_counter()
                 # Pruned Gaussians are not added back
                 if not self.disable_prog_optim and self.step % self.add_steps == 0 and self.num_gaussians + self.num_pruned < self.total_num_gaussians:
                     # Relocation: replace the Gaussians with the lowest score by additional error-guided Gaussians
@@ -651,9 +698,11 @@ class GaussianSplatting2D(nn.Module):
                     if relocate_num > 0:
                         self._remove_gaussians(relocate_num, action="Relocating", plot_gaussians=self.vis_gaussians)
                     self._add_gaussians(self.max_add_num + relocate_num, plot_gaussians=self.vis_gaussians)
-                if (self.num_pruned < self.num_prune and self.step > self.prune_start_step
-                        and (self.step - self.prune_start_step) % self.prune_steps == 0):
+                if self.num_pruned < self.num_prune and self.step > self.prune_start_step and self._is_prune_step():
                     self._prune_gaussians(self.max_prune_num, plot_gaussians=self.vis_gaussians)
+                if self.max_time > 0.0:
+                    self.total_time_accum += perf_counter() - begin  # Densification and pruning are part of the time budget
+                    terminate = self._time_schedule() or terminate
                 if terminate:
                     break
         with torch.no_grad():
@@ -756,6 +805,32 @@ class GaussianSplatting2D(nn.Module):
         else:
             images, _ = self.forward(self.img_h, self.img_w, self.tile_bounds)
         return self._to_rgb(images)
+
+    def _is_prune_step(self):
+        """
+        Whether the next pruning round is due: every prune_steps steps, or with a time budget, every prune_time_ratio of the budget.
+        """
+        if self.max_time > 0.0:
+            rounds_done = math.ceil(self.num_pruned / self.max_prune_num)
+            return self.total_time_accum >= (rounds_done + 1) * self.prune_time_ratio * self.max_time
+        return (self.step - self.prune_start_step) % self.prune_steps == 0
+
+    def _time_schedule(self):
+        """
+        Schedule of time-budgeted optimization: a single learning rate decay after decay_time_ratio of the budget, and termination once the
+        budget is used up. Returns whether to terminate.
+        """
+        if not self.disable_lr_schedule and self.decay_times == 0 and self.total_time_accum >= self.decay_time_ratio * self.max_time:
+            self.decay_times = 1
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] /= self.decay_ratio
+            self.worklog.info(f"Step: {self.step:d} | Learning rate decayed by {self.decay_ratio:.1f} after {self.total_time_accum:.2f} s")
+            self.worklog.info("***********************************************")
+        if self.total_time_accum >= self.max_time:
+            self.worklog.info(f"Step: {self.step:d} | Time budget of {self.max_time:.2f} s used up ({self.total_time_accum:.2f} s)")
+            self.worklog.info("***********************************************")
+            return True
+        return False
 
     def _lr_schedule(self):
         if (self.psnr_curr <= self.best_psnr + 100*self.decay_threshold or self.ssim_curr <= self.best_ssim + self.decay_threshold):

@@ -1,180 +1,62 @@
-<div align="center">
+# Image-GS
 
-<h1>Image-GS: Content-Adaptive Image Representation via 2D Gaussians</h1>
-
-[**Yunxiang Zhang**](https://yunxiangzhang.github.io/)<sup>1\*</sup>,
-[**Bingxuan Li**](https://bingxuan-li.github.io/)<sup>1\*</sup>,
-[**Alexandr Kuznetsov**](https://alexku.me/)<sup>3&dagger;</sup>,
-[**Akshay Jindal**](https://www.akshayjindal.com/)<sup>2</sup>,
-[**Stavros Diolatzis**](https://www.sdiolatz.info/)<sup>2</sup>,
-[**Kenneth Chen**](https://kenchen10.github.io/)<sup>1</sup>,
-[**Anton Sochenov**](https://www.intel.com/content/www/us/en/developer/articles/community/gpu-researchers-anton-sochenov.html)<sup>2</sup>,
-[**Anton Kaplanyan**](http://kaplanyan.com/)<sup>2</sup>,
-[**Qi Sun**](https://qisun.me/)<sup>1</sup>
-
-\* Equal contribution &emsp; &dagger; Work done while at Intel
-
-<sup>1</sup>
-<a href="https://www.immersivecomputinglab.org/research/"><img width="30%" src="assets/images/NYU-logo.png" style="vertical-align: top;" alt="NYU logo"></a>
-&emsp;
-<sup>2</sup>
-<a href="https://www.intel.com/content/www/us/en/developer/topic-technology/graphics-research/overview.html"><img width="22%" src="assets/images/Intel-logo.png" style="vertical-align: top;" alt="Intel logo"></a>
-&emsp;
-<sup>3</sup>
-<a href="https://www.amd.com/en.html"><img width="33%" src="assets/images/AMD-logo.png" style="vertical-align: top;" alt="AMD logo"></a>
-
-<a href="https://arxiv.org/abs/2407.01866"><img src="https://img.shields.io/badge/arXiv-2407.01866-ff5a5f" alt="arXiv"></a>
-<a href="https://www.immersivecomputinglab.org/publication/image-gs-content-adaptive-image-representation-via-2d-gaussians/"><img src="https://img.shields.io/badge/project-ImageGS-9fa0ff" alt="Project Page"></a>
-<a href="https://github.com/NYU-ICL/image-gs"><img src="https://visitor-badge.laobi.icu/badge?page_id=NYU-ICL.image-gs&left_color=gray&right_color=lightgreen" alt="Visitors"></a>
-<a href="https://www.youtube.com/watch?v=_WjU5d26Cc4"><img src="https://img.shields.io/badge/Two Minute Papers-ffee32" alt="Two Minute Papers"></a>
-<a href="https://learnopencv.com/image-gs-image-reconstruction-using-2d-gaussians/"><img src="https://img.shields.io/badge/LearnOpenCV-4cc9f0" alt="LearnOpenCV"></a>
-
-</div>
-
-<div style="width: 90%; margin: 0 auto;">
-  <p>
-  Neural image representations have emerged as a promising approach for encoding and rendering visual data. Combined with learning-based workflows, they demonstrate impressive trade-offs between visual fidelity and memory footprint. Existing methods in this domain, however, often rely on fixed data structures that suboptimally allocate memory or compute-intensive implicit models, hindering their practicality for real-time graphics applications.
-  </p>
-  <p>
-  Inspired by recent advancements in radiance field rendering, we introduce Image-GS, a content-adaptive image representation based on 2D Gaussians. Leveraging a custom differentiable renderer, Image-GS reconstructs images by adaptively allocating and progressively optimizing a group of anisotropic, colored 2D Gaussians. It achieves a favorable balance between visual fidelity and memory efficiency across a variety of stylized images frequently seen in graphics workflows, especially for those showing non-uniformly distributed features and in low-bitrate regimes. Moreover, it supports hardware-friendly rapid random access for real-time usage, requiring only 0.3K MACs to decode a pixel. Through error-guided progressive optimization, Image-GS naturally constructs a smooth level-of-detail hierarchy. We demonstrate its versatility with several applications, including texture compression, semantics-aware compression, and joint image compression and restoration.
-  </p>
-  <img src="assets/images/teaser.jpg" width="100%" />
-  <sub>
-  Figure 1: Image-GS reconstructs an image by adaptively allocating and progressively optimizing a set of colored 2D Gaussians. It achieves favorable rate-distortion trade-offs, hardware-friendly random access, and flexible quality control through a smooth level-of-detail stack. (a) visualizes the optimized spatial distribution of Gaussians (20% randomly sampled for clarity). (b) Image-GS’s explicit content-adaptive design effectively captures non-uniformly distributed image features and better preserves fine details under constrained memory budgets. In the inset error maps, brighter colors indicate larger errors.
-  </sub>
-</div>
+Image-GS represents an image with 2D Gaussians that are optimized to reconstruct it. This version adds quantization of the Gaussian
+parameters, entropy-coded bitstreams (LZMA or rANS), pruning, and time-budgeted encoding.
 
 ## Setup
-1. Create a dedicated Python environment and install the dependencies
-    ```bash
-    git clone https://github.com/NYU-ICL/image-gs.git
-    cd image-gs
-    conda env create -f environment.yml
-    conda activate image-gs
-    pip install git+https://github.com/rahul-goel/fused-ssim/ --no-build-isolation
-    cd gsplat
-    pip install -e ".[dev]"
-    cd ..
-    ```
-2. Download the image and texture datasets from [OneDrive](https://1drv.ms/u/c/3a8968df8a027819/EeshjZJlMtdCmvvmESiN2pABM71EDaoLYmEwuOvecg0tAA?e=GybqBv) and organize the folder structure as follows
-    ```
-    image-gs
-    └── media
-        ├── images
-        └── textures
-    ```
-3. (Optional) To run saliency-guided Gaussian position initialization, download the pre-trained [EML-Net](https://github.com/SenJia/EML-NET-Saliency) models ([res_imagenet.pth](https://drive.google.com/open?id=1-a494canr9qWKLdm-DUDMgbGwtlAJz71), [res_places.pth](https://drive.google.com/open?id=18nRz0JSRICLqnLQtAvq01azZAsH0SEzS), [res_decoder.pth](https://drive.google.com/open?id=1vwrkz3eX-AMtXQE08oivGMwS4lKB74sH)) and place them under the `models/emlnet/` folder
-    ```
-    image-gs
-    └── models
-        └── emlnet
-            ├── res_decoder.pth
-            ├── res_imagenet.pth
-            └── res_places.pth
-    ```
 
-## Quick Start
+Requires Python 3.13 and the CUDA 12.8 toolkit (`nvcc`) to compile the CUDA extensions.
 
-#### Image Compression 
-- Optimize an Image-GS representation for an input image `anime-1_2k.png` using `10000` Gaussians with half-precision parameters
 ```bash
-python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quant_mode="minmax"
+python3.13 -m venv .venv
+source .venv/bin/activate
+pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements.txt
+
+# CUDA extensions, compiled for the compute capability of your GPU (e.g., 8.0 for an A100, 8.6 for an RTX 30 series)
+export TORCH_CUDA_ARCH_LIST="8.6"
+pip install ./gsplat --no-build-isolation
+pip install git+https://github.com/rahul-goel/fused-ssim/@a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38 --no-build-isolation
 ```
-- Render the corresponding optimized Image-GS representation at a new resolution with height `4000` (aspect ratio is maintained)
+
+## Running
+
 ```bash
-python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quant_mode="minmax" --eval --render_height=4000
+python main.py --input_path uvg/480p/Beauty_0001.png --num_gaussians 2000
 ```
 
-#### Texture Stack Compression
-- Optimize an Image-GS representation for an input texture stack `alarm-clock_2k` using `30000` Gaussians with half-precision parameters
+Every option has a default in `cfgs/default.yaml` and can be overridden on the command line as `--<key> <value>`. Boolean options are
+flags that switch them on (they all default to off). Input images are read from `data_root` (default `media/`), and `input_path` is an
+image file or a directory with a texture stack. Each run writes its log, config, checkpoints, renders, and bitstream to
+`results/<exp_name>/<folder named after the main settings>/`. To render a trained model, rerun with the same options plus
+`--eval --render_height <height>`.
+
+## Configurations
+
+| What | Options |
+|---|---|
+| Rate | `--num_gaussians`; `--prune_ratio` prunes that fraction of them after densification (`--prune_score loo` or `contribution`) |
+| Quantization | `--quant_mode step` (fixed step sizes: `--pos_step`, `--scale_step`, `--rot_step`, `--feat_step`), `minmax` (bit depths over each attribute's range: `--pos_bits`, `--scale_bits`, `--rot_bits`, `--feat_bits`), or `none` |
+| Bitstream | `--bitstream_codec rans`, `lzma`, or `none`; `--color_transform subtract-green` (codes R-G, G, B-G) or `none` |
+| Color space | `--color_space rgb` or `yuv` (with `--y_step`/`--uv_step` or `--y_bits`/`--uv_bits`; requires `--color_transform none`) |
+| Schedule | By default, progressive optimization adds Gaussians in rounds and the learning rate decays when PSNR stops improving (up to `--max_steps`). `--max_time <seconds>` optimizes for a fixed time instead, pruning and decaying the learning rate at `--prune_time_ratio` and `--decay_time_ratio` of the budget. `--disable_prog_optim` starts with all Gaussians. |
+| Gaussians | `--max_scale <pixels>` caps the Gaussian size; `--init_mode gradient`, `saliency`, or `random` |
+
+Examples:
+
 ```bash
-python main.py --input_path="textures/alarm-clock_2k" --exp_name="test/alarm-clock_2k" --num_gaussians=30000 --quant_mode="minmax"
-```
-- Render the corresponding optimized Image-GS representation at a new resolution with height `3000` (aspect ratio is maintained)
-```bash
-python main.py --input_path="textures/alarm-clock_2k" --exp_name="test/alarm-clock_2k" --num_gaussians=30000 --quant_mode="minmax"  --eval --render_height=3000
-```
+# Fixed bit depths, LZMA bitstream
+python main.py --quant_mode minmax --pos_bits 16 --scale_bits 8 --rot_bits 8 --feat_bits 10 --bitstream_codec lzma
 
-#### Control bit precision of Gaussian parameters
-- Optimize an Image-GS representation for an input image `anime-1_2k.png` using `10000` Gaussians with 12-bit-precision parameters
-```bash
-python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quant_mode="minmax" --pos_bits=12 --scale_bits 12 --rot_bits 12 --feat_bits 12
+# Encoding within a 40-second optimization budget
+python main.py --disable_prog_optim --max_time 40 --max_steps 1000000
+
+# Unquantized float parameters (a bitstream requires quantization)
+python main.py --quant_mode none --bitstream_codec none
 ```
 
-#### Switch to saliency-guided Gaussian position initialization 
-- Optimize an Image-GS representation for an input image `anime-1_2k.png` using `10000` Gaussians with half-precision parameters and saliency-guided initialization
-```bash
-python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quant_mode="minmax" --init_mode="saliency"
-```
+## Sweeps on a Slurm cluster
 
-### Command Line Arguments
-Please refer to `cfgs/default.yaml` for the full list of arguments and their default values.
-
-**Post-optimization rendering**
-- `--eval` render the optimized Image-GS representation.
-- `--render_height` image height for rendering (aspect ratio is maintained).
-
-**Bit precision control**
-- `--quant_mode` quantization of Gaussian parameters: `none` (32 bits (float32) per dimension), `minmax` (bit precision set below), or `step` (fixed step sizes, see `cfgs/default.yaml`).
-- `--pos_bits` bit precision of individual coordinate dimension.
-- `--scale_bits` bit precision of individual scale dimension.
-- `--rot_bits` bit precision of Gaussian orientation angle.
-- `--feat_bits` bit precision of individual feature dimension (RGB mode, and single-channel images in YUV mode).
-- `--y_bits` bit precision of the Y feature dimension (YUV mode only).
-- `--uv_bits` bit precision of individual U and V feature dimensions (YUV mode only).
-
-**Logging**
-- `--exp_name` path to the logging directory.
-- `--vis_gaussians`: visualize Gaussians during optimization.
-- `--save_image_steps` frequency of rendering intermediate results during optimization.
-- `--save_ckpt_steps` frequency of checkpointing during optimization.
-
-**Input image**
-- `--input_path` path to an image file or a directory containing a texture stack.
-- `--downsample` load a downsampled version of the input image or texture stack as the optimization target to evaluate image upsampling performance.
-- `--downsample_ratio` downsampling ratio.
-- `--color_space` color space of Gaussian features and training losses, valid values include "yuv" (default) and "rgb". Metrics and saved images are always in RGB.
-- `--gamma` optimize in a gamma-corrected space, modify with caution.
-
-**Gaussian**
-- `--num_gaussians` number of Gaussians (for compression rate control).
-- `--init_scale` initial Gaussian scale in number of pixels.
-- `--disable_topk_norm` disable top-K normalization.
-- `--disable_inverse_scale` disable inverse Gaussian scale optimization.
-- `--init_mode` Gaussian position initialization mode, valid values include "gradient", "saliency", and "random".
-- `--init_random_ratio` ratio of Gaussians with randomly initialized position.
-
-**Optimization**
-- `--disable_tiles` disable tile-based rendering (warning: optimization and rendering without tiles will be way slower).
-- `--max_steps` maximum number of optimization steps.
-- `--pos_lr` Gaussian position learning rate.
-- `--scale_lr` Gaussian scale learning rate.
-- `--rot_lr` Gaussian orientation angle learning rate.
-- `--feat_lr` Gaussian feature learning rate.
-- `--disable_lr_schedule` disable learning rate decay and early stopping schedule.
-- `--disable_prog_optim` disable error-guided progressive optimization.
-
-**Pruning**: disabled by default
-- `--prune_ratio` fraction of `num_gaussians` to prune once progressive optimization has added all Gaussians. The Gaussians with the lowest score are pruned first. The compression rate is based on the remaining Gaussians, e.g., `--num_gaussians 1000 --prune_ratio 0.1` stores 900 Gaussians.
-- `--prune_times` number of pruning rounds, each removing an equal share.
-- `--prune_steps` number of optimization steps before each pruning round.
-- `--prune_score` ranking of Gaussians for pruning, valid values include "contribution" (total blending weight over all pixels) and "loo" (increase of the L1 loss when removing a single Gaussian, computed in one rendering pass; requires tile-based rendering with top-K normalization).
-- `--relocate_ratio` fraction of the Gaussians with the lowest score to replace at each step of progressive optimization by additional Gaussians at high-error locations. Does not change the number of Gaussians and can be combined with `--prune_ratio`.
-
-## Acknowledgements
-We would like to thank the [gsplat](https://github.com/nerfstudio-project/gsplat) team, as well as the authors of [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting), [Fused SSIM](https://github.com/rahul-goel/fused-ssim), and [EML-Net](https://github.com/SenJia/EML-NET-Saliency) for their outstanding work, which provided an important foundation for the development of Image-GS. We also thank [Károly Zsolnai-Fehér](https://users.cg.tuwien.ac.at/zsolnai/about/) for featuring our work on [Two Minute Papers](https://www.youtube.com/watch?v=_WjU5d26Cc4) and introducing it to a broader audience, and [Shubham Anand](https://www.linkedin.com/in/shubham-anand-91a10b211/) for creating a clear, thorough, and well-explained tutorial on our work on [LearnOpenCV](https://learnopencv.com/image-gs-image-reconstruction-using-2d-gaussians/).
-
-## License
-This project is licensed under the terms of the MIT license.
-
-## Citation
-If you find this project helpful to your research, please consider citing [BibTeX](assets/docs/image-gs.bib):
-```bibtex
-@inproceedings{zhang2025image,
-  title={Image-gs: Content-adaptive image representation via 2d gaussians},
-  author={Zhang, Yunxiang and Li, Bingxuan and Kuznetsov, Alexandr and Jindal, Akshay and Diolatzis, Stavros and Chen, Kenneth and Sochenov, Anton and Kaplanyan, Anton and Sun, Qi},
-  booktitle={Proceedings of the Special Interest Group on Computer Graphics and Interactive Techniques Conference Conference Papers},
-  pages={1--11},
-  year={2025}
-}
-```
+`slurm/setup.slurm` builds the environment once, and `slurm/submit_lowres.sh [options]` submits the 480p/720p sweep as a job array with
+one run per task, after the setup job. Cluster-specific settings (account, partition, modules) are in the `#SBATCH` headers and
+`slurm/env.sh`. `python slurm/lowres_sweep.py --help` lists the sweep options; without `--task`, it runs the whole sweep locally.

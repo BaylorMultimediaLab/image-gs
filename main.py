@@ -16,6 +16,8 @@ def get_gaussian_cfg(args):
         gaussian_cfg += f"_scale-{args.init_scale:.1f}"
     else:
         gaussian_cfg += f"_inv-scale-{args.init_scale:.1f}"
+    if args.max_scale > 0.0:
+        gaussian_cfg += f"_max-scale-{args.max_scale:g}"
     if args.quant_mode == "none":
         args.pos_bits, args.scale_bits, args.rot_bits, args.feat_bits, args.y_bits, args.uv_bits = 32, 32, 32, 32, 32, 32
     all_bits = [args.pos_bits, args.scale_bits, args.rot_bits, args.feat_bits, args.y_bits, args.uv_bits]
@@ -45,6 +47,8 @@ def get_log_dir(args):
         folder += f"_ds-{args.downsample_ratio:.1f}"
     if not args.disable_lr_schedule:
         folder += f"_decay-{args.max_decay_times:d}-{args.decay_ratio:.1f}"
+    if args.max_time > 0.0:
+        folder += f"_time-{args.max_time:g}"
     if not args.disable_prog_optim:
         folder += "_prog"
     return f"{args.log_root}/{args.exp_name}/{folder}"
