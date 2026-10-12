@@ -13,11 +13,6 @@ from numpy.linalg import norm
 from PIL import Image
 from scipy.ndimage import sobel
 
-FONT_PATH = "assets/fonts/linux_libertine/LinLibertine_R.ttf"
-font_manager.fontManager.addfont(FONT_PATH)
-FONT_PROP = font_manager.FontProperties(fname=FONT_PATH).get_name()
-
-plt.rcParams['font.family'] = FONT_PROP
 plt.rcParams['text.usetex'] = True
 matplotlib.rcParams['font.size'] = 16
 matplotlib.rcParams['axes.titlesize'] = 16

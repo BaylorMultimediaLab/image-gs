@@ -78,33 +78,33 @@
 #### Image Compression 
 - Optimize an Image-GS representation for an input image `anime-1_2k.png` using `10000` Gaussians with half-precision parameters
 ```bash
-python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quantize
+python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quant_mode="minmax"
 ```
 - Render the corresponding optimized Image-GS representation at a new resolution with height `4000` (aspect ratio is maintained)
 ```bash
-python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quantize --eval --render_height=4000
+python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quant_mode="minmax" --eval --render_height=4000
 ```
 
 #### Texture Stack Compression
 - Optimize an Image-GS representation for an input texture stack `alarm-clock_2k` using `30000` Gaussians with half-precision parameters
 ```bash
-python main.py --input_path="textures/alarm-clock_2k" --exp_name="test/alarm-clock_2k" --num_gaussians=30000 --quantize
+python main.py --input_path="textures/alarm-clock_2k" --exp_name="test/alarm-clock_2k" --num_gaussians=30000 --quant_mode="minmax"
 ```
 - Render the corresponding optimized Image-GS representation at a new resolution with height `3000` (aspect ratio is maintained)
 ```bash
-python main.py --input_path="textures/alarm-clock_2k" --exp_name="test/alarm-clock_2k" --num_gaussians=30000 --quantize  --eval --render_height=3000
+python main.py --input_path="textures/alarm-clock_2k" --exp_name="test/alarm-clock_2k" --num_gaussians=30000 --quant_mode="minmax"  --eval --render_height=3000
 ```
 
 #### Control bit precision of Gaussian parameters
 - Optimize an Image-GS representation for an input image `anime-1_2k.png` using `10000` Gaussians with 12-bit-precision parameters
 ```bash
-python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quantize --pos_bits=12 --scale_bits 12 --rot_bits 12 --feat_bits 12
+python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quant_mode="minmax" --pos_bits=12 --scale_bits 12 --rot_bits 12 --feat_bits 12
 ```
 
 #### Switch to saliency-guided Gaussian position initialization 
 - Optimize an Image-GS representation for an input image `anime-1_2k.png` using `10000` Gaussians with half-precision parameters and saliency-guided initialization
 ```bash
-python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quantize --init_mode="saliency"
+python main.py --input_path="images/anime-1_2k.png" --exp_name="test/anime-1_2k" --num_gaussians=10000 --quant_mode="minmax" --init_mode="saliency"
 ```
 
 ### Command Line Arguments
@@ -114,8 +114,8 @@ Please refer to `cfgs/default.yaml` for the full list of arguments and their def
 - `--eval` render the optimized Image-GS representation.
 - `--render_height` image height for rendering (aspect ratio is maintained).
 
-**Bit precision control**: 32 bits (float32) per dimension by default 
-- `--quantize` enable bit precision control of Gaussian parameters.
+**Bit precision control**
+- `--quant_mode` quantization of Gaussian parameters: `none` (32 bits (float32) per dimension), `minmax` (bit precision set below), or `step` (fixed step sizes, see `cfgs/default.yaml`).
 - `--pos_bits` bit precision of individual coordinate dimension.
 - `--scale_bits` bit precision of individual scale dimension.
 - `--rot_bits` bit precision of Gaussian orientation angle.

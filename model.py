@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import struct
 import sys
 import warnings
 from time import perf_counter
@@ -22,6 +23,7 @@ from gsplat import (
     rasterize_gaussians_sum,
 )
 from gsplat.cuda import nd_rasterize_forward_topk_norm
+from utils.bitstream_utils import decode_bitstream, encode_bitstream
 from utils.color_utils import get_color_transforms, get_yuv_channel_indices, transform_images
 from utils.flip import LDRFLIPLoss
 from utils.image_utils import (
@@ -37,7 +39,7 @@ from utils.image_utils import (
     visualize_gaussian_position,
 )
 from utils.misc_utils import clean_dir, get_latest_ckpt_step, save_cfg, set_random_seed
-from utils.quantization_utils import ste_quantize
+from utils.quantization_utils import dequantize, quantize_minmax, quantize_step
 from utils.saliency_utils import get_smap
 
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
@@ -157,32 +159,78 @@ class GaussianSplatting2D(nn.Module):
         return transform_images(images, self.yuv_to_rgb) if self.color_space == "yuv" else images
 
     def _init_bit_precision(self, args):
-        self.quantize = args.quantize
+        self.quant_mode = args.quant_mode
+        if self.quant_mode not in ["none", "minmax", "step"]:
+            raise ValueError(f"Unsupported quantization mode '{self.quant_mode}', valid values include 'none', 'minmax', and 'step'")
         self.pos_bits = args.pos_bits
         self.scale_bits = args.scale_bits
         self.rot_bits = args.rot_bits
         self.feat_bits = args.feat_bits
         self.y_bits = args.y_bits
         self.uv_bits = args.uv_bits
+        all_steps = [args.pos_step, args.scale_step, args.rot_step, args.feat_step, args.y_step, args.uv_step]
+        if self.quant_mode == "step" and min(all_steps) <= 0.0:
+            raise ValueError(f"Quantization steps must be positive but got: {', '.join(f'{step:g}' for step in all_steps)}")
+        self.pos_step = args.pos_step  # Pixels
+        self.scale_step = args.scale_step  # Octaves (log2 of the scale in pixels)
+        self.rot_step = math.radians(args.rot_step)
+        self.feat_step = args.feat_step
+        self.y_step = args.y_step
+        self.uv_step = args.uv_step
+        self.wrap_rot = args.wrap_rot
+        self.bitstream_codec = args.bitstream_codec
+        if self.bitstream_codec not in ["none", "lzma"]:
+            raise ValueError(f"Unsupported bitstream codec '{self.bitstream_codec}', valid values include 'none' and 'lzma'")
+        if self.bitstream_codec != "none" and self.quant_mode == "none":
+            raise ValueError("Writing a bitstream requires quantization")
 
-    def _get_feat_bit_groups(self):
+    def _get_feat_groups(self):
         """
-        (channel indices, bit precision) of each separately quantized group of feature channels.
-        In YUV mode, single-channel images are not converted and keep using feat_bits.
+        (channel indices, bit precision, step) of each separately quantized group of feature channels.
+        In YUV mode, single-channel images are not converted and keep using feat_bits and feat_step.
         """
         if self.color_space != "yuv":
-            return [(None, self.feat_bits)]
-        groups = [(self.y_channels, self.y_bits), (self.uv_channels, self.uv_bits), (self.other_channels, self.feat_bits)]
-        return [(channels, bits) for channels, bits in groups if len(channels) > 0]
+            return [(torch.arange(self.feat_dim, device=self.device), self.feat_bits, self.feat_step)]
+        groups = [(self.y_channels, self.y_bits, self.y_step), (self.uv_channels, self.uv_bits, self.uv_step),
+                  (self.other_channels, self.feat_bits, self.feat_step)]
+        return [group for group in groups if len(group[0]) > 0]
 
-    def _quantize_feat(self, feat):
-        groups = self._get_feat_bit_groups()
-        if groups[0][0] is None:
-            return ste_quantize(feat, groups[0][1])
-        q_feat = feat.clone()
-        for channels, bits in groups:
-            q_feat[:, channels] = ste_quantize(feat[:, channels], bits)
-        return q_feat
+    def _canonicalize(self, scale, rot):
+        """
+        Equivalent Gaussian parameters to quantize: ellipses are symmetric under rotation by pi,
+        and rendering only depends on squared scales (scales are quantized in the log domain in "step" mode).
+        """
+        if self.wrap_rot:
+            rot = torch.remainder(rot, math.pi)
+        if self.quant_mode == "step":
+            scale = scale.abs()
+        return scale, rot
+
+    def _get_symbols(self, xy, scale, rot, feat):
+        """
+        Quantization indices [P, C] of the canonicalized Gaussian parameters (scale in pixels), with the per-channel steps and origins [C]
+        that dequantize them. Scales are quantized in pixels in "minmax" mode and in log2 pixels in "step" mode.
+        """
+        with torch.no_grad():
+            if self.quant_mode == "step":
+                pos_step = self.pos_step / torch.tensor([self.img_w, self.img_h], dtype=self.dtype, device=self.device)
+                symbols = [quantize_step(xy, pos_step), quantize_step(torch.log2(scale), self.scale_step), quantize_step(rot, self.rot_step)]
+            else:
+                symbols = [quantize_minmax(xy, self.pos_bits), quantize_minmax(scale, self.scale_bits), quantize_minmax(rot, self.rot_bits)]
+            q_feat, feat_steps, feat_origins = torch.empty_like(feat), feat.new_empty(self.feat_dim), feat.new_empty(self.feat_dim)
+            for channels, bits, step in self._get_feat_groups():
+                q, steps, origins = quantize_step(feat[:, channels], step) if self.quant_mode == "step" else quantize_minmax(feat[:, channels], bits)
+                q_feat[:, channels], feat_steps[channels], feat_origins[channels] = q, steps, origins
+        return symbols + [(q_feat, feat_steps, feat_origins)]
+
+    def _dequantize_symbols(self, symbols):
+        """
+        Gaussian parameters (scale in pixels) from their quantization indices.
+        """
+        xy, scale, rot, feat = [dequantize(*symbol) for symbol in symbols]
+        if self.quant_mode == "step":
+            scale = torch.exp2(scale)
+        return xy, scale, rot, feat
 
     def _init_gaussians(self, args):
         self.num_gaussians = args.num_gaussians
@@ -261,15 +309,34 @@ class GaussianSplatting2D(nn.Module):
         for num_channels, bit_depth in zip(self.input_channels, self.bit_depths):
             bpp_uncompressed += float(num_channels) * bit_depth
         bppc_uncompressed = bpp_uncompressed / self.feat_dim
+        self.bpp_uncompressed = bpp_uncompressed
         self.worklog.info(f"Uncompressed: {bytes_uncompressed/1e3:.2f} KB | {bpp_uncompressed:.3f} bpp | {bppc_uncompressed:.3f} bppc")
-        feat_bits = sum((self.feat_dim if channels is None else len(channels)) * bits for channels, bits in self._get_feat_bit_groups())
-        bits_compressed = (2*self.pos_bits + 2*self.scale_bits + self.rot_bits + feat_bits) * self.final_num_gaussians
+        if self.quant_mode == "step":
+            self.num_bytes = 0.0
+            self.worklog.info("Compressed: depends on the parameter ranges with step quantization, logged when saving checkpoints")
+            self.worklog.info("***********************************************")
+        else:
+            self._log_compressed_size(self._get_fixed_length_bits())
+
+    def _get_fixed_length_bits(self):
+        """
+        Total size in bits of the Gaussian parameters stored with fixed-length codes.
+        With step quantization, each channel uses as many bits as its range of quantization indices requires.
+        """
+        if self.quant_mode != "step":
+            feat_bits = sum(len(channels) * bits for channels, bits, _ in self._get_feat_groups())
+            return (2*self.pos_bits + 2*self.scale_bits + self.rot_bits + feat_bits) * self.final_num_gaussians
+        symbols = self._get_symbols(self.xy, *self._canonicalize(self._get_scale(), self.rot), self.feat)
+        q = torch.cat([q for q, _, _ in symbols], dim=1)
+        return torch.ceil(torch.log2(q.amax(dim=0) - q.amin(dim=0) + 1.0)).sum().item() * self.num_gaussians
+
+    def _log_compressed_size(self, bits_compressed):
         bytes_compressed = bits_compressed / 8.0
         bpp_compressed = float(bits_compressed) / self.num_pixels
         bppc_compressed = bpp_compressed / self.feat_dim
         self.num_bytes = bytes_compressed
         self.worklog.info(f"Compressed: {bytes_compressed/1e3:.2f} KB | {bpp_compressed:.3f} bpp | {bppc_compressed:.3f} bppc")
-        self.worklog.info(f"Compression rate: {bpp_uncompressed/bpp_compressed:.2f}x | {100.0*bpp_compressed/bpp_uncompressed:.2f}%")
+        self.worklog.info(f"Compression rate: {self.bpp_uncompressed/bpp_compressed:.2f}x | {100.0*bpp_compressed/self.bpp_uncompressed:.2f}%")
         self.worklog.info("***********************************************")
 
     def _init_loss(self, args):
@@ -369,9 +436,11 @@ class GaussianSplatting2D(nn.Module):
         self.worklog.info(f"Checkpoint '{ckpt_path}' successfully loaded")
         self.worklog.info("***********************************************")
 
-    def _save_model(self):
-        if self.quantize:
+    def _save_model(self, final=False):
+        if self.quant_mode != "none":
             self._quantize()
+            if self.quant_mode == "step":
+                self._log_compressed_size(self._get_fixed_length_bits())
         psnr, ssim = self._evaluate(log=False, upsample=False)
         self._evaluate_extra()
         ckpt_data = {"step": self.step,
@@ -385,6 +454,8 @@ class GaussianSplatting2D(nn.Module):
                      "color_space": self.color_space,
                      "state_dict": self.state_dict(),
                      "optim_state_dict": self.optimizer.state_dict()}
+        if final and self.bitstream_codec != "none":
+            ckpt_data["bitstream_bytes"] = self._write_bitstream(path=f"{self.log_dir}/bitstream.{self.bitstream_codec}")
         save_path = f"{self.ckpt_dir}/ckpt_step-{self.step:d}.pt"
         torch.save(ckpt_data, save_path)
         self.worklog.info(f"Checkpoint 'ckpt_step-{self.step:d}.pt' successfully saved")
@@ -393,11 +464,48 @@ class GaussianSplatting2D(nn.Module):
         self.worklog.info("***********************************************")
 
     def _quantize(self):
+        """
+        Replace the Gaussian parameters by their quantized values, as used for rendering.
+        """
         with torch.no_grad():
-            self.xy.copy_(ste_quantize(self.xy, self.pos_bits))
-            self.scale.copy_(ste_quantize(self.scale, self.scale_bits))
-            self.rot.copy_(ste_quantize(self.rot, self.rot_bits))
-            self.feat.copy_(self._quantize_feat(self.feat))
+            xy, scale, rot, feat = self._get_params()
+            self.xy.copy_(xy)
+            self.scale.copy_(scale if self.disable_inverse_scale else 1.0 / scale)
+            self.rot.copy_(rot)
+            self.feat.copy_(feat)
+
+    def _write_bitstream(self, path):
+        """
+        Encode the quantized Gaussians into a bitstream file, then decode it and check that it reproduces the quantized parameters.
+        Returns the size of the bitstream in bytes.
+        """
+        with torch.no_grad():
+            symbols = self._get_symbols(self.xy, *self._canonicalize(self._get_scale(), self.rot), self.feat)
+            attributes = [(q.cpu().numpy().astype(np.int64), steps.cpu().numpy().astype(np.float64), origins.cpu().numpy().astype(np.float64))
+                          for q, steps, origins in symbols]
+            meta = struct.pack("<IIBB", self.img_h, self.img_w, ["minmax", "step"].index(self.quant_mode), ["rgb", "yuv"].index(self.color_space))
+            data, order, attribute_bytes = encode_bitstream(attributes, meta)
+            with open(path, "wb") as file:
+                file.write(data)
+            with open(path, "rb") as file:
+                decoded, _ = decode_bitstream(file.read())
+            if not all(np.array_equal(q[order], q_decoded) for (q, _, _), (q_decoded, _, _) in zip(attributes, decoded)):
+                raise RuntimeError(f"Decoding '{path}' does not reproduce the quantization indices")
+            decoded_symbols = [[torch.from_numpy(x).to(dtype=self.dtype, device=self.device) for x in attribute] for attribute in decoded]
+            images = self._rasterize(*self._dequantize_symbols(decoded_symbols), self.img_h, self.img_w, self.tile_bounds)
+            psnr, _ = self._evaluate(log=False, upsample=False)
+            decoded_psnr, _ = self._evaluate(log=False, upsample=False, images=self._to_rgb(images))
+        num_bits = 8.0 * len(data)
+        fixed_length_bits = self._get_fixed_length_bits()
+        names = ["Position", "Scale", "Rotation", "Feature"]
+        bits_per_gaussian = [f"{name} {8.0*num_bytes/self.num_gaussians:.2f}" for name, num_bytes in zip(names, attribute_bytes)]
+        self.worklog.info(f"Bitstream ({self.bitstream_codec}): {len(data)/1e3:.2f} KB | {num_bits/self.num_pixels:.3f} bpp | "
+                          f"{num_bits/fixed_length_bits*100.0:.2f}% of fixed-length codes | Saved to '{path}'")
+        self.worklog.info(f"Bits per Gaussian: {num_bits/self.num_gaussians:.2f} (fixed-length: {fixed_length_bits/self.num_gaussians:.2f}) | "
+                          f"{' | '.join(bits_per_gaussian)} | Header {len(data)-sum(attribute_bytes):d} bytes")
+        self.worklog.info(f"Lossless decoding verified | PSNR: {decoded_psnr:.4f} decoded, {psnr:.4f} encoder side")
+        self.worklog.info("***********************************************")
+        return len(data)
 
     def render(self, render_height=None):
         img_h, img_w = self.img_h, self.img_w
@@ -416,6 +524,8 @@ class GaussianSplatting2D(nn.Module):
         self.worklog.info(f"Step: {self.start_step-1:d} | Time: {render_time:.6f} s")
         self.worklog.info(f"Rendering at resolution ({img_h:d}, {img_w:d}) completed")
         self.worklog.info("***********************************************")
+        if self.bitstream_codec != "none":
+            self._write_bitstream(path=f"{self.eval_dir}/bitstream.{self.bitstream_codec}")
 
     def benchmark_render_time(self, num_reps, render_height=None):
         img_h, img_w = self.img_h, self.img_w
@@ -434,11 +544,7 @@ class GaussianSplatting2D(nn.Module):
         return render_time_all
 
     def forward(self, img_h, img_w, tile_bounds, upsample_ratio=None, benchmark=False):
-        scale = self._get_scale(upsample_ratio=upsample_ratio)
-        xy, rot, feat = self.xy, self.rot, self.feat
-        if self.quantize:
-            xy, scale, rot, feat = ste_quantize(xy, self.pos_bits), ste_quantize(
-                scale, self.scale_bits), ste_quantize(rot, self.rot_bits), self._quantize_feat(feat)
+        xy, scale, rot, feat = self._get_params(upsample_ratio=upsample_ratio)
         begin = perf_counter()
         tmp = project_gaussians_2d_scale_rot(xy, scale, rot, img_h, img_w, tile_bounds)
         xy, radii, conics, num_tiles_hit = tmp
@@ -463,18 +569,36 @@ class GaussianSplatting2D(nn.Module):
             scale = upsample_ratio * scale
         return scale
 
+    def _get_params(self, upsample_ratio=None):
+        """
+        Gaussian parameters used for rendering (scale in pixels), quantized with straight-through gradients if enabled.
+        Scales are quantized before upsampling, so that they match the stored values.
+        """
+        xy, scale, rot, feat = self.xy, self._get_scale(), self.rot, self.feat
+        if self.quant_mode != "none":
+            scale, rot = self._canonicalize(scale, rot)
+            params = (xy, scale, rot, feat)
+            q_params = self._dequantize_symbols(self._get_symbols(*params))
+            xy, scale, rot, feat = [x + (q_x - x).detach() for x, q_x in zip(params, q_params)]
+        if upsample_ratio is not None:
+            scale = upsample_ratio * scale
+        return xy, scale, rot, feat
+
     def _visualize_gaussian_id(self, img_h, img_w, tile_bounds, upsample_ratio=None):
-        feat = self._quantize_feat(self.feat) if self.quantize else self.feat
+        feat = self._get_params()[3]
         return self._render_features(self.vis_feat * feat.norm(dim=-1, keepdim=True), img_h, img_w, tile_bounds, upsample_ratio)
 
     def _render_features(self, feat, img_h, img_w, tile_bounds, upsample_ratio=None):
         """
         Render arbitrary per-Gaussian features [P, C] with the current Gaussian geometry.
         """
-        scale = self._get_scale(upsample_ratio=upsample_ratio)
-        xy, rot = self.xy, self.rot
-        if self.quantize:
-            xy, scale, rot = ste_quantize(xy, self.pos_bits), ste_quantize(scale, self.scale_bits), ste_quantize(rot, self.rot_bits)
+        xy, scale, rot, _ = self._get_params(upsample_ratio=upsample_ratio)
+        return self._rasterize(xy, scale, rot, feat, img_h, img_w, tile_bounds)
+
+    def _rasterize(self, xy, scale, rot, feat, img_h, img_w, tile_bounds):
+        """
+        Render per-Gaussian features [P, C] with the given Gaussian parameters (scale in pixels).
+        """
         tmp = project_gaussians_2d_scale_rot(xy, scale, rot, img_h, img_w, tile_bounds)
         xy, radii, conics, num_tiles_hit = tmp
         if not self.disable_tiles:
@@ -534,7 +658,7 @@ class GaussianSplatting2D(nn.Module):
                     break
         with torch.no_grad():
             self._log_images(log_final=True, plot_gaussians=self.vis_gaussians)
-            self._save_model()
+            self._save_model(final=True)
         self.worklog.info("Optimization completed")
         self.worklog.info("***********************************************")
         self.worklog.info(f"Mean scale: {self._get_scale().mean().item():.4f} (pixel) | {self.scale.mean().item():.4f} (raw)")
@@ -559,10 +683,15 @@ class GaussianSplatting2D(nn.Module):
         else:
             self.ssim_loss = None
 
-    def _evaluate(self, log=True, upsample=False):
+    def _evaluate(self, log=True, upsample=False, images=None):
+        """
+        Evaluate the rendered RGB images, or the given ones.
+        """
         if upsample:  # Do not log performance metrics for upsampled images
             log = False
-        images = torch.pow(torch.clamp(self._render_images(upsample=upsample), 0.0, 1.0), 1.0/self.gamma)
+        if images is None:
+            images = self._render_images(upsample=upsample)
+        images = torch.pow(torch.clamp(images, 0.0, 1.0), 1.0/self.gamma)
         gt_images = torch.pow(self.gt_images_upsampled if upsample else self.gt_images, 1.0/self.gamma)
         psnr = get_psnr(images, gt_images).item()
         ssim = fused_ssim(images.unsqueeze(0), gt_images.unsqueeze(0)).item()
@@ -721,11 +850,7 @@ class GaussianSplatting2D(nn.Module):
         Removing Gaussian k from the top-K list of a pixel changes its value from S_f / (S_w + eps) to (S_f - w_k f_k) / (S_w - w_k + eps),
         where S_w and S_f are the sums of the top-K weights and weighted features. Ignores the Gaussian that would move into the top-K list.
         """
-        scale = self._get_scale()
-        xy, rot, feat = self.xy, self.rot, self.feat
-        if self.quantize:
-            xy, scale, rot, feat = ste_quantize(xy, self.pos_bits), ste_quantize(
-                scale, self.scale_bits), ste_quantize(rot, self.rot_bits), self._quantize_feat(feat)
+        xy, scale, rot, feat = self._get_params()
         xy, radii, conics, num_tiles_hit = project_gaussians_2d_scale_rot(xy, scale, rot, self.img_h, self.img_w, self.tile_bounds)
         num_intersects, cum_tiles_hit = compute_cumulative_intersects(num_tiles_hit)
         _, _, _, gaussian_ids_sorted, tile_bins = bin_and_sort_gaussians(

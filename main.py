@@ -16,14 +16,21 @@ def get_gaussian_cfg(args):
         gaussian_cfg += f"_scale-{args.init_scale:.1f}"
     else:
         gaussian_cfg += f"_inv-scale-{args.init_scale:.1f}"
-    if not args.quantize:
+    if args.quant_mode == "none":
         args.pos_bits, args.scale_bits, args.rot_bits, args.feat_bits, args.y_bits, args.uv_bits = 32, 32, 32, 32, 32, 32
     all_bits = [args.pos_bits, args.scale_bits, args.rot_bits, args.feat_bits, args.y_bits, args.uv_bits]
     if min(all_bits) < 4 or max(all_bits) > 32:
         raise ValueError(f"Bit precision must be between 4 and 32 but got: {', '.join(f'{bits:d}' for bits in all_bits)}")
-    gaussian_cfg += f"_bits-{args.pos_bits:d}-{args.scale_bits:d}-{args.rot_bits:d}-{args.feat_bits:d}"
-    if args.color_space == "yuv":
-        gaussian_cfg += f"_yuv-{args.y_bits:d}-{args.uv_bits:d}"
+    if args.quant_mode == "step":
+        gaussian_cfg += f"_steps-{args.pos_step:g}-{args.scale_step:g}-{args.rot_step:g}-{args.feat_step:g}"
+        if args.color_space == "yuv":
+            gaussian_cfg += f"_yuv-{args.y_step:g}-{args.uv_step:g}"
+    else:
+        gaussian_cfg += f"_bits-{args.pos_bits:d}-{args.scale_bits:d}-{args.rot_bits:d}-{args.feat_bits:d}"
+        if args.color_space == "yuv":
+            gaussian_cfg += f"_yuv-{args.y_bits:d}-{args.uv_bits:d}"
+    if args.quant_mode != "none" and args.wrap_rot:
+        gaussian_cfg += "_wrap-rot"
     if not args.disable_topk_norm:
         gaussian_cfg += f"_top-{args.topk:d}"
     gaussian_cfg += f"_{args.init_mode[0]}-{args.init_random_ratio:.1f}"
