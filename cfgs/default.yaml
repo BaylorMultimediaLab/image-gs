@@ -14,16 +14,15 @@ feat_bits:             16 # Bit precision of individual feature dimension (RGB m
 y_bits:                16 # Bit precision of the Y feature dimension (YUV mode only)
 uv_bits:               16 # Bit precision of individual U and V feature dimensions (YUV mode only)
 # quant_mode: "step" configuration:
-# Step sizes from an equal-slope sweep (results/step-sweep): no step pays off when halved or doubled at the PSNR per bit of adding Gaussians
 pos_step:              0.125 # Position step in pixels ("step" mode)
-scale_step:            0.03125 # Scale step in octaves, i.e., log2 of the scale in pixels ("step" mode)
-rot_step:              0.703125 # Rotation step in degrees, 180/256 so that wrap_rot keeps the grid intact ("step" mode)
-feat_step:             0.03125 # Step of individual feature dimensions ("step" mode; RGB mode, and single-channel images in YUV mode)
-y_step:                0.03125 # Step of the Y feature dimension ("step" mode; YUV mode only; not tuned, same as feat_step)
-uv_step:               0.03125 # Step of individual U and V feature dimensions ("step" mode; YUV mode only; not tuned, same as feat_step)
+scale_step:            0.03125 # Scale step in octaves
+rot_step:              0.703125 # Rotation step in degrees
+feat_step:             0.015625 # Step of individual feature dimensions
+y_step:                0.015625 # Step of the Y feature dimension
+uv_step:               0.015625 # Step of individual U and V feature dimensions
 
-wrap_rot:              False # Wrap Gaussian orientations to [0, pi) before quantization (ellipses are symmetric under rotation by pi)
-bitstream_codec:       "rans" # Write a compressed bitstream of the quantized Gaussians after optimization (or with eval) and verify that it decodes losslessly, valid values include "none", "lzma" (LZMA on byte planes), and "rans" (rANS with static token histograms); both code Morton-sorted positions and choose raw or delta coding per stream
+wrap_rot:              False # Wrap Gaussian orientations to [0, pi) before quantization
+bitstream_codec:       "rans" # Write a compressed bitstream of the quantized Gaussians after optimization (or with eval) and verify that it decodes losslessly, valid values include "none", "lzma", and "rans"
 color_transform:       "subtract-green" # Lossless transform of the quantized features before entropy coding (any bitstream_codec), valid values include "none" and "subtract-green" (R-G, G, B-G as in WebP lossless; color_space "rgb" only)
 
 # Logging

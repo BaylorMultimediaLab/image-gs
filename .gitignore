@@ -4,6 +4,7 @@ animations/
 media/
 models/
 results/
+experiments/
 .vscode/
 .DS_Store
 *.code-workspace
