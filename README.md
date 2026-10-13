@@ -1,6 +1,6 @@
 # Image-GS
 
-Image-GS represents an image with 2D Gaussians that are optimized to reconstruct it. This version adds quantization of the Gaussian
+[Image-GS](https://github.com/NYU-ICL/image-gs) represents an image with 2D Gaussians that are optimized to reconstruct it. This version adds quantization of the Gaussian
 parameters, entropy-coded bitstreams (LZMA or rANS), pruning, and time-budgeted encoding.
 
 ## Setup
