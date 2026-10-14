@@ -1,6 +1,7 @@
 seed:                  123
 device:                "cuda:0"
 realtime:              False # Real-time encoding: skip what an encoder does not need (saved images, LPIPS/MS-SSIM/FLIP, periodic evaluation unless the adaptive learning rate schedule uses it, bitstream verification, PSNR measurement of pruning rounds), use fused Adam, and charge the time budget (max_time) by wall-clock time without synchronizing at every step
+cuda_graph:            False # Real-time mode only: replay each optimization step from a CUDA graph (one launch instead of about 110 kernels, so that a step costs its GPU time rather than its CPU time), captured again whenever pruning or densification replaces the Gaussians or the tile intersections outgrow their fixed-capacity buffers; requires quant_mode "step" or "none" and tiles
 # Evaluation
 eval:                  False # Render the optimized Image-GS representation
 render_height:         480 # Image height for rendering (aspect ratio is maintained)

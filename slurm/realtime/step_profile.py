@@ -10,9 +10,10 @@ A finished profiler session keeps slowing down kernel launches for the rest of t
 configurations are timed first, and profiled afterwards with new models trained for as many steps.
 
 Usage (repository root): slurm/realtime/step_profile.py --phase <name> [--configs 480p:1000,...] [--warmup 50] [--steps 300] [--profile-steps 50]
-Results in results/realtime/<phase>: profile.csv (one row per configuration), profile_kernels.csv (GPU time and launches per kernel and step),
-profile_cpu.csv (CPU time and calls per step of the step phases and CUDA runtime calls), and trace_<res>-<N>.json.gz (Chrome trace of the
-profiled steps, for https://ui.perfetto.dev).
+                         [--modes eager,graph] [--set key=value ...]  (graph: steps replayed from a CUDA graph, cuda_graph)
+Results in results/realtime/<phase>: profile.csv (one row per configuration and mode), profile_kernels.csv (GPU time and launches per kernel
+and step), profile_cpu.csv (CPU time and calls per step of the step phases and CUDA runtime calls), and trace_<res>-<N>-<mode>.json.gz (Chrome
+trace of the profiled steps, for https://ui.perfetto.dev).
 """
 import argparse
 import csv
@@ -45,6 +46,10 @@ def no_range(name):
 
 def step(model, label=no_range):
     """One optimization step as in GaussianSplatting2D.optimize() in real-time mode, without the time and schedule bookkeeping."""
+    if model.cuda_graph:
+        with label("graph_step"):
+            model._graph_step()
+        return
     with label("zero_grad"):
         model.optimizer.zero_grad()
     with label("forward"):
@@ -132,12 +137,12 @@ def analyze(prof, steps):
     return summary, sorted(kernel_rows, key=lambda row: -row["ms"]), sorted(cpu_rows, key=lambda row: (row["kind"], -row["ms"]))
 
 
-def build_model(res, num, image, log_dir):
+def build_model(res, num, image, log_dir, settings):
     with open("cfgs/default.yaml", encoding="utf-8") as file:
         cfg = yaml.safe_load(file)
     arm_cfg = {key: value[res] if isinstance(value, dict) else value for key, value in ARMS[ARM].items()}  # Per-resolution values
     cfg.update({**FIXED, **arm_cfg, "realtime": True, "num_gaussians": int(num), "prune_ratio": 0.0, "data_root": "media/uvg",
-                "input_path": f"{res}/{image}.png", "log_level": "WARNING", "log_dir": log_dir})
+                "input_path": f"{res}/{image}.png", "log_level": "WARNING", "log_dir": log_dir, **settings})
     model = GaussianSplatting2D(argparse.Namespace(**cfg))
     model.worklog.setLevel("WARNING")
     return model
@@ -163,27 +168,34 @@ def main():
     parser.add_argument("--warmup", type=int, default=50, help="Steps before the measurements")
     parser.add_argument("--steps", type=int, default=300, help="Steps timed without the profiler (wall-clock time per step)")
     parser.add_argument("--profile-steps", type=int, default=50, help="Steps recorded by the profiler, after as many as warmup + steps")
+    parser.add_argument("--modes", default="eager", help="Comma-separated: eager (as optimize() without cuda_graph), graph (cuda_graph)")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                        help="Override a setting of cfgs/default.yaml (YAML value), e.g., --set ssim_loss_ratio=0")
     options = parser.parse_args()
+    options.settings = {key: yaml.safe_load(value) for key, value in (item.split("=", 1) for item in options.set)}
     os.chdir(REPO)
     out_dir = os.path.join(REPO, "results", "realtime", options.phase)
     os.makedirs(out_dir, exist_ok=True)
-    print(f"{torch.cuda.get_device_name(0)} | torch {torch.__version__}", flush=True)
+    print(f"{torch.cuda.get_device_name(0)} | torch {torch.__version__} | settings {options.settings}", flush=True)
     rows, kernel_rows, cpu_rows = [], [], []
     with tempfile.TemporaryDirectory() as log_root:
+        runs = [(config, mode) for config in options.configs.split(",") for mode in options.modes.split(",")]
         wall_times = {}  # ms per step, before any profiler session
-        for config in options.configs.split(","):
+        for config, mode in runs:
             res, num = config.split(":")
-            model = build_model(res, num, options.image, os.path.join(log_root, f"{res}-{num}"))
+            model = build_model(res, num, options.image, os.path.join(log_root, f"{res}-{num}-{mode}"),
+                                {**options.settings, "cuda_graph": mode == "graph"})
             time_steps(model, options.warmup)
-            wall_times[config] = 1e3 * time_steps(model, options.steps)
-            print(f"{res} N{num}: wall {wall_times[config]:.3f} ms/step", flush=True)
+            wall_times[config, mode] = 1e3 * time_steps(model, options.steps)
+            print(f"{res} N{num} {mode}: wall {wall_times[config, mode]:.3f} ms/step", flush=True)
             del model
             torch.cuda.empty_cache()
-        for config in options.configs.split(","):
+        for config, mode in runs:
             res, num = config.split(":")
-            model = build_model(res, num, options.image, os.path.join(log_root, f"{res}-{num}-profiled"))
+            model = build_model(res, num, options.image, os.path.join(log_root, f"{res}-{num}-{mode}-profiled"),
+                                {**options.settings, "cuda_graph": mode == "graph"})
             time_steps(model, options.warmup + options.steps)
-            wall_ms = wall_times[config]
+            wall_ms = wall_times[config, mode]
             with forward_ranges(model), profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
                 torch.cuda.synchronize()
                 begin = perf_counter()
@@ -191,21 +203,21 @@ def main():
                     step(model, record_function)
                 torch.cuda.synchronize()
                 profiled_wall_ms = 1e3 * (perf_counter() - begin) / options.profile_steps
-            prof.export_chrome_trace(os.path.join(out_dir, f"trace_{res}-{num}.json.gz"))
+            prof.export_chrome_trace(os.path.join(out_dir, f"trace_{res}-{num}-{mode}.json.gz"))
             with torch.no_grad():
                 num_tiles_hit = model_module.project_gaussians_2d_scale_rot(*model._get_params()[:3], model.img_h, model.img_w,
                                                                              model.tile_bounds)[3]
                 intersects = int(num_tiles_hit.sum().item())
             summary, kernels, cpu = analyze(prof, options.profile_steps)
             idle_ms = wall_ms - summary["gpu_busy_ms"]
-            key = {"res": res, "num_gaussians": int(num)}
+            key = {"res": res, "num_gaussians": int(num), "mode": mode}
             rows.append({**key, "intersects": intersects, "wall_ms": wall_ms, "profiled_wall_ms": profiled_wall_ms, **summary,
                          "gpu_idle_ms": idle_ms, "gpu_idle_pct": 100.0 * idle_ms / wall_ms})
             kernel_rows += [{**key, **row} for row in kernels]
             cpu_rows += [{**key, **row} for row in cpu]
 
             s = summary
-            print(f"\n=== {res} N{num} ({intersects} tile intersections) ===\n"
+            print(f"\n=== {res} N{num} {mode} ({intersects} tile intersections) ===\n"
                   f"wall {wall_ms:.3f} ms/step (profiled {profiled_wall_ms:.3f}) | GPU busy {s['gpu_busy_ms']:.3f} ms (kernels "
                   f"{s['kernel_ms']:.3f}, memcpy {s['memcpy_ms']:.3f}, memset {s['memset_ms']:.3f}) | GPU idle {idle_ms:.3f} ms "
                   f"({100.0 * idle_ms / wall_ms:.0f}%)\n"

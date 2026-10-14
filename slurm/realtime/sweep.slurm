@@ -16,7 +16,7 @@
 # every task of an array. Submit from the repository root, after slurm/setup.slurm (slurm/realtime/submit.sh sweep does both):
 #   n=$(python3 slurm/realtime/sweep.py --count <arguments>)
 #   sbatch --array=0-$((n-1)) slurm/realtime/sweep.slurm <arguments>
-# Arguments: --phase <name> (results/realtime/<name>), --res, --images, --arms, --budgets (see slurm/realtime/sweep.py --help)
+# Arguments: --phase <name> (results/realtime/<name>), --res, --images, --arms, --budgets, --set key=value (see slurm/realtime/sweep.py --help)
 # The log directory must exist before submitting: mkdir -p results/slurm-logs
 set -eo pipefail  # No -u: module (Lmod) and venv activation read unset variables
 

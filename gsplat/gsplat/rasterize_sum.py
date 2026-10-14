@@ -8,7 +8,7 @@ from torch import Tensor
 from torch.autograd import Function
 
 import gsplat.cuda as _C
-from .utils import bin_and_sort_gaussians, compute_cumulative_intersects
+from .utils import bin_and_sort_gaussians, bin_and_sort_gaussians_capacity, compute_cumulative_intersects
 
 
 def rasterize_gaussians_sum(
@@ -21,8 +21,13 @@ def rasterize_gaussians_sum(
     img_width: int,
     BLOCK_H: int=16,
     BLOCK_W: int=16,
-    topk_norm: bool=False
+    topk_norm: bool=False,
+    capacity: Optional[int]=None
 ) -> Tensor:
+    """
+    With capacity, the tile intersections go to fixed-capacity buffers without reading their number back to the CPU (for CUDA graph
+    capture; see bin_and_sort_gaussians_capacity), and intersections beyond the capacity are dropped.
+    """
     if colors.dtype == torch.uint8:
         # make sure colors are float [0,1]
         colors = colors.float() / 255
@@ -43,7 +48,8 @@ def rasterize_gaussians_sum(
         img_width,
         BLOCK_H, 
         BLOCK_W,
-        topk_norm
+        topk_norm,
+        capacity
     )
 
 
@@ -62,7 +68,8 @@ class _RasterizeGaussiansSum(Function):
         img_width: int,
         BLOCK_H: int=16,
         BLOCK_W: int=16,
-        topk_norm: bool=False
+        topk_norm: bool=False,
+        capacity: Optional[int]=None
     ) -> Tensor:
         num_points = xys.size(0)
         BLOCK_X, BLOCK_Y = BLOCK_W, BLOCK_H
@@ -74,29 +81,35 @@ class _RasterizeGaussiansSum(Function):
         block = (BLOCK_X, BLOCK_Y, 1)
         img_size = (img_width, img_height, 1)
 
-        num_intersects, cum_tiles_hit = compute_cumulative_intersects(num_tiles_hit)
-
-        if num_intersects < 1:
-            out_img = (
-                torch.zeros(img_height, img_width, colors.shape[-1], device=xys.device)
+        if capacity is not None:
+            # Fixed-capacity buffers (CUDA graph capture): num_intersects is their size, at least one entry
+            num_intersects = capacity
+            gaussian_ids_sorted, tile_bins = bin_and_sort_gaussians_capacity(
+                num_points, capacity, xys, radii, num_tiles_hit, tile_bounds
             )
-            gaussian_ids_sorted = torch.zeros(0, 1, device=xys.device)
-            tile_bins =           torch.zeros(0, 2, device=xys.device)
         else:
-            (
-                isect_ids_unsorted,
-                gaussian_ids_unsorted,
-                isect_ids_sorted,
-                gaussian_ids_sorted,
-                tile_bins,
-            ) = bin_and_sort_gaussians(
-                num_points,
-                num_intersects,
-                xys,
-                radii,
-                cum_tiles_hit,
-                tile_bounds,
-            )
+            num_intersects, cum_tiles_hit = compute_cumulative_intersects(num_tiles_hit)
+            if num_intersects < 1:
+                out_img = (
+                    torch.zeros(img_height, img_width, colors.shape[-1], device=xys.device)
+                )
+                gaussian_ids_sorted = torch.zeros(0, 1, device=xys.device)
+                tile_bins =           torch.zeros(0, 2, device=xys.device)
+            else:
+                (
+                    isect_ids_unsorted,
+                    gaussian_ids_unsorted,
+                    isect_ids_sorted,
+                    gaussian_ids_sorted,
+                    tile_bins,
+                ) = bin_and_sort_gaussians(
+                    num_points,
+                    num_intersects,
+                    xys,
+                    radii,
+                    cum_tiles_hit,
+                    tile_bounds,
+                )
         
         ctx.img_width = img_width
         ctx.img_height = img_height
@@ -223,4 +236,5 @@ class _RasterizeGaussiansSum(Function):
             None,  # block_w
             None,  # block_h
             None,  # topk_norm
+            None,  # capacity
         )

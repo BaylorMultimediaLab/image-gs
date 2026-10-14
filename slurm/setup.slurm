@@ -38,7 +38,8 @@ BUILD_DIR=$(mktemp -d)
 cp -r gsplat "${BUILD_DIR}/gsplat"
 rm -rf "${BUILD_DIR}"/gsplat/build "${BUILD_DIR}"/gsplat/gsplat/csrc*.so  # A copied local build must not end up in the package
 python -m pip install "${BUILD_DIR}/gsplat" -c "${CONSTRAINTS}" --no-cache-dir --no-build-isolation
-python -m pip install "git+https://github.com/rahul-goel/fused-ssim/@a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38" -c "${CONSTRAINTS}" \
+# fused-ssim at the commit of its pull request #45 (kernels on PyTorch's current stream, which cuda_graph needs)
+python -m pip install "git+https://github.com/rahul-goel/fused-ssim/@732c243fc6731ac0ffa25de17a0d7219f90b61c6" -c "${CONSTRAINTS}" \
     --no-cache-dir --no-build-isolation
 # C++ rANS coder of compress/rans_codec.py, built from a copy as well
 cp -r compress/csrc "${BUILD_DIR}/rans"

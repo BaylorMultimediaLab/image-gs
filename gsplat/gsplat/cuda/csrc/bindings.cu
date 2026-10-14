@@ -13,6 +13,7 @@
 #include <iostream>
 #include <math.h>
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <tuple>
 
 namespace cg = cooperative_groups;
@@ -50,7 +51,7 @@ compute_cov2d_bounds_tensor(const int num_pts, torch::Tensor &covs2d) {
 
     int blocks = (num_pts + N_THREADS - 1) / N_THREADS;
 
-    compute_cov2d_bounds_kernel<<<blocks, N_THREADS>>>(
+    compute_cov2d_bounds_kernel<<<blocks, N_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         num_pts,
         covs2d.contiguous().data_ptr<float>(),
         conics.contiguous().data_ptr<float>(),
@@ -82,17 +83,59 @@ std::tuple<torch::Tensor, torch::Tensor> map_gaussian_to_intersects_tensor(
 
     map_gaussian_to_intersects<<<
         (num_points + N_THREADS - 1) / N_THREADS,
-        N_THREADS>>>(
+        N_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         num_points,
         (float2 *)xys.contiguous().data_ptr<float>(),
         radii.contiguous().data_ptr<int32_t>(),
         cum_tiles_hit.contiguous().data_ptr<int32_t>(),
         tile_bounds_dim3,
+        num_intersects,
         // Outputs.
         isect_ids_unsorted.contiguous().data_ptr<int64_t>(),
         gaussian_ids_unsorted.contiguous().data_ptr<int32_t>()
     );
 
+    return std::make_tuple(isect_ids_unsorted, gaussian_ids_unsorted);
+}
+
+// Fixed-capacity variant for CUDA graph capture, where the number of intersections stays on the GPU: buffers of capacity entries, of which
+// the unused ones keep the intersection ID ISECT_ID_PADDING (sorted last, skipped by get_tile_bin_edges). Intersections beyond the capacity
+// are dropped, so the caller must check their number (cum_tiles_hit[-1]) against it.
+std::tuple<torch::Tensor, torch::Tensor> map_gaussian_to_intersects_capacity_tensor(
+    const int num_points,
+    const int capacity,
+    const torch::Tensor &xys,
+    const torch::Tensor &radii,
+    const torch::Tensor &cum_tiles_hit,
+    const std::tuple<int, int, int> tile_bounds
+) {
+    CHECK_INPUT(xys);
+    CHECK_INPUT(radii);
+    CHECK_INPUT(cum_tiles_hit);
+
+    dim3 tile_bounds_dim3;
+    tile_bounds_dim3.x = std::get<0>(tile_bounds);
+    tile_bounds_dim3.y = std::get<1>(tile_bounds);
+
+    torch::Tensor gaussian_ids_unsorted =
+        torch::zeros({capacity}, xys.options().dtype(torch::kInt32));
+    torch::Tensor isect_ids_unsorted =
+        torch::full({capacity}, ISECT_ID_PADDING, xys.options().dtype(torch::kInt64));
+
+    map_gaussian_to_intersects<<<
+        (num_points + N_THREADS - 1) / N_THREADS,
+        N_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        num_points,
+        (float2 *)xys.contiguous().data_ptr<float>(),
+        radii.contiguous().data_ptr<int32_t>(),
+        cum_tiles_hit.contiguous().data_ptr<int32_t>(),
+        tile_bounds_dim3,
+        capacity,
+        // Outputs.
+        isect_ids_unsorted.contiguous().data_ptr<int64_t>(),
+        gaussian_ids_unsorted.contiguous().data_ptr<int32_t>()
+    );
+    CUDA_CHECK_LAUNCH();
     return std::make_tuple(isect_ids_unsorted, gaussian_ids_unsorted);
 }
 
@@ -105,7 +148,7 @@ torch::Tensor get_tile_bin_edges_tensor(
     );
     get_tile_bin_edges<<<
         (num_intersects + N_THREADS - 1) / N_THREADS,
-        N_THREADS>>>(
+        N_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         num_intersects,
         isect_ids_sorted.contiguous().data_ptr<int64_t>(),
         (int2 *)tile_bins.contiguous().data_ptr<int>()
@@ -159,7 +202,7 @@ std::tuple<
     // block: block_w * block_h * 1
     // each thread processes a pixel
     // each block processes a tile
-    rasterize_forward<<<tile_bounds_dim3, block_dim3>>>(
+    rasterize_forward<<<tile_bounds_dim3, block_dim3, 0, at::cuda::getCurrentCUDAStream()>>>(
         tile_bounds_dim3,
         img_size_dim3,
         gaussian_ids_sorted.contiguous().data_ptr<int32_t>(),
@@ -215,7 +258,7 @@ std::tuple<
         {img_height, img_width, channels}, xys.options().dtype(torch::kFloat32)
     );
 
-    nd_rasterize_forward<<<tile_bounds_dim3, block_dim3>>>(
+    nd_rasterize_forward<<<tile_bounds_dim3, block_dim3, 0, at::cuda::getCurrentCUDAStream()>>>(
         tile_bounds_dim3,
         img_size_dim3,
         channels,
@@ -286,7 +329,7 @@ std::
     //     workspace = torch::zeros({0}, xys.options().dtype(torch::kFloat32));
     // }
 
-    nd_rasterize_backward_kernel<<<tile_bounds, block>>>(
+    nd_rasterize_backward_kernel<<<tile_bounds, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         tile_bounds,
         img_size,
         channels,
@@ -349,7 +392,7 @@ std::tuple<
         {img_height, img_width, TOP_K}, xys.options().dtype(torch::kInt32)
     );
     
-    nd_rasterize_forward_topk_norm<<<tile_bounds_dim3, block_dim3>>>(
+    nd_rasterize_forward_topk_norm<<<tile_bounds_dim3, block_dim3, 0, at::cuda::getCurrentCUDAStream()>>>(
         tile_bounds_dim3,
         img_size_dim3,
         channels,
@@ -411,7 +454,7 @@ nd_rasterize_backward_topk_norm_tensor(
     torch::Tensor v_conic = torch::zeros({num_points, 3}, xys.options());
     torch::Tensor v_colors =
         torch::zeros({num_points, channels}, xys.options());
-    nd_rasterize_backward_topk_norm_kernel<<<tile_bounds, block>>>(
+    nd_rasterize_backward_topk_norm_kernel<<<tile_bounds, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         tile_bounds,
         img_size,
         channels,
@@ -470,7 +513,7 @@ std::tuple<
         {img_height, img_width, TOP_K}, xys.options().dtype(torch::kInt32)
     );
     
-    nd_rasterize_forward_no_tiles<<<grid_size_dim3, block_dim3>>>(
+    nd_rasterize_forward_no_tiles<<<grid_size_dim3, block_dim3, 0, at::cuda::getCurrentCUDAStream()>>>(
         img_size_dim3,
         channels,
         num_points,
@@ -518,7 +561,7 @@ nd_rasterize_backward_no_tiles_tensor(
     torch::Tensor v_conic = torch::zeros({num_points, 3}, xys.options());
     torch::Tensor v_colors =
         torch::zeros({num_points, channels}, xys.options());
-    nd_rasterize_backward_no_tiles_kernel<<<grid_size, block_size>>>(
+    nd_rasterize_backward_no_tiles_kernel<<<grid_size, block_size, 0, at::cuda::getCurrentCUDAStream()>>>(
         img_size,
         channels,
         (float2 *)xys.contiguous().data_ptr<float>(),
@@ -693,7 +736,7 @@ std::
     torch::Tensor v_colors =
         torch::zeros({num_points, channels}, xys.options());
 
-    rasterize_backward_kernel<<<tile_bounds, block>>>(
+    rasterize_backward_kernel<<<tile_bounds, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         tile_bounds,
         img_size,
         gaussians_ids_sorted.contiguous().data_ptr<int>(),
@@ -746,7 +789,7 @@ project_gaussians_2d_scale_rot_forward_tensor(
 
     project_gaussians_2d_scale_rot_forward_kernel<<<
         (num_points + N_THREADS - 1) / N_THREADS,
-        N_THREADS>>>(
+        N_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         num_points,
         (float2 *)means2d.contiguous().data_ptr<float>(),
         (float2 *)scales2d.contiguous().data_ptr<float>(),
@@ -799,7 +842,7 @@ project_gaussians_2d_scale_rot_backward_tensor(
 
     project_gaussians_2d_scale_rot_backward_kernel<<<
         (num_points + N_THREADS - 1) / N_THREADS,
-        N_THREADS>>>(
+        N_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         num_points,
         (float2 *)means2d.contiguous().data_ptr<float>(),
         (float2 *)scales2d.contiguous().data_ptr<float>(),

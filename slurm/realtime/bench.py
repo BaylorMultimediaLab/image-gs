@@ -32,8 +32,8 @@ ARMS = {"default": {}, "realtime": {"realtime": True}}
 
 def encode(base_args, overrides):
     """
-    Encode one frame; returns its timings, steps, numbers of Gaussians, PSNR, SSIM, bitstream size, and the pruning and densification rounds
-    ("P<step>:<number>" or "A<step>:<number>").
+    Encode one frame; returns its timings, steps, numbers of Gaussians, PSNR, SSIM, bitstream size, the pruning and densification rounds
+    ("P<step>:<number>" or "A<step>:<number>") with their wall-clock time, and the CUDA graph captures (cuda_graph).
     """
     args = copy.copy(base_args)
     vars(args).update(overrides)
@@ -51,7 +51,8 @@ def encode(base_args, overrides):
     return {"num_init": args.num_gaussians, "gaussians": model.num_gaussians, "steps": model.step, "counted_s": model.total_time_accum,
             "init_s": init_time, "optimization_s": model.wall_times["optimization"], "saving_s": model.wall_times["saving"], "total_s": total_time,
             "psnr": ckpt["psnr"], "ssim": ckpt["ssim"], "bytes": ckpt["bitstream_bytes"],
-            "rounds": " ".join(f"{action[0]}{step}:{num}" for step, action, num in rounds)}
+            "rounds": " ".join(f"{action[0]}{step}:{num}" for step, action, num in rounds),
+            "round_s": model.round_time_accum, "graph_captures": model.graph_captures, "graph_capture_s": model.graph_capture_time}
 
 
 def main():

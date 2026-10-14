@@ -28,6 +28,15 @@ std::tuple<torch::Tensor, torch::Tensor> map_gaussian_to_intersects_tensor(
     const std::tuple<int, int, int> tile_bounds
 );
 
+std::tuple<torch::Tensor, torch::Tensor> map_gaussian_to_intersects_capacity_tensor(
+    const int num_points,
+    const int capacity,
+    const torch::Tensor &xys,
+    const torch::Tensor &radii,
+    const torch::Tensor &cum_tiles_hit,
+    const std::tuple<int, int, int> tile_bounds
+);
+
 torch::Tensor get_tile_bin_edges_tensor(
     int num_intersects,
     int num_tiles,

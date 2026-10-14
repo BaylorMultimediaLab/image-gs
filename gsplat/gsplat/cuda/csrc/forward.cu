@@ -9,12 +9,14 @@ namespace cg = cooperative_groups;
 
 // kernel to map each intersection from tile ID and depth to a gaussian
 // writes output to isect_ids and gaussian_ids
+// intersections at index capacity and beyond are dropped (fixed-capacity buffers of map_gaussian_to_intersects_capacity_tensor)
 __global__ void map_gaussian_to_intersects(
     const int num_points,
     const float2* __restrict__ xys,
     const int* __restrict__ radii,
     const int32_t* __restrict__ cum_tiles_hit,
     const dim3 tile_bounds,
+    const int capacity,
     int64_t* __restrict__ isect_ids,
     int32_t* __restrict__ gaussian_ids
 ) {
@@ -33,6 +35,8 @@ __global__ void map_gaussian_to_intersects(
     int64_t depth_id = 0;
     for (int i = tile_min.y; i < tile_max.y; ++i) {
         for (int j = tile_min.x; j < tile_max.x; ++j) {
+            if (cur_idx >= capacity)
+                return;
             // isect_id is tile ID and depth as int32
             int64_t tile_id = i * tile_bounds.x + j; // tile within image
             isect_ids[cur_idx] = (tile_id << 32) | depth_id; // tile | depth id
@@ -45,28 +49,22 @@ __global__ void map_gaussian_to_intersects(
 // kernel to map sorted intersection IDs to tile bins
 // expect that intersection IDs are sorted by increasing tile ID
 // i.e. intersections of a tile are in contiguous chunks
+// each entry sets the start of its tile if it is the first of the tile, and the end if it is the last one; entries with the padding ID
+// ISECT_ID_PADDING (sorted last, see map_gaussian_to_intersects_capacity_tensor) are skipped
 __global__ void get_tile_bin_edges(
     const int num_intersects, const int64_t* __restrict__ isect_ids_sorted, int2* __restrict__ tile_bins
 ) {
     unsigned idx = cg::this_grid().thread_rank();
     if (idx >= num_intersects)
         return;
-    // save the indices where the tile_id changes
-    int32_t cur_tile_idx = (int32_t)(isect_ids_sorted[idx] >> 32);
-    if (idx == 0 || idx == num_intersects - 1) {
-        if (idx == 0)
-            tile_bins[cur_tile_idx].x = 0;
-        if (idx == num_intersects - 1)
-            tile_bins[cur_tile_idx].y = num_intersects;
-    }
-    if (idx == 0)
+    const int64_t isect_id = isect_ids_sorted[idx];
+    if (isect_id == ISECT_ID_PADDING)
         return;
-    int32_t prev_tile_idx = (int32_t)(isect_ids_sorted[idx - 1] >> 32);
-    if (prev_tile_idx != cur_tile_idx) {
-        tile_bins[prev_tile_idx].y = idx;
+    int32_t cur_tile_idx = (int32_t)(isect_id >> 32);
+    if (idx == 0 || (int32_t)(isect_ids_sorted[idx - 1] >> 32) != cur_tile_idx)
         tile_bins[cur_tile_idx].x = idx;
-        return;
-    }
+    if (idx == num_intersects - 1 || (int32_t)(isect_ids_sorted[idx + 1] >> 32) != cur_tile_idx)
+        tile_bins[cur_tile_idx].y = idx + 1;
 }
 
 // kernel function for rasterizing each tile

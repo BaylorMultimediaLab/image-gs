@@ -1,17 +1,19 @@
 """
-Encoding time at which image-gs overtakes HEVC: RD curves of three rate-control arms at a series of time budgets in real-time mode (wall-clock
+Encoding time at which image-gs overtakes HEVC: RD curves of rate-control arms at a series of time budgets in real-time mode (wall-clock
 budgets, persistent process), at 480p/720p on the UVG test frames. Arms (settings loaded from the earlier sweeps):
   fixed-n            fixed numbers of Gaussians, 10% pruned at 1/6 of the budget (slurm/lowres/sweep.py, arm step-feat64)
+  fixed-n-noprune    the same without pruning (no rounds, so no CUDA graph recaptures either)
   qp-lam4            QP rate control, lambda x4 pruning from an overestimate (slurm/qp/sweep.py, arm cap25x4-lam4)
   qp-lam4-mid-add25  the same, starting in the middle and adding Gaussians between the rounds (slurm/qp/sweep.py, cap25x4-lam4-mid-add25)
 Pruning rounds and the learning rate decay come at fixed fractions of the budget, i.e., within a few dozen steps at the shortest budgets.
 Each task encodes one rate point (number of Gaussians or QP) of one image and arm at every budget, shortest first, in one process after a
 discarded warm-up encode, and writes a row per run to results/realtime/<phase>/rows/task<i>.csv; a rerun skips the finished budgets.
 
-Locally:  slurm/realtime/sweep.py --phase <name> [--res ...] [--images ...] [--arms ...] [--budgets ...]   runs all tasks one after another
+Locally:  slurm/realtime/sweep.py --phase <name> [--res ...] [--images ...] [--arms ...] [--budgets ...] [--set key=value ...]   runs all tasks
+          one after another (--set overrides a setting of every arm, e.g., --set cuda_graph=true)
 Slurm:    slurm/realtime/sweep.py --task <i> [...]   runs only task i (one per array task, see slurm/realtime/sweep.slurm)
 Count:    slurm/realtime/sweep.py --count [...]      prints the number of tasks (the array size)
-Analysis: .venv/bin/python experiments/realtime/analyze.py <phase>
+Analysis: .venv/bin/python experiments/realtime/analyze.py <phase> [<phase> ...]
 """
 import argparse
 import csv
@@ -36,12 +38,13 @@ BUDGETS = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
 # Settings, the option that sets the rate, and its values per resolution
 ARMS = {
     "fixed-n": ({**LOWRES.FIXED, **LOWRES.ARMS["step-feat64"]}, "num_gaussians", LOWRES.NUM_GAUSSIANS),
+    "fixed-n-noprune": ({**LOWRES.FIXED, **LOWRES.ARMS["step-feat64"], "prune_ratio": 0.0}, "num_gaussians", LOWRES.NUM_GAUSSIANS),
     "qp-lam4": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4"]}, "qp", {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
     "qp-lam4-mid-add25": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"]}, "qp", {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
 }
 
 
-def run_task(index, job, phase, budgets):
+def run_task(index, job, phase, budgets, extra):
     import torch
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from bench import encode
@@ -62,7 +65,7 @@ def run_task(index, job, phase, budgets):
 
     def overrides(budget, log_root, exp_name):
         return {**settings, rate_key: rate, "realtime": True, "max_time": budget, "data_root": os.path.join(REPO, "media", "uvg"),
-                "input_path": f"{res}/{image}.png", "log_root": log_root, "exp_name": exp_name}
+                "input_path": f"{res}/{image}.png", "log_root": log_root, "exp_name": exp_name, **extra}
 
     with tempfile.TemporaryDirectory() as log_root:  # CUDA initialization and kernel warm-up, which a persistent encoder pays once
         encode(base_args, overrides(budgets[0], log_root, "warm-up"))
@@ -86,11 +89,18 @@ def parse_args():
     parser.add_argument("--arms", default=",".join(ARMS), help=f"Arms (comma-separated) from: {', '.join(ARMS)}")
     parser.add_argument("--images", default=",".join(LOWRES.IMAGES), help="Images in media/uvg/<res>/ without extension (comma-separated)")
     parser.add_argument("--budgets", default=",".join(f"{budget:g}" for budget in BUDGETS), help="Time budgets in seconds (comma-separated)")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                        help="Override a setting of every arm (YAML value), e.g., --set cuda_graph=true")
     parser.add_argument("--task", type=int, default=None, help="Run only this task index (Slurm array task)")
     parser.add_argument("--count", action="store_true", help="Print the number of tasks and exit")
     args = parser.parse_args()
     args.res, args.arms, args.images = args.res.split(","), args.arms.split(","), args.images.split(",")
     args.budgets = [float(budget) for budget in args.budgets.split(",")]
+    if args.set:
+        import yaml  # Only then, so that --count runs with the login node's Python
+        args.extra = {key: yaml.safe_load(value) for key, value in (item.split("=", 1) for item in args.set)}
+    else:
+        args.extra = {}
     unknown = [arm for arm in args.arms if arm not in ARMS] + [res for res in args.res if res not in LOWRES.NUM_GAUSSIANS]
     if unknown:
         parser.error(f"Unknown arms or resolutions: {', '.join(unknown)}")
@@ -110,7 +120,7 @@ if __name__ == "__main__":
     if args.task is not None:
         if not 0 <= args.task < len(jobs):
             sys.exit(f"Task {args.task} is out of range (there are {len(jobs)} tasks)")
-        run_task(args.task, jobs[args.task], args.phase, args.budgets)
+        run_task(args.task, jobs[args.task], args.phase, args.budgets, args.extra)
     else:
         for index, job in enumerate(jobs):
-            run_task(index, job, args.phase, args.budgets)
+            run_task(index, job, args.phase, args.budgets, args.extra)

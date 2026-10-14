@@ -57,6 +57,8 @@ QP_FEAT_STEP_HALVING = 15.0  # QPs over which the feature step halves
 
 
 class GaussianSplatting2D(nn.Module):
+    isect_capacity_ratio = 2.0  # Tile intersection buffers of CUDA graphs, relative to the number at capture time
+
     def __init__(self, args):
         super(GaussianSplatting2D, self).__init__()
         self.evaluate = args.eval
@@ -446,6 +448,15 @@ class GaussianSplatting2D(nn.Module):
         self.scale_lr = args.scale_lr
         self.rot_lr = args.rot_lr
         self.feat_lr = args.feat_lr
+        # CUDA graph of the optimization step, captured by _graph_step
+        self.cuda_graph = args.cuda_graph
+        if self.cuda_graph and not (self.realtime and self.quant_mode != "minmax" and not self.disable_tiles):
+            raise ValueError("cuda_graph requires realtime, quant_mode 'step' or 'none', and tiles")
+        self.graph, self.graph_key, self.graph_capacity, self.prev_step_event = None, None, 0, None
+        self.graph_captures, self.graph_capture_time = 0, 0.0
+        # Peak number of tile intersections since the last capture, on the GPU and copied to pinned memory by every replay
+        self.isect_peak = torch.zeros(1, dtype=torch.int64, device=self.device)
+        self.isect_peak_host = torch.zeros(1, dtype=torch.int64, pin_memory=self.cuda_graph)
         self.optimizer = self._new_optimizer()
         self.disable_lr_schedule = args.disable_lr_schedule
         if not self.disable_lr_schedule:
@@ -465,8 +476,13 @@ class GaussianSplatting2D(nn.Module):
     def _new_optimizer(self):
         """
         Adam over the current Gaussian parameters. Real-time mode uses the fused implementation (one kernel per parameter group instead of
-        about ten), which is faster but not bit-identical.
+        about ten), which is faster but not bit-identical. For CUDA graphs, the step counts stay on the GPU (capturable) and the learning rates
+        are GPU tensors, which the schedules decay in place, so that the captured step uses the current ones.
         """
+        if self.cuda_graph:
+            groups = [(self.xy, self.pos_lr), (self.scale, self.scale_lr), (self.rot, self.rot_lr), (self.feat, self.feat_lr)]
+            return torch.optim.Adam([{'params': param, 'lr': torch.tensor(lr, device=self.device)} for param, lr in groups],
+                                    fused=True, capturable=True)
         return torch.optim.Adam([{'params': self.xy, 'lr': self.pos_lr},
                                  {'params': self.scale, 'lr': self.scale_lr},
                                  {'params': self.rot, 'lr': self.rot_lr},
@@ -680,14 +696,20 @@ class GaussianSplatting2D(nn.Module):
                 render_time_all[rid] = render_time
         return render_time_all
 
-    def forward(self, img_h, img_w, tile_bounds, upsample_ratio=None, benchmark=False):
+    def forward(self, img_h, img_w, tile_bounds, upsample_ratio=None, benchmark=False, isect_capacity=None):
+        """
+        With isect_capacity, the tile intersections go to buffers of that size without reading their number back to the CPU (CUDA graph
+        capture), and their peak number is tracked in isect_peak.
+        """
         xy, scale, rot, feat = self._get_params(upsample_ratio=upsample_ratio)
         begin = perf_counter()
         tmp = project_gaussians_2d_scale_rot(xy, scale, rot, img_h, img_w, tile_bounds)
         xy, radii, conics, num_tiles_hit = tmp
+        if isect_capacity is not None:
+            torch.maximum(self.isect_peak, num_tiles_hit.sum(dtype=torch.int64), out=self.isect_peak)
         if not self.disable_tiles:
             enable_topk_norm = not self.disable_topk_norm
-            tmp = xy, radii, conics, num_tiles_hit, feat, img_h, img_w, self.block_h, self.block_w, enable_topk_norm
+            tmp = xy, radii, conics, num_tiles_hit, feat, img_h, img_w, self.block_h, self.block_w, enable_topk_norm, isect_capacity
             out_image = rasterize_gaussians_sum(*tmp)
         else:
             tmp = xy, conics, feat, img_h, img_w
@@ -765,6 +787,7 @@ class GaussianSplatting2D(nn.Module):
         self.best_psnr, self.best_ssim = 0.0, 0.0
         self.decay_times, self.no_improvement_steps = 0, 0
         self.render_time_accum, self.total_time_accum = 0.0, 0.0
+        self.round_time_accum = 0.0  # Wall-clock time of the densification and pruning rounds
         self.lpips_final, self.flip_final, self.msssim_final = 1.0, 1.0, 0.0
 
         self.step = 0
@@ -776,21 +799,24 @@ class GaussianSplatting2D(nn.Module):
         for step in range(self.start_step, self.max_steps+1):
             self.step = step
             step_begin = perf_counter()
-            self.optimizer.zero_grad()
-            # Rendering
-            images, render_time = self.forward(self.img_h, self.img_w, self.tile_bounds)
-            self.render_time_accum += render_time
-            # Optimization
-            begin = perf_counter()
-            self._get_total_loss(images)
-            self.total_loss.backward()
-            self.optimizer.step()
-            if self.max_scale > 0.0:
-                self._clamp_scale()
-            if not self.realtime:
-                if self.max_time > 0.0:
-                    torch.cuda.synchronize()  # Charge each step its GPU time
-                self.total_time_accum += (perf_counter() - begin + render_time)
+            if self.cuda_graph:
+                self._graph_step()
+            else:
+                self.optimizer.zero_grad()
+                # Rendering
+                images, render_time = self.forward(self.img_h, self.img_w, self.tile_bounds)
+                self.render_time_accum += render_time
+                # Optimization
+                begin = perf_counter()
+                self._get_total_loss(images)
+                self.total_loss.backward()
+                self.optimizer.step()
+                if self.max_scale > 0.0:
+                    self._clamp_scale()
+                if not self.realtime:
+                    if self.max_time > 0.0:
+                        torch.cuda.synchronize()  # Charge each step its GPU time
+                    self.total_time_accum += (perf_counter() - begin + render_time)
             # Logging
             terminate = False
             with torch.no_grad():
@@ -815,9 +841,10 @@ class GaussianSplatting2D(nn.Module):
                         self._prune_gaussians_lambda(plot_gaussians=self.vis_gaussians)
                     else:
                         self._prune_gaussians(self.max_prune_num, plot_gaussians=self.vis_gaussians)
+                self.round_time_accum += perf_counter() - begin
                 if self.realtime:
                     # Wall-clock time of the whole step without synchronizing: reading back the number of tile intersections in every forward
-                    # pass keeps the CPU at most one step ahead of the GPU
+                    # pass (or waiting for the previous step of the CUDA graph) keeps the CPU at most one step ahead of the GPU
                     self.total_time_accum += perf_counter() - step_begin
                 elif self.max_time > 0.0:
                     self.total_time_accum += perf_counter() - begin  # Densification and pruning are part of the time budget
@@ -833,12 +860,69 @@ class GaussianSplatting2D(nn.Module):
             self._save_model(final=True)
         torch.cuda.synchronize()
         self.wall_times = {"optimization": optimization_time, "saving": perf_counter() - wall_begin - optimization_time}
+        graph_info = f" | {self.graph_captures:d} CUDA graph captures ({self.graph_capture_time:.3f} s)" if self.cuda_graph else ""
         self.worklog.info(f"Optimization completed | Wall-clock time: {optimization_time:.3f} s optimization ({self.step:d} steps), "
-                          f"{self.wall_times['saving']:.3f} s final evaluation, checkpoint, and bitstream")
+                          f"{self.wall_times['saving']:.3f} s final evaluation, checkpoint, and bitstream{graph_info}")
         self.worklog.info("***********************************************")
         self.worklog.info(f"Mean scale: {self._get_scale().mean().item():.4f} (pixel) | {self.scale.mean().item():.4f} (raw)")
         self.worklog.info("***********************************************")
         return self.psnr_curr, self.ssim_curr
+
+    def _graph_step(self):
+        """
+        One optimization step replayed from a CUDA graph (cuda_graph). The step is captured again whenever pruning or densification replaced
+        the Gaussian parameters or the optimizer, or the tile intersections outgrew their fixed-capacity buffers (dropping the excess in the
+        meantime, for a step or two). Then waits for the previous step, so that the CPU stays at most one step ahead of the GPU.
+        """
+        key = (self.xy, self.scale, self.rot, self.feat, self.optimizer)
+        overflow = int(self.isect_peak_host[0]) > self.graph_capacity  # Peak of a recent step (written by the replays)
+        if self.graph is None or overflow or any(a is not b for a, b in zip(key, self.graph_key)):
+            self._capture_step(key)
+            return
+        self.graph.replay()
+        event = torch.cuda.Event()
+        event.record()
+        if self.prev_step_event is not None:
+            self.prev_step_event.synchronize()
+        self.prev_step_event = event
+
+    def _capture_step(self, key):
+        """
+        Optimization step as a CUDA graph: an eager step (on a side stream, as before any capture; it also creates the optimizer state of new
+        parameters), then the capture of the next one, with buffers for isect_capacity_ratio times the current number of tile intersections.
+        """
+        begin = perf_counter()
+        self.graph, self.graph_key, self.prev_step_event = None, None, None  # Frees the memory of the previous graph
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            self.optimizer.zero_grad()
+            images, _ = self.forward(self.img_h, self.img_w, self.tile_bounds)
+            self._get_total_loss(images)
+            self.total_loss.backward()
+            self.optimizer.step()
+            if self.max_scale > 0.0:
+                self._clamp_scale()
+            with torch.no_grad():
+                xy, scale, rot, _ = self._get_params()
+                num_tiles_hit = project_gaussians_2d_scale_rot(xy, scale, rot, self.img_h, self.img_w, self.tile_bounds)[3]
+                capacity = max(1024, round(self.isect_capacity_ratio * num_tiles_hit.sum().item()))
+        torch.cuda.current_stream().wait_stream(stream)
+        self.isect_peak.zero_()
+        self.isect_peak_host.zero_()
+        self.optimizer.zero_grad(set_to_none=True)  # backward() then allocates the gradients from the memory pool of the graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            images, _ = self.forward(self.img_h, self.img_w, self.tile_bounds, isect_capacity=capacity)
+            self._get_total_loss(images)
+            self.total_loss.backward()
+            self.optimizer.step()
+            if self.max_scale > 0.0:
+                self._clamp_scale()
+            self.isect_peak_host.copy_(self.isect_peak, non_blocking=True)
+        self.graph, self.graph_key, self.graph_capacity = graph, key, capacity
+        self.graph_captures += 1
+        self.graph_capture_time += perf_counter() - begin
 
     def _get_total_loss(self, images):
         self.total_loss = 0

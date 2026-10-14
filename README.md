@@ -16,7 +16,8 @@ pip install -r requirements.txt
 # CUDA extensions, compiled for the compute capability of your GPU (e.g., 8.0 for an A100, 8.6 for an RTX 30 series)
 export TORCH_CUDA_ARCH_LIST="8.6"
 pip install ./gsplat --no-build-isolation
-pip install git+https://github.com/rahul-goel/fused-ssim/@a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38 --no-build-isolation
+# fused-ssim at the commit of its pull request #45, which launches the kernels on PyTorch's current stream (needed by cuda_graph)
+pip install git+https://github.com/rahul-goel/fused-ssim/@732c243fc6731ac0ffa25de17a0d7219f90b61c6 --no-build-isolation
 
 # C++ rANS coder (rebuild after changing compress/csrc/rans.cpp; compress/rans_codec.py refuses a build from another source)
 pip install ./compress/csrc --no-build-isolation
@@ -45,6 +46,7 @@ image file or a directory with a texture stack. Each run writes its log, config,
 | Schedule | By default, progressive optimization adds Gaussians in rounds and the learning rate decays when PSNR stops improving (up to `--max_steps`). `--max_time <seconds>` optimizes for a fixed time instead, pruning and decaying the learning rate at `--prune_time_ratio` and `--decay_time_ratio` of the budget. `--disable_prog_optim` starts with all Gaussians. |
 | Gaussians | `--max_scale <pixels>` caps the Gaussian size; `--init_mode gradient`, `saliency`, or `random` |
 | Real-time | `--realtime` skips what an encoder does not need (saved images, LPIPS/MS-SSIM/FLIP, periodic evaluation unless the adaptive learning rate schedule needs it, bitstream verification), uses fused Adam, and charges `--max_time` by wall-clock time without synchronizing every step. Writes the bitstream and the final checkpoint with PSNR/SSIM. |
+| CUDA graph | `--realtime --cuda_graph` replays each optimization step from a CUDA graph, so that a step costs its GPU time instead of the CPU time of launching about 110 kernels, which limits fast GPUs at low resolutions (e.g., 480p on an A100). The graph is captured again after every pruning or densification round. Requires `--quant_mode step` (or `none`). |
 
 Examples:
 
@@ -57,6 +59,8 @@ python main.py --disable_prog_optim --max_time 40 --max_steps 1000000
 
 # Real-time encoding within a 1-second budget
 python main.py --realtime --disable_prog_optim --max_time 1 --max_steps 1000000
+# The same with CUDA graphs
+python main.py --realtime --cuda_graph --disable_prog_optim --max_time 1 --max_steps 1000000
 
 # HEVC-like QP within a 40-second budget, pruning in 4 rounds (at 1/6 to 4/6 of the budget) of at most 25% each
 python main.py --qp 32 --prune_times 4 --prune_max_ratio 0.25 --disable_prog_optim --max_time 40 --max_steps 1000000
