@@ -401,6 +401,12 @@ nd_rasterize_backward_topk_norm_tensor(
     const dim3 block(BLOCK_W, BLOCK_H, 1);
     const dim3 img_size = {img_width, img_height, 1};
     const int channels = colors.size(1);
+    if ((BLOCK_W * BLOCK_H) % 32 != 0 || BLOCK_W * BLOCK_H > BLOCK_SIZE) {
+        AT_ERROR("the block size must be a multiple of 32 and at most BLOCK_SIZE (warp sums over whole warps)");
+    }
+    if (channels > MAX_CHANNELS) {
+        AT_ERROR("at most MAX_CHANNELS channels");
+    }
     torch::Tensor v_xy = torch::zeros({num_points, 2}, xys.options());
     torch::Tensor v_conic = torch::zeros({num_points, 3}, xys.options());
     torch::Tensor v_colors =

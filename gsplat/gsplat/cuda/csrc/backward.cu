@@ -155,6 +155,14 @@ __global__ void nd_rasterize_backward_kernel(
     }
 }
 
+// Sum over the 32 lanes of a warp, returned to every lane (all lanes must be active)
+inline __device__ float warp_sum_all(float value) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        value += __shfl_xor_sync(0xffffffff, value, offset);
+    return value;
+}
+
 __global__ void nd_rasterize_backward_topk_norm_kernel(
     const dim3 tile_bounds,
     const dim3 img_size,
@@ -184,21 +192,21 @@ __global__ void nd_rasterize_backward_topk_norm_kernel(
     // clamp this value to the last pixel
     const int32_t pix_id = min(i * img_size.x + j, img_size.x * img_size.y - 1);
 
-    // keep not rasterizing threads around for reading data
+    // threads outside the image take part in the warp sums with an empty top-K list
     const bool inside = (i < img_size.y && j < img_size.x);
-    if (!inside) return;
 
     // df/d_out for this pixel
     const float* v_out = &(v_output[channels * pix_id]);
-    // topk gs id for this pixel
-    const int* topk = &pixel_topk[pix_id * TOP_K];
-    
-    // compute the normalization factor
 
-    float d_local[TOP_K] = {0.0f};
+    // topk gs ids for this pixel and their weights d = exp(-sigma)
+    int32_t topk[TOP_K];
+    float d_local[TOP_K];
     float denom = EPS;
     int cnt = 0;
+    #pragma unroll
     for (int k = 0; k < TOP_K; ++k) {
+        topk[k] = inside ? pixel_topk[pix_id * TOP_K + k] : -1;
+        d_local[k] = 0.f;
         int g_id = topk[k];
         if (g_id < 0) continue;
         ++cnt;
@@ -212,74 +220,131 @@ __global__ void nd_rasterize_backward_topk_norm_kernel(
         denom += d;
         d_local[k] = d;
     }
-    // if (cnt > 1) {printf("cnt: %d\n", cnt);}
-    
-    float v_d_local[TOP_K] = {0.f};
 
-    // compute each gaussian's contribution to the gradient
+    // out = sum_k d_k f_k / denom, so dL/dd_l = (f_l . v_out) / denom - sum_k d_k (f_k . v_out) / denom^2
+    float v_norm_d[TOP_K];
+    float v_d_shared = 0.f;
+    #pragma unroll
     for (int k = 0; k < TOP_K; ++k) {
+        v_norm_d[k] = 0.f;
         int g_id = topk[k];
         if (g_id < 0) continue;
-
-        float d = d_local[k];
-        float norm_d = d / denom;
-        float v_rgb_local[MAX_CHANNELS] = {0.f};
-
-        // update v_rgb for this gaussian
-        for (int c = 0; c < channels; ++c)
-            v_rgb_local[c] = norm_d * v_out[c];
-        
         const float* rgb = &rgbs[channels * g_id];
-        float* v_rgb_ptr = (float*)(v_rgb);
         for (int c = 0; c < channels; ++c)
-            atomicAdd(v_rgb_ptr + channels * g_id + c, v_rgb_local[c]);
-        
-        float v_norm_d = 0.f;
-        for (int c = 0; c < channels; ++c)
-            v_norm_d += rgb[c] * v_out[c];
-
-        float tmp = -d / (denom*denom) * v_norm_d;
-        for (int l = 0; l < TOP_K; ++l) {
-            if (l == k) {
-                v_d_local[l] += v_norm_d/denom + tmp;
-            } 
-            else {
-                v_d_local[l] += tmp;
-            }
-        }        
+            v_norm_d[k] += rgb[c] * v_out[c];
+        v_d_shared += -d_local[k] / (denom*denom) * v_norm_d[k];
     }
 
+    // per top-K entry: the weight of its color and dL/dsigma = -d dL/dd
+    float rgb_weight_local[TOP_K];
+    float v_sigma_local[TOP_K];
+    #pragma unroll
     for (int k = 0; k < TOP_K; ++k) {
-        int g_id = topk[k];
-        if (g_id < 0) continue;
+        rgb_weight_local[k] = d_local[k] / denom;
+        v_sigma_local[k] = -d_local[k] * (v_norm_d[k] / denom + v_d_shared);
+    }
 
-        const float* rgb = &rgbs[channels * g_id];
-        float v_sigma = 0.f;
-        v_sigma = v_d_local[k];
-        v_sigma *= -d_local[k];
+    const int2 range = tile_bins[tile_id];
+    if (range.y - range.x > TOPK_WALK_MAX_GAUSSIANS) {
+        // crowded tile (the same branch for the whole block): walking its list would cost more than per-pixel atomic adds
+        if (!inside) return;
+        #pragma unroll
+        for (int k = 0; k < TOP_K; ++k) {
+            int g_id = topk[k];
+            if (g_id < 0) continue;
+            float v_sigma = v_sigma_local[k];
+            float3 conic = conics[g_id];
+            float2 xy = xys[g_id];
+            float2 delta = {xy.x - px, xy.y - py};
+            float* v_conic_ptr = (float*)(v_conic);
+            atomicAdd(v_conic_ptr + 3*g_id + 0, 0.5f * v_sigma * delta.x * delta.x);
+            atomicAdd(v_conic_ptr + 3*g_id + 1, v_sigma * delta.x * delta.y);
+            atomicAdd(v_conic_ptr + 3*g_id + 2, 0.5f * v_sigma * delta.y * delta.y);
+            float* v_xy_ptr = (float*)(v_xy);
+            atomicAdd(v_xy_ptr + 2*g_id + 0, v_sigma * (conic.x * delta.x + conic.y * delta.y));
+            atomicAdd(v_xy_ptr + 2*g_id + 1, v_sigma * (conic.y * delta.x + conic.z * delta.y));
+            for (int c = 0; c < channels; ++c)
+                atomicAdd(v_rgb + channels * g_id + c, rgb_weight_local[k] * v_out[c]);
+        }
+        return;
+    }
 
-        float3 conic = conics[g_id];
-        float2 xy = xys[g_id];
-        float2 delta = {xy.x - px, xy.y - py};
-        
-        // update v_conic for this gaussian
-        float3 v_conic_local = {0.5f * v_sigma * delta.x * delta.x, 
-                                v_sigma * delta.x * delta.y, 
-                         0.5f * v_sigma * delta.y * delta.y};
-        
-        // update v_xy for this gaussian
-        float2 v_xy_local = {v_sigma * (conic.x * delta.x + conic.y * delta.y), 
-                      v_sigma * (conic.y * delta.x + conic.z * delta.y)};
-        
+    // walk the tile's Gaussians in batches loaded into shared memory, as in the forward pass
+    const int block_size = block.size();
+    const int num_batches = (range.y - range.x + block_size - 1) / block_size;
 
-        float* v_conic_ptr = (float*)(v_conic);
-        atomicAdd(v_conic_ptr + 3*g_id + 0, v_conic_local.x);
-        atomicAdd(v_conic_ptr + 3*g_id + 1, v_conic_local.y);
-        atomicAdd(v_conic_ptr + 3*g_id + 2, v_conic_local.z);
-        
-        float* v_xy_ptr = (float*)(v_xy);
-        atomicAdd(v_xy_ptr + 2*g_id + 0, v_xy_local.x);
-        atomicAdd(v_xy_ptr + 2*g_id + 1, v_xy_local.y);
+    __shared__ int32_t id_batch[BLOCK_SIZE];
+    __shared__ float2 xy_batch[BLOCK_SIZE];
+    __shared__ float3 conic_batch[BLOCK_SIZE];
+
+    const int tr = block.thread_rank();
+    const int lane = tr % 32;
+    // values per Gaussian, lane v adds value v: v_conic (0-2), v_xy (3-4), v_rgb (5-)
+    const int num_values = 5 + channels;
+    int remaining = cnt;  // top-K Gaussians of this pixel not reached yet
+
+    for (int b = 0; b < num_batches; ++b) {
+        // end early once every pixel of the tile has reached all of its top-K Gaussians
+        if (__syncthreads_count(remaining > 0) == 0) {
+            break;
+        }
+        int batch_start = range.x + block_size * b;
+        int idx = batch_start + tr;
+        if (idx < range.y) {
+            int32_t g_id = gaussians_ids_sorted[idx];
+            id_batch[tr] = g_id;
+            xy_batch[tr] = xys[g_id];
+            conic_batch[tr] = conics[g_id];
+        }
+        block.sync();
+
+        // all branches below are uniform within the warp
+        int batch_size = min(block_size, range.y - batch_start);
+        for (int t = 0; t < batch_size; ++t) {
+            if (!__any_sync(0xffffffff, remaining > 0))
+                break;
+            const int32_t g_id = id_batch[t];
+            float rgb_weight = 0.f;
+            float v_sigma = 0.f;
+            bool hit = false;
+            #pragma unroll
+            for (int k = 0; k < TOP_K; ++k) {
+                if (topk[k] == g_id) {
+                    rgb_weight = rgb_weight_local[k];
+                    v_sigma = v_sigma_local[k];
+                    hit = true;
+                }
+            }
+            if (!__any_sync(0xffffffff, hit))
+                continue;
+            remaining -= hit;
+
+            const float3 conic = conic_batch[t];
+            const float2 xy = xy_batch[t];
+            const float2 delta = {xy.x - px, xy.y - py};
+            float value = 0.f;
+            float sum;
+            sum = warp_sum_all(0.5f * v_sigma * delta.x * delta.x);
+            if (lane == 0) value = sum;
+            sum = warp_sum_all(v_sigma * delta.x * delta.y);
+            if (lane == 1) value = sum;
+            sum = warp_sum_all(0.5f * v_sigma * delta.y * delta.y);
+            if (lane == 2) value = sum;
+            sum = warp_sum_all(v_sigma * (conic.x * delta.x + conic.y * delta.y));
+            if (lane == 3) value = sum;
+            sum = warp_sum_all(v_sigma * (conic.y * delta.x + conic.z * delta.y));
+            if (lane == 4) value = sum;
+            for (int c = 0; c < channels; ++c) {
+                sum = warp_sum_all(rgb_weight * v_out[c]);
+                if (lane == 5 + c) value = sum;
+            }
+            if (lane < num_values) {
+                float* target = lane < 3 ? (float*)v_conic + 3 * g_id + lane
+                              : lane < 5 ? (float*)v_xy + 2 * g_id + (lane - 3)
+                              : v_rgb + channels * g_id + (lane - 5);
+                atomicAdd(target, value);
+            }
+        }
     }
 }
 
