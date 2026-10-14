@@ -77,6 +77,21 @@ def encode_bitstream(attributes, meta=b"", codec="lzma", channel_refs=None):
     return data, order, [(bits + coded_bits) / 8.0 for bits, coded_bits in zip(header_bits, group_bits)]
 
 
+def estimate_bits(indices, channel_refs=None):
+    """
+    Fast estimate of the coded size in bits of quantized Gaussian attributes without the header, with the transforms of encode_bitstream
+    and rans_codec.estimate_stream_bits.
+    indices: list of quantization indices [P, C] int64 per attribute, where the first attribute is the position (C = 2).
+    """
+    channel_refs = [None] * len(indices) if channel_refs is None else channel_refs
+    _, order, codes = morton_order(indices[0])
+    streams = [np.diff(codes, prepend=np.uint64(0)).astype(np.int64)]
+    for values, refs in zip(indices[1:], channel_refs[1:]):
+        values = values[order] if refs is None else subtract_channels(values[order], refs)
+        streams += [values[:, c] for c in range(values.shape[1])]
+    return sum(rans_codec.estimate_stream_bits(stream) for stream in streams)
+
+
 def decode_bitstream(data):
     """
     Decode a bitstream written by encode_bitstream.

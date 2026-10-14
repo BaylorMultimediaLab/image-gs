@@ -35,7 +35,7 @@ image file or a directory with a texture stack. Each run writes its log, config,
 
 | What | Options |
 |---|---|
-| Rate | `--num_gaussians`; `--prune_ratio` prunes that fraction of them after densification (`--prune_score loo` or `contribution`) |
+| Rate | `--qp <QP>` sets everything below from an HEVC-like quantization parameter: λ pruning with HEVC's λ at that QP, from a content-agnostic overestimate of the number of Gaussians (`--qp_overestimate`), and a feature step that halves every 15 QP. Otherwise `--num_gaussians`; `--prune_ratio` prunes that fraction of them after densification (`--prune_score loo` or `contribution`), or `--prune_mode lambda --prune_lambda <λ>` prunes, in up to `--prune_times` rounds, every Gaussian whose removal increases the squared error (8-bit units, summed over pixels) by less than λ times its bits, at most `--prune_max_ratio` of them per round |
 | Quantization | `--quant_mode step` (fixed step sizes: `--pos_step`, `--scale_step`, `--rot_step`, `--feat_step`), `minmax` (bit depths over each attribute's range: `--pos_bits`, `--scale_bits`, `--rot_bits`, `--feat_bits`), or `none` |
 | Bitstream | `--bitstream_codec rans`, `lzma`, or `none`; `--color_transform subtract-green` (codes R-G, G, B-G) or `none` |
 | Color space | `--color_space rgb` or `yuv` (with `--y_step`/`--uv_step` or `--y_bits`/`--uv_bits`; requires `--color_transform none`) |
@@ -51,12 +51,9 @@ python main.py --quant_mode minmax --pos_bits 16 --scale_bits 8 --rot_bits 8 --f
 # Encoding within a 40-second optimization budget
 python main.py --disable_prog_optim --max_time 40 --max_steps 1000000
 
+# HEVC-like QP within a 40-second budget, pruning in 4 rounds (at 1/6 to 4/6 of the budget) of at most 25% each
+python main.py --qp 32 --prune_times 4 --prune_max_ratio 0.25 --disable_prog_optim --max_time 40 --max_steps 1000000
+
 # Unquantized float parameters (a bitstream requires quantization)
 python main.py --quant_mode none --bitstream_codec none
 ```
-
-## Sweeps on a Slurm cluster
-
-`slurm/setup.slurm` builds the environment once, and `slurm/submit_lowres.sh [options]` submits the 480p/720p sweep as a job array with
-one run per task, after the setup job. Cluster-specific settings (account, partition, modules) are in the `#SBATCH` headers and
-`slurm/env.sh`. `python slurm/lowres_sweep.py --help` lists the sweep options; without `--task`, it runs the whole sweep locally.

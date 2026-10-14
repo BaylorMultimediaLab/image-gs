@@ -3,25 +3,22 @@ Step-size and quantization comparison at 480p/720p at equal encoding time (time-
 Runs are numbered in a fixed order (resolution, image, number of Gaussians, arm). Finished runs with the expected settings are skipped.
 Run from the repository root; results go to results/lowres/<phase>.
 
-Locally:  slurm/lowres_sweep.py [--res 480p,720p] [--arms ...]   runs all runs one at a time, so that time budgets are not shared
+Locally:  slurm/lowres/sweep.py [--res 480p,720p] [--arms ...]   runs all runs one at a time, so that time budgets are not shared
           (--snapshot DIR runs a frozen copy of the code and config, so that repo edits cannot leak into a long sweep)
-Slurm:    slurm/lowres_sweep.py --task <i> [...]                 runs only run i (one per array task, see slurm/lowres_sweep.slurm)
-Count:    slurm/lowres_sweep.py --count [...]                    prints the number of runs (the array size)
+Slurm:    slurm/lowres/sweep.py --task <i> [...]                 runs only run i (one per array task, see slurm/lowres/sweep.slurm)
+Count:    slurm/lowres/sweep.py --count [...]                    prints the number of runs (the array size)
 """
 import argparse
-import glob
 import os
-import subprocess
 import sys
 
-REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-DATA_ROOT = os.path.join(REPO, "media", "uvg")
-IMAGES = ["Beauty_0001", "Bosphorus_0001", "Jockey_0001"]
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from sweep_utils import IMAGES, REPO, TIME_BUDGET, run_main  # noqa: E402
+
 # Gaussians before pruning (10% are pruned); 720p uses 2.25x as many as 480p, the same number per pixel
 NUM_GAUSSIANS = {"480p": [500, 1000, 2000, 4000], "720p": [1125, 2250, 4500, 9000]}
-# Equal encoding time (user, 2026-10-12): the same optimization time budget for every run of a resolution, measured with GPU
-# synchronization; no progressive optimization, prune 10% at 1/6 and decay the LR at 5/6 of the budget. max_steps only caps runaway runs.
-TIME_BUDGET = {"480p": 40.0, "720p": 90.0}
+# Time-budgeted optimization (TIME_BUDGET): no progressive optimization, prune 10% at 1/6 and decay the LR at 5/6 of the budget.
+# max_steps only caps runaway runs.
 FIXED = {"seed": 123, "max_steps": 1000000, "disable_prog_optim": True, "prune_ratio": 0.1, "prune_score": "loo", "prune_time_ratio": 0.1667,
          "decay_time_ratio": 0.8333, "color_space": "rgb", "init_scale": 2.25, "bitstream_codec": "rans", "color_transform": "subtract-green",
          "save_image_format": "png"}
@@ -42,34 +39,12 @@ ARMS = {
 DEFAULT_ARMS = ["minmax-16-8-8-10", "step", "step-feat64", "step-feat128", "step-pos16", "step-pos16-feat64"]
 
 
-def finished_ok(exp_dir, expected):
-    import yaml  # Not needed to count runs, e.g., on a login node
-    for cfg_path in glob.glob(f"{exp_dir}/*/cfg_train.yaml"):
-        with open(cfg_path) as f:
-            cfg = yaml.safe_load("".join(line for line in f if not line.startswith("#")))
-        log = open(os.path.join(os.path.dirname(cfg_path), "log_train.txt")).read()
-        if "LPIPS:" in log and "Lossless decoding verified" in log and all(cfg.get(k) == v for k, v in expected.items()):
-            return True
-    return False
-
-
 def run(job, phase, budgets, cwd):
     res, image, num_gaussians, arm = job
     exp = f"lowres/{phase}/{res}/{image}/{arm}/N{num_gaussians}"
     arm_cfg = {key: value[res] if isinstance(value, dict) else value for key, value in ARMS[arm].items()}  # Per-resolution values
     expected = {**FIXED, **arm_cfg, "num_gaussians": num_gaussians, "max_time": budgets[res]}
-    if finished_ok(f"{REPO}/results/{exp}", expected):
-        print(f"{res} {image:15s} {arm:18s} N{num_gaussians:<5d} skipped (already done)", flush=True)
-        return True
-    cmd = [sys.executable, "main.py", f"--log_root={REPO}/results", f"--data_root={DATA_ROOT}", f"--input_path={res}/{image}.png",
-           f"--exp_name={exp}"]
-    cmd += [f"--{k}={v}" for k, v in expected.items() if not isinstance(v, bool)] + [f"--{k}" for k, v in expected.items() if v is True]
-    out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-    ok = finished_ok(f"{REPO}/results/{exp}", expected)
-    print(f"{res} {image:15s} {arm:18s} N{num_gaussians:<5d} {'done' if ok else 'FAILED'}", flush=True)
-    if not ok:
-        print((out.stdout + out.stderr)[-4000:], flush=True)
-    return ok
+    return run_main(exp, f"{res}/{image}.png", expected, cwd, f"{res} {image:15s} {arm:18s} N{num_gaussians:<5d}")
 
 
 def parse_args():

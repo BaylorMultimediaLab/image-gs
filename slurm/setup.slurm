@@ -12,8 +12,8 @@
 #SBATCH --time=01:00:00
 
 # Builds the image-gs environment once, so that array tasks only activate it: a venv on top of the PyTorch and SciPy modules, gsplat and
-# fused-ssim compiled for the A100, and the LPIPS backbone weights. Then runs a smoke test and times optimization steps (slurm/calib.py).
-# Submit from the repository root: sbatch slurm/setup.slurm  (slurm/submit_lowres.sh does this before the sweep)
+# fused-ssim compiled for the A100, and the LPIPS backbone weights. Then runs a smoke test and times optimization steps (slurm/lowres/calib.py).
+# Submit from the repository root: sbatch slurm/setup.slurm  (slurm/<study>/submit.sh does this before a sweep)
 set -eo pipefail  # No -u: module (Lmod) and venv activation read unset variables
 
 if [ -z "${IGS_VENV}${VSC_SCRATCH}" ]; then
@@ -60,6 +60,6 @@ python -m pip freeze --all > results/lowres/freeze_a100.txt  # Compare with the 
 python main.py --data_root=media/uvg --input_path=480p/Beauty_0001.png --num_gaussians=1000 --disable_prog_optim --max_steps=100000 \
     --max_time=5 --bitstream_codec=rans --color_transform=subtract-green --exp_name=slurm-smoke | tail -n 12
 grep -q "Lossless decoding verified" results/slurm-smoke/*/log_train.txt
-python slurm/calib.py results/lowres/calib_a100.csv \
+python slurm/lowres/calib.py results/lowres/calib_a100.csv \
     480p:1000:step,480p:4000:step,480p:4000:minmax-16-8-8-10,720p:9000:step,720p:9000:minmax-16-8-8-10
 echo "Setup completed"

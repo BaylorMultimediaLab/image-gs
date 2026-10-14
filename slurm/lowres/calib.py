@@ -1,6 +1,6 @@
 """
 Time per optimization step (forward, loss, backward, Adam) on an otherwise idle GPU, without evaluation or logging.
-Usage (repo root): slurm/calib.py <out_csv> <res:N:arm,...>  (arms as in lowres_sweep.ARMS)
+Usage (repo root): slurm/lowres/calib.py <out_csv> <res:N:arm,...>  (arms as in slurm/lowres/sweep.py)
 """
 import argparse
 import csv
@@ -15,7 +15,7 @@ import yaml
 sys.path.insert(0, os.getcwd())
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import GaussianSplatting2D  # noqa: E402
-from lowres_sweep import ARMS, FIXED, IMAGES  # noqa: E402
+from sweep import ARMS, FIXED, IMAGES  # noqa: E402
 
 WARMUP, STEPS = 50, 300
 

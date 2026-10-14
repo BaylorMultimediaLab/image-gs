@@ -15,7 +15,7 @@ from lpips import LPIPS
 from pytorch_msssim import MS_SSIM
 from torchvision.transforms.functional import gaussian_blur
 
-from compress import decode_bitstream, encode_bitstream
+from compress import decode_bitstream, encode_bitstream, estimate_bits
 from gsplat import (
     bin_and_sort_gaussians,
     compute_cumulative_intersects,
@@ -46,6 +46,15 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=FutureWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=FutureWarning, module="lpips")
 
+# Settings derived from the quantization parameter (qp), fitted on the 480p/720p UVG equal-time runs (A100, 40/90 s; experiments/qp/fit.py):
+# x265's RD slope in the units of prune_lambda is 0.9-1.1x HEVC's lambda at QP 22-37. The number of Gaussians that paid off doubles every
+# ~5 QP (4.7-5.6 per image) and varies 2.5x between images; QP_DENSITY is the most for any image. Refining the feature step paid off
+# from QP ~44 (1/32 -> 1/64) and below QP ~29 (1/64 -> 1/128), i.e., the optimal step halves every ~15 QP.
+QP_DENSITY = 8.0  # Gaussians per 1000 pixels at QP 32
+QP_DENSITY_DOUBLING = 5.0  # QPs over which the number of Gaussians doubles
+QP_FEAT_STEP = 1.0 / 64.0  # Feature step at QP 37
+QP_FEAT_STEP_HALVING = 15.0  # QPs over which the feature step halves
+
 
 class GaussianSplatting2D(nn.Module):
     def __init__(self, args):
@@ -56,6 +65,7 @@ class GaussianSplatting2D(nn.Module):
         self.dtype = torch.float32
         self._init_logging(args)
         self._init_target(args)
+        self._init_qp(args)
         self._init_color_space(args)
         self._init_bit_precision(args)
         self._init_gaussians(args)
@@ -106,7 +116,8 @@ class GaussianSplatting2D(nn.Module):
         consoleHandler.setFormatter(logging.Formatter(fmt="\x1b[32m[{asctime}] \x1b[0m{message}", datefmt=datefmt, style="{"))
         self.worklog.handlers = [fileHandler, consoleHandler]
         action = "rendering" if self.evaluate else "optimizing"
-        self.worklog.info(f"Start {action} {args.num_gaussians:d} Gaussians for '{args.input_path}'")
+        target = f"at QP {args.qp:g}" if args.qp > 0.0 else f"{args.num_gaussians:d} Gaussians"
+        self.worklog.info(f"Start {action} {target} for '{args.input_path}'")
         self.worklog.info("***********************************************")
 
     def _init_target(self, args):
@@ -128,6 +139,29 @@ class GaussianSplatting2D(nn.Module):
         if not self.evaluate:
             path = f"{self.log_dir}/gt_res-{self.img_h:d}x{self.img_w:d}"
             self._separate_and_save_images(images=self.gt_images, channels=self.input_channels, path=path)
+
+    def _init_qp(self, args):
+        """
+        Rate settings from the quantization parameter: lambda pruning with HEVC's lambda at this QP, starting from a content-agnostic
+        overestimate of the number of Gaussians, and a feature step that halves every QP_FEAT_STEP_HALVING QPs. The other steps are unchanged.
+        """
+        if args.qp == 0.0:
+            return
+        if args.qp < 0.0:
+            raise ValueError(f"Quantization parameter must be positive (or 0 to disable it) but got: {args.qp}")
+        if args.quant_mode != "step":
+            raise ValueError("The quantization parameter requires quant_mode 'step'")
+        if args.qp_overestimate <= 0.0 or args.qp_lambda_scale <= 0.0:
+            raise ValueError(f"Overestimation and lambda factors must be positive but got: {args.qp_overestimate}, {args.qp_lambda_scale}")
+        density = QP_DENSITY * 2.0**((32.0 - args.qp) / QP_DENSITY_DOUBLING)
+        args.num_gaussians = max(1, round(args.qp_overestimate * density * self.img_h * self.img_w / 1000.0))
+        args.feat_step = args.y_step = args.uv_step = QP_FEAT_STEP * 2.0**((args.qp - 37.0) / QP_FEAT_STEP_HALVING)
+        args.prune_mode = "lambda"
+        args.prune_lambda = args.qp_lambda_scale * 0.57 * 2.0**((args.qp - 12.0) / 3.0)
+        self.worklog.info(f"QP {args.qp:g}: {args.num_gaussians:d} Gaussians before pruning ({args.qp_overestimate:g} x {density:.2f} per 1000 pixels), "
+                          f"feature step 1/{1.0/args.feat_step:.1f}, lambda {args.prune_lambda:.2f} ({args.qp_lambda_scale:g} x HEVC's)")
+        if not self.evaluate:
+            save_cfg(path=f"{self.log_dir}/cfg_train.yaml", args=args)  # Record the derived settings
 
     def _load_target_images(self, path, downsample_ratio=None):
         self.gt_images, self.input_channels, self.image_fnames, self.bit_depths = load_images(
@@ -284,28 +318,56 @@ class GaussianSplatting2D(nn.Module):
         self._log_compression_rate()
 
     def _init_pruning(self, args):
+        self.prune_mode = args.prune_mode
+        if self.prune_mode not in ["ratio", "lambda"]:
+            raise ValueError(f"Unsupported pruning mode '{self.prune_mode}', valid values include 'ratio' and 'lambda'")
         if not 0.0 <= args.prune_ratio < 1.0:
             raise ValueError(f"Pruning ratio must be in [0, 1) but got: {args.prune_ratio}")
         if not 0.0 <= args.relocate_ratio < 1.0:
             raise ValueError(f"Relocation ratio must be in [0, 1) but got: {args.relocate_ratio}")
-        self.num_prune = round(args.prune_ratio * self.total_num_gaussians)
+        # With prune_mode "lambda", the number of pruned Gaussians is decided during optimization and final_num_gaussians is an upper bound
+        self.num_prune = round(args.prune_ratio * self.total_num_gaussians) if self.prune_mode == "ratio" else 0
         self.final_num_gaussians = self.total_num_gaussians - self.num_prune
         self.num_pruned = 0
+        self.prune_rounds_done = 0
+        self.prune_finished = self.prune_mode == "ratio" and self.num_prune == 0
         self.relocate_ratio = args.relocate_ratio
         if self.evaluate:
-            self.num_gaussians = self.final_num_gaussians  # Checkpoints only contain the Gaussians that survived pruning
+            # Checkpoints only contain the Gaussians that survived pruning
+            checkpoint = torch.load(self._get_ckpt_path(args.ckpt_file), weights_only=False)
+            self.num_gaussians = self.final_num_gaussians = checkpoint["state_dict"]["xy"].shape[0]
             return
         if self.relocate_ratio > 0.0 and self.disable_prog_optim:
             raise ValueError("Relocation happens at densification steps and requires progressive optimization")
-        if self.num_prune > 0 or self.relocate_ratio > 0.0:
+        if self.prune_mode == "lambda":
+            if args.prune_lambda <= 0.0:
+                raise ValueError(f"Pruning lambda must be positive but got: {args.prune_lambda}")
+            if not 0.0 < args.prune_max_ratio < 1.0:
+                raise ValueError(f"Maximum pruning ratio per round must be in (0, 1) but got: {args.prune_max_ratio}")
+            if args.prune_score != "loo":
+                raise ValueError("Pruning mode 'lambda' requires prune_score 'loo'")
+            if self.quant_mode == "none":
+                raise ValueError("Pruning mode 'lambda' requires quantization to estimate the bits per Gaussian")
+            if args.prune_add_ratio < 0.0:
+                raise ValueError(f"Ratio of added Gaussians per round must be non-negative but got: {args.prune_add_ratio}")
+            self.prune_lambda = args.prune_lambda
+            self.prune_max_ratio = args.prune_max_ratio
+            self.prune_add_ratio = args.prune_add_ratio
+            self.worklog.info(f"Pruning with lambda {self.prune_lambda:g}: up to {args.prune_times:d} rounds of at most {100.0*self.prune_max_ratio:g}% "
+                              f"of the Gaussians, sizes logged before pruning assume all {self.total_num_gaussians:d}"
+                              + (f", adding {100.0*self.prune_add_ratio:g}% after each round but the last" if self.prune_add_ratio > 0.0 else ""))
+        elif args.prune_add_ratio > 0.0:
+            raise ValueError("Adding Gaussians between pruning rounds requires prune_mode 'lambda'")
+        if not self.prune_finished or self.relocate_ratio > 0.0:
             self.prune_score = args.prune_score
             if self.prune_score not in ["contribution", "loo"]:
                 raise ValueError(f"Unsupported pruning score '{self.prune_score}', valid values include 'contribution' and 'loo'")
             if self.prune_score == "loo" and (args.disable_tiles or args.disable_topk_norm):
                 raise ValueError("Pruning score 'loo' requires tile-based rendering with top-K normalization")
-        if self.num_prune > 0:
+        if not self.prune_finished:
             if args.prune_times < 1:
                 raise ValueError(f"Number of pruning rounds must be positive but got: {args.prune_times:d}")
+            self.prune_times = args.prune_times
             self.prune_steps = args.prune_steps
             self.max_prune_num = math.ceil(float(self.num_prune) / args.prune_times)
             # Pruning starts once progressive optimization has added all Gaussians
@@ -319,7 +381,7 @@ class GaussianSplatting2D(nn.Module):
         """
         Whether progressive optimization and pruning have both finished.
         """
-        return self.num_pruned == self.num_prune and self.num_gaussians == self.final_num_gaussians
+        return self.prune_finished and self.num_gaussians == self.final_num_gaussians
 
     def _log_compression_rate(self):
         bytes_uncompressed = 0.0
@@ -448,14 +510,19 @@ class GaussianSplatting2D(nn.Module):
             target_features = target_features[0, :, 0, :].permute(1, 0)  # [P, C]
         return target_features
 
+    def _get_ckpt_path(self, ckpt_file):
+        """
+        Path of the given checkpoint file, or of the latest checkpoint if none is given.
+        """
+        if ckpt_file != "":
+            return os.path.join(self.ckpt_dir, ckpt_file)
+        latest_step = get_latest_ckpt_step(self.ckpt_dir)
+        if latest_step == -1:
+            raise FileNotFoundError(f"No checkpoint found in '{self.ckpt_dir}'")
+        return os.path.join(self.ckpt_dir, f"ckpt_step-{latest_step:d}.pt")
+
     def _load_model(self):
-        if self.ckpt_file != "":
-            ckpt_path = os.path.join(self.ckpt_dir, self.ckpt_file)
-        else:
-            latest_step = get_latest_ckpt_step(self.ckpt_dir)
-            if latest_step == -1:
-                raise FileNotFoundError(f"No checkpoint found in '{self.ckpt_dir}'")
-            ckpt_path = os.path.join(self.ckpt_dir, f"ckpt_step-{latest_step:d}.pt")
+        ckpt_path = self._get_ckpt_path(self.ckpt_file)
         checkpoint = torch.load(ckpt_path, weights_only=False)
         ckpt_color_space = checkpoint.get("color_space", "rgb")  # Checkpoints without this field were trained in RGB
         if ckpt_color_space != self.color_space:
@@ -503,6 +570,15 @@ class GaussianSplatting2D(nn.Module):
             self.scale.copy_(scale if self.disable_inverse_scale else 1.0 / scale)
             self.rot.copy_(rot)
             self.feat.copy_(feat)
+
+    def _estimate_bits(self):
+        """
+        Fast estimate of the coded size in bits of the quantized Gaussians, without the bitstream header.
+        """
+        with torch.no_grad():
+            symbols = self._get_symbols(self.xy, *self._canonicalize(self._get_scale(), self.rot), self.feat)
+            indices = [q.cpu().numpy().astype(np.int64) for q, _, _ in symbols]
+        return estimate_bits(indices, channel_refs=self._get_channel_refs())
 
     def _write_bitstream(self, path):
         """
@@ -696,10 +772,13 @@ class GaussianSplatting2D(nn.Module):
                     # Relocation: replace the Gaussians with the lowest score by additional error-guided Gaussians
                     relocate_num = round(self.relocate_ratio * self.num_gaussians)
                     if relocate_num > 0:
-                        self._remove_gaussians(relocate_num, action="Relocating", plot_gaussians=self.vis_gaussians)
+                        self._remove_lowest_score(relocate_num, action="Relocating", plot_gaussians=self.vis_gaussians)
                     self._add_gaussians(self.max_add_num + relocate_num, plot_gaussians=self.vis_gaussians)
-                if self.num_pruned < self.num_prune and self.step > self.prune_start_step and self._is_prune_step():
-                    self._prune_gaussians(self.max_prune_num, plot_gaussians=self.vis_gaussians)
+                if not self.prune_finished and self.step > self.prune_start_step and self._is_prune_step():
+                    if self.prune_mode == "lambda":
+                        self._prune_gaussians_lambda(plot_gaussians=self.vis_gaussians)
+                    else:
+                        self._prune_gaussians(self.max_prune_num, plot_gaussians=self.vis_gaussians)
                 if self.max_time > 0.0:
                     self.total_time_accum += perf_counter() - begin  # Densification and pruning are part of the time budget
                     terminate = self._time_schedule() or terminate
@@ -811,8 +890,7 @@ class GaussianSplatting2D(nn.Module):
         Whether the next pruning round is due: every prune_steps steps, or with a time budget, every prune_time_ratio of the budget.
         """
         if self.max_time > 0.0:
-            rounds_done = math.ceil(self.num_pruned / self.max_prune_num)
-            return self.total_time_accum >= (rounds_done + 1) * self.prune_time_ratio * self.max_time
+            return self.total_time_accum >= (self.prune_rounds_done + 1) * self.prune_time_ratio * self.max_time
         return (self.step - self.prune_start_step) % self.prune_steps == 0
 
     def _time_schedule(self):
@@ -919,9 +997,10 @@ class GaussianSplatting2D(nn.Module):
             contribution, = torch.autograd.grad(images.sum(), ones)
         return contribution.squeeze(dim=-1)
 
-    def _get_loo_loss_increase(self, chunk_size=2**18):
+    def _get_loo_loss_increase(self, metric="l1", chunk_size=2**18):
         """
-        Increase of the L1 loss when removing each Gaussian on its own (leave-one-out), computed from a single rendering pass.
+        Increase of the loss when removing each Gaussian on its own (leave-one-out), computed from a single rendering pass.
+        The loss is the L1 loss (metric "l1") or the squared error summed over pixels and averaged over channels in 8-bit units (metric "sse").
         Removing Gaussian k from the top-K list of a pixel changes its value from S_f / (S_w + eps) to (S_f - w_k f_k) / (S_w - w_k + eps),
         where S_w and S_f are the sums of the top-K weights and weighted features. Ignores the Gaussian that would move into the top-K list.
         """
@@ -950,25 +1029,81 @@ class GaussianSplatting2D(nn.Module):
             sum_weights = weights.sum(dim=1, keepdim=True)  # [P, 1]
             sum_feat = weighted_feat.sum(dim=1)  # [P, C]
             target = targets[begin:begin+chunk_size]
-            error = (sum_feat / (sum_weights + self.eps) - target).abs().sum(dim=-1, keepdim=True)  # [P, 1]
             loo_values = (sum_feat.unsqueeze(1) - weighted_feat) / (sum_weights - weights + self.eps).unsqueeze(-1)  # [P, K, C]
-            loo_error = (loo_values - target.unsqueeze(1)).abs().sum(dim=-1)  # [P, K]
+            diff, loo_diff = sum_feat / (sum_weights + self.eps) - target, loo_values - target.unsqueeze(1)
+            if metric == "sse":
+                error, loo_error = diff.square().sum(dim=-1, keepdim=True), loo_diff.square().sum(dim=-1)  # [P, 1], [P, K]
+            else:
+                error, loo_error = diff.abs().sum(dim=-1, keepdim=True), loo_diff.abs().sum(dim=-1)
             loss_increase.index_add_(0, ids[valid], (loo_error - error)[valid])
-        return loss_increase / targets.numel()
+        return loss_increase * (255.0**2 / self.feat_dim if metric == "sse" else 1.0 / targets.numel())
 
     def _prune_gaussians(self, prune_num, plot_gaussians=False):
         prune_num = min(prune_num, self.max_prune_num, self.num_prune-self.num_pruned)
         if prune_num <= 0:
             return
-        self._remove_gaussians(prune_num, action="Pruning", plot_gaussians=plot_gaussians)
+        self._remove_lowest_score(prune_num, action="Pruning", plot_gaussians=plot_gaussians)
         self.num_pruned += prune_num
+        self.prune_rounds_done += 1
+        self.prune_finished = self.num_pruned == self.num_prune
 
-    def _remove_gaussians(self, remove_num, action, plot_gaussians=False):
+    def _prune_gaussians_lambda(self, plot_gaussians=False):
+        """
+        Pruning round of prune_mode "lambda": remove the Gaussians whose removal increases the squared error by less than prune_lambda times
+        the bits they take (the average of the current Gaussians), at most prune_max_ratio of them. With prune_add_ratio, each round but the last
+        then adds that fraction of Gaussians at high-error pixels, which the next round tests, so that the number of Gaussians can also grow.
+        Pruning finishes after prune_times rounds, or once a round finds no Gaussian to remove (without adding).
+        """
+        self.prune_rounds_done += 1
+        sse_increase = self._get_loo_loss_increase(metric="sse")
+        bits_per_gaussian = self._estimate_bits() / self.num_gaussians
+        threshold = self.prune_lambda * bits_per_gaussian
+        num_below = int((sse_increase < threshold).sum().item())
+        prune_num = min(num_below, round(self.prune_max_ratio * self.num_gaussians))
+        round_info = (f"Round {self.prune_rounds_done:d}: {num_below:d} below lambda x {bits_per_gaussian:.1f} bits per Gaussian = "
+                      f"{threshold:.1f} SSE")
+        if prune_num > 0:
+            pruned = torch.topk(sse_increase, prune_num, largest=False).indices
+            # Removing many Gaussians at once costs more than the sum of their leave-one-out scores, so measure it
+            keep = torch.ones(self.num_gaussians, dtype=torch.bool, device=self.device)
+            keep[pruned] = False
+            psnr_before, _ = self._evaluate(log=False, upsample=False)
+            images = self._rasterize(*[param[keep] for param in self._get_params()], self.img_h, self.img_w, self.tile_bounds)
+            psnr_after, _ = self._evaluate(log=False, upsample=False, images=self._to_rgb(images))
+            psnr_info = f"PSNR before fine-tuning: {psnr_before:.2f} -> {psnr_after:.2f} dB"
+            self._remove_gaussians(pruned, "Pruning", f"{round_info} | {psnr_info}", plot_gaussians=plot_gaussians)
+            self.num_pruned += prune_num
+            self.final_num_gaussians = self.num_gaussians
+        if (prune_num == 0 and self.prune_add_ratio == 0.0) or self.prune_rounds_done == self.prune_times:
+            self.prune_finished = True
+            self.worklog.info(f"Step: {self.step:d} | {round_info} | Pruning finished with {self.num_gaussians:d} Gaussians "
+                              f"({self.num_pruned:d} pruned in {self.prune_rounds_done:d} rounds)")
+            self.worklog.info("***********************************************")
+        elif self.prune_add_ratio > 0.0:
+            add_num = round(self.prune_add_ratio * self.num_gaussians)
+            self.total_num_gaussians = self.num_gaussians + add_num  # _add_gaussians adds up to total_num_gaussians
+            self._add_gaussians(add_num, plot_gaussians=plot_gaussians)
+            self.final_num_gaussians = self.num_gaussians
+
+    def _remove_lowest_score(self, remove_num, action, plot_gaussians=False):
         """
         Remove the Gaussians with the lowest pruning score.
         """
-        score = self._get_contribution() if self.prune_score == "contribution" else self._get_loo_loss_increase()
-        pruned = torch.topk(score, remove_num, largest=False).indices
+        if self.prune_score == "contribution":
+            score = self._get_contribution()
+            pruned = torch.topk(score, remove_num, largest=False).indices
+            score_info = f"Pruned contribution: {100.0*score[pruned].sum().item()/score.sum().item():.2f}%"
+        else:
+            score = self._get_loo_loss_increase()
+            pruned = torch.topk(score, remove_num, largest=False).indices
+            score_info = f"Predicted L1 increase: {score[pruned].sum().item():.5f}"
+        self._remove_gaussians(pruned, action, score_info, plot_gaussians=plot_gaussians)
+
+    def _remove_gaussians(self, pruned, action, score_info, plot_gaussians=False):
+        """
+        Remove the given Gaussians [indices], keeping the optimizer state of the remaining ones.
+        """
+        remove_num = len(pruned)
         keep = torch.ones(self.num_gaussians, dtype=torch.bool, device=self.device)
         keep[pruned] = False
         # Plot Gaussians (red: kept, green: removed)
@@ -990,10 +1125,6 @@ class GaussianSplatting2D(nn.Module):
             setattr(self, name, new_param)
         self.vis_feat = nn.Parameter(self.vis_feat.detach()[keep], requires_grad=False)
         self.num_gaussians -= remove_num
-        if self.prune_score == "contribution":
-            score_info = f"Pruned contribution: {100.0*score[pruned].sum().item()/score.sum().item():.2f}%"
-        else:
-            score_info = f"Predicted L1 increase: {score[pruned].sum().item():.5f}"
         self.worklog.info(
             f"Step: {self.step:d} | {action} {remove_num:d} Gaussians ({self.num_gaussians+remove_num:d} -> {self.num_gaussians:d}) | {score_info}")
         self.worklog.info("***********************************************")

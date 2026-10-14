@@ -7,9 +7,20 @@ from utils.misc_utils import load_cfg
 
 
 def get_gaussian_cfg(args):
-    gaussian_cfg = f"num-{args.num_gaussians:d}"
-    if args.prune_ratio > 0.0:
-        gaussian_cfg += f"_prune-{args.prune_ratio:.2f}"
+    if args.qp > 0.0:  # The number of Gaussians, the feature step, and lambda are derived from the QP
+        gaussian_cfg = f"qp-{args.qp:g}-over-{args.qp_overestimate:g}_prune-x{args.prune_times:d}-max-{args.prune_max_ratio:g}"
+        if args.qp_lambda_scale != 1.0:
+            gaussian_cfg += f"-lambda-x{args.qp_lambda_scale:g}"
+        if args.prune_add_ratio > 0.0:
+            gaussian_cfg += f"-add-{args.prune_add_ratio:g}"
+    else:
+        gaussian_cfg = f"num-{args.num_gaussians:d}"
+        if args.prune_mode == "lambda":
+            gaussian_cfg += f"_prune-lambda-{args.prune_lambda:g}-x{args.prune_times:d}-max-{args.prune_max_ratio:g}"
+            if args.prune_add_ratio > 0.0:
+                gaussian_cfg += f"-add-{args.prune_add_ratio:g}"
+        elif args.prune_ratio > 0.0:
+            gaussian_cfg += f"_prune-{args.prune_ratio:.2f}"
     if args.relocate_ratio > 0.0:
         gaussian_cfg += f"_reloc-{args.relocate_ratio:.2f}"
     if args.disable_inverse_scale:
@@ -24,8 +35,9 @@ def get_gaussian_cfg(args):
     if min(all_bits) < 4 or max(all_bits) > 32:
         raise ValueError(f"Bit precision must be between 4 and 32 but got: {', '.join(f'{bits:d}' for bits in all_bits)}")
     if args.quant_mode == "step":
-        gaussian_cfg += f"_steps-{args.pos_step:g}-{args.scale_step:g}-{args.rot_step:g}-{args.feat_step:g}"
-        if args.color_space == "yuv":
+        feat_step = "qp" if args.qp > 0.0 else f"{args.feat_step:g}"
+        gaussian_cfg += f"_steps-{args.pos_step:g}-{args.scale_step:g}-{args.rot_step:g}-{feat_step}"
+        if args.color_space == "yuv" and args.qp == 0.0:
             gaussian_cfg += f"_yuv-{args.y_step:g}-{args.uv_step:g}"
     else:
         gaussian_cfg += f"_bits-{args.pos_bits:d}-{args.scale_bits:d}-{args.rot_bits:d}-{args.feat_bits:d}"
