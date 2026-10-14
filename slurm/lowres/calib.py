@@ -1,6 +1,7 @@
 """
 Time per optimization step (forward, loss, backward, Adam) on an otherwise idle GPU, without evaluation or logging.
-Usage (repo root): slurm/lowres/calib.py <out_csv> <res:N:arm,...>  (arms as in slurm/lowres/sweep.py)
+Usage (repo root): slurm/lowres/calib.py <out_csv> <res:N:arm[:flag...],...>  (arms as in slurm/lowres/sweep.py; flags are boolean
+options to switch on, e.g., 480p:1000:step:realtime)
 """
 import argparse
 import csv
@@ -45,21 +46,23 @@ def time_params(model, steps):
 rows = []
 with tempfile.TemporaryDirectory() as log_root:
     for job in sys.argv[2].split(","):
-        res, num, arm = job.split(":")
+        res, num, arm, *flags = job.split(":")
         with open("cfgs/default.yaml", encoding="utf-8") as file:
             cfg = yaml.safe_load(file)
         arm_cfg = {key: value[res] if isinstance(value, dict) else value for key, value in ARMS[arm].items()}  # Per-resolution values
-        cfg.update({**FIXED, **arm_cfg, "num_gaussians": int(num), "prune_ratio": 0.0, "data_root": "media/uvg",
-                    "input_path": f"{res}/{IMAGES[0]}.png", "log_level": "WARNING"})
-        cfg["log_dir"] = os.path.join(log_root, f"{res}-{num}-{arm}")
+        cfg.update({**FIXED, **arm_cfg, **{flag: True for flag in flags}, "num_gaussians": int(num), "prune_ratio": 0.0,
+                    "data_root": "media/uvg", "input_path": f"{res}/{IMAGES[0]}.png", "log_level": "WARNING"})
+        cfg["log_dir"] = os.path.join(log_root, "-".join([res, num, arm, *flags]))
         model = GaussianSplatting2D(argparse.Namespace(**cfg))
         model.worklog.setLevel("WARNING")
         time_steps(model, WARMUP)
         step_time = time_steps(model, STEPS)
         with torch.no_grad():
             params_time = time_params(model, STEPS)
-        rows.append({"res": res, "num_gaussians": int(num), "arm": arm, "step_ms": 1e3 * step_time, "params_ms": 1e3 * params_time})
-        print(f"{res} N{num:>5s} {arm:18s} step {1e3*step_time:6.2f} ms | quantized params (no grad) {1e3*params_time:5.2f} ms", flush=True)
+        rows.append({"res": res, "num_gaussians": int(num), "arm": arm, "flags": "+".join(flags), "step_ms": 1e3 * step_time,
+                     "params_ms": 1e3 * params_time})
+        print(f"{res} N{num:>5s} {arm:18s} {'+'.join(flags):9s} step {1e3*step_time:6.2f} ms | quantized params (no grad) "
+              f"{1e3*params_time:5.2f} ms", flush=True)
         del model
         torch.cuda.empty_cache()
 with open(sys.argv[1], "w", newline="") as file:

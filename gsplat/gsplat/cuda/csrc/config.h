@@ -22,3 +22,7 @@
             exit(EXIT_FAILURE);                                                \
         }                                                                      \
     } while (0)
+
+// Check that a kernel was launched without waiting for it to finish (as cudaDeviceSynchronize would): errors during its execution surface at
+// the next synchronization, e.g., when PyTorch reads back a result
+#define CUDA_CHECK_LAUNCH() CUDA_CALL(cudaPeekAtLastError())

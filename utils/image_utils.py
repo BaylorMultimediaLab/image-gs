@@ -8,10 +8,9 @@ import matplotlib.font_manager as font_manager
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from matplotlib.patches import Ellipse
-from numpy.linalg import norm
 from PIL import Image
-from scipy.ndimage import sobel
 
 plt.rcParams['text.usetex'] = True
 matplotlib.rcParams['font.size'] = 16
@@ -45,13 +44,16 @@ def get_grid(h, w, x_lim=np.asarray([0, 1]), y_lim=np.asarray([0, 1])):
     return grid
 
 
-def compute_image_gradients(image):
-    gy, gx = [], []
-    for image_channel in image:
-        gy.append(sobel(image_channel, 0))
-        gx.append(sobel(image_channel, 1))
-    gy = norm(np.stack(gy, axis=0), ord=2, axis=0).astype(np.float32)
-    gx = norm(np.stack(gx, axis=0), ord=2, axis=0).astype(np.float32)
+def compute_image_gradients(images):
+    """
+    Image gradients of a tensor [C, H, W] on its device: Sobel derivatives along y and x of each channel (repeating the edge pixels, as
+    scipy.ndimage.sobel), each combined over channels with the L2 norm.
+    """
+    smooth = torch.tensor([1.0, 2.0, 1.0], dtype=images.dtype, device=images.device)
+    derivative = torch.tensor([-1.0, 0.0, 1.0], dtype=images.dtype, device=images.device)
+    kernels = torch.stack([torch.outer(derivative, smooth), torch.outer(smooth, derivative)]).unsqueeze(1)  # [2, 1, 3, 3]: d/dy, d/dx
+    gradients = F.conv2d(F.pad(images.unsqueeze(1), (1, 1, 1, 1), mode="replicate"), kernels)  # [C, 2, H, W]
+    gy, gx = torch.linalg.vector_norm(gradients, dim=0)
     return gy, gx
 
 
@@ -104,7 +106,7 @@ def load_images(load_path, downsample_ratio=None, gamma=None):
         if downsample_ratio is not None:
             height, width = image.shape[:2]
             image = cv2.resize(image, (round(width/downsample_ratio), round(height/downsample_ratio)), interpolation=cv2.INTER_LANCZOS4)
-        if gamma is not None:
+        if gamma is not None and gamma != 1.0:  # np.power(image, 1.0) copies the image unchanged
             image = np.power(image, gamma)
         image = image.transpose(2, 0, 1)
         image_list.append(image)

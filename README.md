@@ -17,6 +17,9 @@ pip install -r requirements.txt
 export TORCH_CUDA_ARCH_LIST="8.6"
 pip install ./gsplat --no-build-isolation
 pip install git+https://github.com/rahul-goel/fused-ssim/@a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38 --no-build-isolation
+
+# C++ rANS coder (rebuild after changing compress/csrc/rans.cpp; compress/rans_codec.py refuses a build from another source)
+pip install ./compress/csrc --no-build-isolation
 ```
 
 ## Running
@@ -41,6 +44,7 @@ image file or a directory with a texture stack. Each run writes its log, config,
 | Color space | `--color_space rgb` or `yuv` (with `--y_step`/`--uv_step` or `--y_bits`/`--uv_bits`; requires `--color_transform none`) |
 | Schedule | By default, progressive optimization adds Gaussians in rounds and the learning rate decays when PSNR stops improving (up to `--max_steps`). `--max_time <seconds>` optimizes for a fixed time instead, pruning and decaying the learning rate at `--prune_time_ratio` and `--decay_time_ratio` of the budget. `--disable_prog_optim` starts with all Gaussians. |
 | Gaussians | `--max_scale <pixels>` caps the Gaussian size; `--init_mode gradient`, `saliency`, or `random` |
+| Real-time | `--realtime` skips what an encoder does not need (saved images, LPIPS/MS-SSIM/FLIP, periodic evaluation unless the adaptive learning rate schedule needs it, bitstream verification), uses fused Adam, and charges `--max_time` by wall-clock time without synchronizing every step. Writes the bitstream and the final checkpoint with PSNR/SSIM. |
 
 Examples:
 
@@ -50,6 +54,9 @@ python main.py --quant_mode minmax --pos_bits 16 --scale_bits 8 --rot_bits 8 --f
 
 # Encoding within a 40-second optimization budget
 python main.py --disable_prog_optim --max_time 40 --max_steps 1000000
+
+# Real-time encoding within a 1-second budget
+python main.py --realtime --disable_prog_optim --max_time 1 --max_steps 1000000
 
 # HEVC-like QP within a 40-second budget, pruning in 4 rounds (at 1/6 to 4/6 of the budget) of at most 25% each
 python main.py --qp 32 --prune_times 4 --prune_max_ratio 0.25 --disable_prog_optim --max_time 40 --max_steps 1000000

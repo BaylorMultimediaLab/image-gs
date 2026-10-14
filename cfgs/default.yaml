@@ -1,5 +1,6 @@
 seed:                  123
 device:                "cuda:0"
+realtime:              False # Real-time encoding: skip what an encoder does not need (saved images, LPIPS/MS-SSIM/FLIP, periodic evaluation unless the adaptive learning rate schedule uses it, bitstream verification, PSNR measurement of pruning rounds), use fused Adam, and charge the time budget (max_time) by wall-clock time without synchronizing at every step
 # Evaluation
 eval:                  False # Render the optimized Image-GS representation
 render_height:         480 # Image height for rendering (aspect ratio is maintained)

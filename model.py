@@ -79,6 +79,7 @@ class GaussianSplatting2D(nn.Module):
             self._init_pos_scale_feat(args)
 
     def _init_logging(self, args):
+        self.realtime = args.realtime
         self.log_dir = args.log_dir
         self.log_level = args.log_level
         self.ckpt_dir = os.path.join(self.log_dir, "checkpoints")
@@ -132,11 +133,11 @@ class GaussianSplatting2D(nn.Module):
             self.img_h_upsampled, self.img_w_upsampled = self.img_h, self.img_w
             self.tile_bounds_upsampled = self.tile_bounds
             self._load_target_images(path=os.path.join(args.data_root, args.input_path), downsample_ratio=self.downsample_ratio)
-            if not self.evaluate:
+            if not self.evaluate and not self.realtime:
                 path = f"{self.log_dir}/gt_upsample-{self.downsample_ratio:.1f}_res-{self.img_h_upsampled:d}x{self.img_w_upsampled:d}"
                 self._separate_and_save_images(images=self.gt_images_upsampled, channels=self.input_channels, path=path)
         self.num_pixels = self.img_h * self.img_w
-        if not self.evaluate:
+        if not self.evaluate and not self.realtime:
             path = f"{self.log_dir}/gt_res-{self.img_h:d}x{self.img_w:d}"
             self._separate_and_save_images(images=self.gt_images, channels=self.input_channels, path=path)
 
@@ -183,6 +184,7 @@ class GaussianSplatting2D(nn.Module):
         if self.color_space == "yuv":
             self.rgb_to_yuv, self.yuv_to_rgb = get_color_transforms(self.input_channels, dtype=self.dtype, device=self.device)
             self.y_channels, self.uv_channels, self.other_channels = get_yuv_channel_indices(self.input_channels, device=self.device)
+        self.feat_dim = sum(self.input_channels)
         # Optimization target in the color space of the Gaussian features
         self.target_images = self._from_rgb(self.gt_images)
 
@@ -211,6 +213,15 @@ class GaussianSplatting2D(nn.Module):
         self.feat_step = args.feat_step
         self.y_step = args.y_step
         self.uv_step = args.uv_step
+        if self.quant_mode == "step":
+            # Per-channel steps of the position, scale, rotation, and features as GPU tensors, created once: creating them from Python numbers
+            # at every optimization step copies them to the GPU and synchronizes
+            feat_steps = torch.empty(self.feat_dim, dtype=self.dtype, device=self.device)
+            for channels, _, step in self._get_feat_groups():
+                feat_steps[channels] = step
+            self.quant_steps = [self.pos_step / torch.tensor([self.img_w, self.img_h], dtype=self.dtype, device=self.device),
+                                torch.full((2,), self.scale_step, dtype=self.dtype, device=self.device),
+                                torch.full((1,), self.rot_step, dtype=self.dtype, device=self.device), feat_steps]
         self.wrap_rot = args.wrap_rot
         self.bitstream_codec = args.bitstream_codec
         if self.bitstream_codec not in ["none", "lzma", "rans"]:
@@ -266,14 +277,11 @@ class GaussianSplatting2D(nn.Module):
         """
         with torch.no_grad():
             if self.quant_mode == "step":
-                pos_step = self.pos_step / torch.tensor([self.img_w, self.img_h], dtype=self.dtype, device=self.device)
-                symbols = [quantize_step(xy, pos_step), quantize_step(torch.log2(scale), self.scale_step), quantize_step(rot, self.rot_step)]
-            else:
-                symbols = [quantize_minmax(xy, self.pos_bits), quantize_minmax(scale, self.scale_bits), quantize_minmax(rot, self.rot_bits)]
+                return [quantize_step(x, steps) for x, steps in zip([xy, torch.log2(scale), rot, feat], self.quant_steps)]
+            symbols = [quantize_minmax(xy, self.pos_bits), quantize_minmax(scale, self.scale_bits), quantize_minmax(rot, self.rot_bits)]
             q_feat, feat_steps, feat_origins = torch.empty_like(feat), feat.new_empty(self.feat_dim), feat.new_empty(self.feat_dim)
-            for channels, bits, step in self._get_feat_groups():
-                q, steps, origins = quantize_step(feat[:, channels], step) if self.quant_mode == "step" else quantize_minmax(feat[:, channels], bits)
-                q_feat[:, channels], feat_steps[channels], feat_origins[channels] = q, steps, origins
+            for channels, bits, _ in self._get_feat_groups():
+                q_feat[:, channels], feat_steps[channels], feat_origins[channels] = quantize_minmax(feat[:, channels], bits)
         return symbols + [(q_feat, feat_steps, feat_origins)]
 
     def _dequantize_symbols(self, symbols):
@@ -312,7 +320,6 @@ class GaussianSplatting2D(nn.Module):
         self.xy = nn.Parameter(torch.rand(self.num_gaussians, 2, dtype=self.dtype, device=self.device), requires_grad=True)
         self.scale = nn.Parameter(torch.ones(self.num_gaussians, 2, dtype=self.dtype, device=self.device), requires_grad=True)
         self.rot = nn.Parameter(torch.zeros(self.num_gaussians, 1, dtype=self.dtype, device=self.device), requires_grad=True)
-        self.feat_dim = sum(self.input_channels)
         self.feat = nn.Parameter(torch.rand(self.num_gaussians, self.feat_dim, dtype=self.dtype, device=self.device), requires_grad=True)
         self.vis_feat = nn.Parameter(torch.rand_like(self.feat), requires_grad=False)  # Only used for Gaussian ID visualization
         self._log_compression_rate()
@@ -439,10 +446,7 @@ class GaussianSplatting2D(nn.Module):
         self.scale_lr = args.scale_lr
         self.rot_lr = args.rot_lr
         self.feat_lr = args.feat_lr
-        self.optimizer = torch.optim.Adam([{'params': self.xy, 'lr': self.pos_lr},
-                                           {'params': self.scale, 'lr': self.scale_lr},
-                                           {'params': self.rot, 'lr': self.rot_lr},
-                                           {'params': self.feat, 'lr': self.feat_lr}])
+        self.optimizer = self._new_optimizer()
         self.disable_lr_schedule = args.disable_lr_schedule
         if not self.disable_lr_schedule:
             self.decay_ratio = args.decay_ratio
@@ -458,6 +462,16 @@ class GaussianSplatting2D(nn.Module):
         if self.max_time > 0.0 and not (0.0 < self.prune_time_ratio <= 1.0 and 0.0 < self.decay_time_ratio <= 1.0):
             raise ValueError(f"Time ratios must be in (0, 1] but got: {self.prune_time_ratio}, {self.decay_time_ratio}")
 
+    def _new_optimizer(self):
+        """
+        Adam over the current Gaussian parameters. Real-time mode uses the fused implementation (one kernel per parameter group instead of
+        about ten), which is faster but not bit-identical.
+        """
+        return torch.optim.Adam([{'params': self.xy, 'lr': self.pos_lr},
+                                 {'params': self.scale, 'lr': self.scale_lr},
+                                 {'params': self.rot, 'lr': self.rot_lr},
+                                 {'params': self.feat, 'lr': self.feat_lr}], fused=True if self.realtime else None)
+
     def _init_pos_scale_feat(self, args):
         self.init_mode = args.init_mode
         self.init_random_ratio = args.init_random_ratio
@@ -472,36 +486,45 @@ class GaussianSplatting2D(nn.Module):
                 self._compute_smap(path="models")
                 self.xy.copy_(self._sample_pos(prob=self.saliency))
             else:
-                selected = np.random.choice(self.num_pixels, self.num_gaussians, replace=False, p=None)
-                self.xy.copy_(self.pixel_xy.detach().clone()[selected])
+                self.xy.copy_(self.pixel_xy.detach().clone()[self._sample_pixels(self.num_gaussians)])
             # Scale
             self.scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0/self.init_scale)
             # Feature
             if not self.disable_color_init:
                 self.feat.copy_(self._get_target_features(positions=self.xy).detach().clone())
 
+    def _sample_pixels(self, num, prob=None):
+        """
+        Indices of num distinct pixels on the GPU, drawn uniformly or with the probabilities prob [H*W] (successive sampling without
+        replacement, as np.random.choice).
+        """
+        if prob is None:
+            return torch.randperm(self.num_pixels, device=self.device)[:num]
+        return torch.multinomial(torch.as_tensor(prob, device=self.device), num, replacement=False)
+
     def _sample_pos(self, prob):
         num_random = round(self.init_random_ratio*self.num_gaussians)
-        selected_random = np.random.choice(self.num_pixels, num_random, replace=False, p=None)
-        selected_other = np.random.choice(self.num_pixels, self.num_gaussians-num_random, replace=False, p=prob)
+        selected_random = self._sample_pixels(num_random)
+        selected_other = self._sample_pixels(self.num_gaussians-num_random, prob=prob)
         return torch.cat([self.pixel_xy.detach().clone()[selected_random], self.pixel_xy.detach().clone()[selected_other]], dim=0)
 
     def _compute_gmap(self):
-        gy, gx = compute_image_gradients(np.power(self.gt_images.detach().cpu().clone().numpy(), 1.0/self.gamma))
-        g_norm = np.hypot(gy, gx).astype(np.float32)
+        g_norm = torch.hypot(*compute_image_gradients(torch.pow(self.gt_images, 1.0/self.gamma)))
         g_norm = g_norm / g_norm.max()
-        save_image(g_norm, f"{self.log_dir}/gmap_res-{self.img_h:d}x{self.img_w:d}.{self.save_image_format}")
-        g_norm = np.power(g_norm.reshape(-1), 2.0)
+        if not self.realtime:
+            save_image(g_norm, f"{self.log_dir}/gmap_res-{self.img_h:d}x{self.img_w:d}.{self.save_image_format}")
+            self.worklog.info("Image gradient map successfully saved")
+            self.worklog.info("***********************************************")
+        g_norm = g_norm.reshape(-1).square()
         self.image_gradients = g_norm / g_norm.sum()
-        self.worklog.info("Image gradient map successfully saved")
-        self.worklog.info("***********************************************")
 
     def _compute_smap(self, path):
         smap = get_smap(torch.pow(self.gt_images.detach().clone(), 1.0/self.gamma), path, self.smap_filter_size)
-        save_image(smap, f"{self.log_dir}/smap_res-{self.img_h:d}x{self.img_w:d}.{self.save_image_format}")
+        if not self.realtime:
+            save_image(smap, f"{self.log_dir}/smap_res-{self.img_h:d}x{self.img_w:d}.{self.save_image_format}")
+            self.worklog.info("Saliency map successfully saved")
+            self.worklog.info("***********************************************")
         self.saliency = (smap / smap.sum()).reshape(-1)
-        self.worklog.info("Saliency map successfully saved")
-        self.worklog.info("***********************************************")
 
     def _get_target_features(self, positions):
         with torch.no_grad():
@@ -536,10 +559,13 @@ class GaussianSplatting2D(nn.Module):
     def _save_model(self, final=False):
         if self.quant_mode != "none":
             self._quantize()
-            if self.quant_mode == "step":
+            if self.quant_mode == "step" and not self.realtime:
                 self._log_compressed_size(self._get_fixed_length_bits())
         psnr, ssim = self._evaluate(log=False, upsample=False)
-        self._evaluate_extra()
+        if self.realtime:
+            self.lpips_final, self.flip_final, self.msssim_final = float("nan"), float("nan"), float("nan")
+        else:
+            self._evaluate_extra()
         ckpt_data = {"step": self.step,
                      "psnr": psnr,
                      "ssim": ssim,
@@ -582,8 +608,8 @@ class GaussianSplatting2D(nn.Module):
 
     def _write_bitstream(self, path):
         """
-        Encode the quantized Gaussians into a bitstream file, then decode it and check that it reproduces the quantized parameters.
-        Returns the size of the bitstream in bytes.
+        Encode the quantized Gaussians into a bitstream file, then decode it and check that it reproduces the quantized parameters (except in
+        real-time mode). Returns the size of the bitstream in bytes.
         """
         with torch.no_grad():
             symbols = self._get_symbols(self.xy, *self._canonicalize(self._get_scale(), self.rot), self.feat)
@@ -593,23 +619,28 @@ class GaussianSplatting2D(nn.Module):
             data, order, attribute_bytes = encode_bitstream(attributes, meta, codec=self.bitstream_codec, channel_refs=self._get_channel_refs())
             with open(path, "wb") as file:
                 file.write(data)
-            with open(path, "rb") as file:
-                decoded, _ = decode_bitstream(file.read())
-            if not all(np.array_equal(q[order], q_decoded) for (q, _, _), (q_decoded, _, _) in zip(attributes, decoded)):
-                raise RuntimeError(f"Decoding '{path}' does not reproduce the quantization indices")
-            decoded_symbols = [[torch.from_numpy(x).to(dtype=self.dtype, device=self.device) for x in attribute] for attribute in decoded]
-            images = self._rasterize(*self._dequantize_symbols(decoded_symbols), self.img_h, self.img_w, self.tile_bounds)
-            psnr, _ = self._evaluate(log=False, upsample=False)
-            decoded_psnr, _ = self._evaluate(log=False, upsample=False, images=self._to_rgb(images))
+            if not self.realtime:
+                with open(path, "rb") as file:
+                    decoded, _ = decode_bitstream(file.read())
+                if not all(np.array_equal(q[order], q_decoded) for (q, _, _), (q_decoded, _, _) in zip(attributes, decoded)):
+                    raise RuntimeError(f"Decoding '{path}' does not reproduce the quantization indices")
+                decoded_symbols = [[torch.from_numpy(x).to(dtype=self.dtype, device=self.device) for x in attribute] for attribute in decoded]
+                images = self._rasterize(*self._dequantize_symbols(decoded_symbols), self.img_h, self.img_w, self.tile_bounds)
+                psnr, _ = self._evaluate(log=False, upsample=False)
+                decoded_psnr, _ = self._evaluate(log=False, upsample=False, images=self._to_rgb(images))
         num_bits = 8.0 * len(data)
-        fixed_length_bits = self._get_fixed_length_bits()
         names = ["Position", "Scale", "Rotation", "Feature"]
         bits_per_gaussian = [f"{name} {8.0*num_bytes/self.num_gaussians:.2f}" for name, num_bytes in zip(names, attribute_bytes)]
-        self.worklog.info(f"Bitstream ({self.bitstream_codec}): {len(data)/1e3:.2f} KB | {num_bits/self.num_pixels:.3f} bpp | "
-                          f"{num_bits/fixed_length_bits*100.0:.2f}% of fixed-length codes | Saved to '{path}'")
-        self.worklog.info(f"Bits per Gaussian: {num_bits/self.num_gaussians:.2f} (fixed-length: {fixed_length_bits/self.num_gaussians:.2f}) | "
-                          f"{' | '.join(bits_per_gaussian)} | Header {len(data)-sum(attribute_bytes):.0f} bytes")
-        self.worklog.info(f"Lossless decoding verified | PSNR: {decoded_psnr:.4f} decoded, {psnr:.4f} encoder side")
+        size_info = f"Bitstream ({self.bitstream_codec}): {len(data)/1e3:.2f} KB | {num_bits/self.num_pixels:.3f} bpp"
+        bits_info = f"Bits per Gaussian: {num_bits/self.num_gaussians:.2f}"
+        if not self.realtime:  # Comparison with fixed-length codes
+            fixed_length_bits = self._get_fixed_length_bits()
+            size_info += f" | {num_bits/fixed_length_bits*100.0:.2f}% of fixed-length codes"
+            bits_info += f" (fixed-length: {fixed_length_bits/self.num_gaussians:.2f})"
+        self.worklog.info(f"{size_info} | Saved to '{path}'")
+        self.worklog.info(f"{bits_info} | {' | '.join(bits_per_gaussian)} | Header {len(data)-sum(attribute_bytes):.0f} bytes")
+        if not self.realtime:
+            self.worklog.info(f"Lossless decoding verified | PSNR: {decoded_psnr:.4f} decoded, {psnr:.4f} encoder side")
         self.worklog.info("***********************************************")
         return len(data)
 
@@ -737,10 +768,14 @@ class GaussianSplatting2D(nn.Module):
         self.lpips_final, self.flip_final, self.msssim_final = 1.0, 1.0, 0.0
 
         self.step = 0
+        adaptive_lr_schedule = not self.disable_lr_schedule and self.max_time == 0.0  # Decays based on periodic evaluation
+        wall_begin = perf_counter()
         with torch.no_grad():
-            self._log_images(log_final=False, plot_gaussians=self.vis_gaussians)
+            if not self.realtime:
+                self._log_images(log_final=False, plot_gaussians=self.vis_gaussians)
         for step in range(self.start_step, self.max_steps+1):
             self.step = step
+            step_begin = perf_counter()
             self.optimizer.zero_grad()
             # Rendering
             images, render_time = self.forward(self.img_h, self.img_w, self.tile_bounds)
@@ -752,17 +787,18 @@ class GaussianSplatting2D(nn.Module):
             self.optimizer.step()
             if self.max_scale > 0.0:
                 self._clamp_scale()
-            if self.max_time > 0.0:
-                torch.cuda.synchronize()  # Charge each step its GPU time
-            self.total_time_accum += (perf_counter() - begin + render_time)
+            if not self.realtime:
+                if self.max_time > 0.0:
+                    torch.cuda.synchronize()  # Charge each step its GPU time
+                self.total_time_accum += (perf_counter() - begin + render_time)
             # Logging
             terminate = False
             with torch.no_grad():
-                if self.step % self.eval_steps == 0:
+                if self.step % self.eval_steps == 0 and (adaptive_lr_schedule or not self.realtime):
                     self._evaluate(log=True, upsample=False)
-                    if not self.disable_lr_schedule and self.max_time == 0.0 and self._is_final_num_gaussians():
+                    if adaptive_lr_schedule and self._is_final_num_gaussians():
                         terminate = self._lr_schedule()
-                if self.step % self.save_image_steps == 0:
+                if self.step % self.save_image_steps == 0 and not self.realtime:
                     self._log_images(log_final=False, plot_gaussians=self.vis_gaussians)
                 if self.step % self.save_ckpt_steps == 0 and self._is_final_num_gaussians():
                     self._save_model()
@@ -779,15 +815,26 @@ class GaussianSplatting2D(nn.Module):
                         self._prune_gaussians_lambda(plot_gaussians=self.vis_gaussians)
                     else:
                         self._prune_gaussians(self.max_prune_num, plot_gaussians=self.vis_gaussians)
-                if self.max_time > 0.0:
+                if self.realtime:
+                    # Wall-clock time of the whole step without synchronizing: reading back the number of tile intersections in every forward
+                    # pass keeps the CPU at most one step ahead of the GPU
+                    self.total_time_accum += perf_counter() - step_begin
+                elif self.max_time > 0.0:
                     self.total_time_accum += perf_counter() - begin  # Densification and pruning are part of the time budget
+                if self.max_time > 0.0:
                     terminate = self._time_schedule() or terminate
                 if terminate:
                     break
+        torch.cuda.synchronize()
+        optimization_time = perf_counter() - wall_begin
         with torch.no_grad():
-            self._log_images(log_final=True, plot_gaussians=self.vis_gaussians)
+            if not self.realtime:
+                self._log_images(log_final=True, plot_gaussians=self.vis_gaussians)
             self._save_model(final=True)
-        self.worklog.info("Optimization completed")
+        torch.cuda.synchronize()
+        self.wall_times = {"optimization": optimization_time, "saving": perf_counter() - wall_begin - optimization_time}
+        self.worklog.info(f"Optimization completed | Wall-clock time: {optimization_time:.3f} s optimization ({self.step:d} steps), "
+                          f"{self.wall_times['saving']:.3f} s final evaluation, checkpoint, and bitstream")
         self.worklog.info("***********************************************")
         self.worklog.info(f"Mean scale: {self._get_scale().mean().item():.4f} (pixel) | {self.scale.mean().item():.4f} (raw)")
         self.worklog.info("***********************************************")
@@ -943,8 +990,8 @@ class GaussianSplatting2D(nn.Module):
             gt_images = gaussian_blur(img=gt_images, kernel_size=kernel_size)
         diff_map = (gt_images - images).detach().clone()
         error_map = torch.pow(torch.abs(diff_map).mean(dim=0).reshape(-1), 2.0)
-        sample_prob = (error_map / error_map.sum()).cpu().numpy()
-        selected = np.random.choice(self.num_pixels, add_num, replace=False, p=sample_prob)
+        sample_prob = error_map / error_map.sum()
+        selected = self._sample_pixels(add_num, prob=sample_prob)
         # New Gaussians
         new_xy = self.pixel_xy.detach().clone()[selected]
         new_scale = torch.ones(add_num, 2, dtype=self.dtype, device=self.device)
@@ -979,10 +1026,7 @@ class GaussianSplatting2D(nn.Module):
             visualize_added_gaussians(path, raw_images, old_xy, new_xy, self.input_channels, size=size, every_n=every_n,
                                       alpha=0.8, gamma=self.gamma, save_image_format=self.save_plot_format)
         # Update optimizer
-        self.optimizer = torch.optim.Adam([{'params': self.xy, 'lr': self.pos_lr},
-                                           {'params': self.scale, 'lr': self.scale_lr},
-                                           {'params': self.rot, 'lr': self.rot_lr},
-                                           {'params': self.feat, 'lr': self.feat_lr}])
+        self.optimizer = self._new_optimizer()
         self.worklog.info(f"Step: {self.step:d} | Adding {add_num:d} Gaussians ({self.num_gaussians-add_num:d} -> {self.num_gaussians:d})")
         self.worklog.info("***********************************************")
 
@@ -1064,14 +1108,15 @@ class GaussianSplatting2D(nn.Module):
                       f"{threshold:.1f} SSE")
         if prune_num > 0:
             pruned = torch.topk(sse_increase, prune_num, largest=False).indices
-            # Removing many Gaussians at once costs more than the sum of their leave-one-out scores, so measure it
-            keep = torch.ones(self.num_gaussians, dtype=torch.bool, device=self.device)
-            keep[pruned] = False
-            psnr_before, _ = self._evaluate(log=False, upsample=False)
-            images = self._rasterize(*[param[keep] for param in self._get_params()], self.img_h, self.img_w, self.tile_bounds)
-            psnr_after, _ = self._evaluate(log=False, upsample=False, images=self._to_rgb(images))
-            psnr_info = f"PSNR before fine-tuning: {psnr_before:.2f} -> {psnr_after:.2f} dB"
-            self._remove_gaussians(pruned, "Pruning", f"{round_info} | {psnr_info}", plot_gaussians=plot_gaussians)
+            prune_info = round_info
+            if not self.realtime:  # Removing many Gaussians at once costs more than the sum of their leave-one-out scores, so measure it
+                keep = torch.ones(self.num_gaussians, dtype=torch.bool, device=self.device)
+                keep[pruned] = False
+                psnr_before, _ = self._evaluate(log=False, upsample=False)
+                images = self._rasterize(*[param[keep] for param in self._get_params()], self.img_h, self.img_w, self.tile_bounds)
+                psnr_after, _ = self._evaluate(log=False, upsample=False, images=self._to_rgb(images))
+                prune_info += f" | PSNR before fine-tuning: {psnr_before:.2f} -> {psnr_after:.2f} dB"
+            self._remove_gaussians(pruned, "Pruning", prune_info, plot_gaussians=plot_gaussians)
             self.num_pruned += prune_num
             self.final_num_gaussians = self.num_gaussians
         if (prune_num == 0 and self.prune_add_ratio == 0.0) or self.prune_rounds_done == self.prune_times:

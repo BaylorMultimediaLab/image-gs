@@ -110,7 +110,7 @@ torch::Tensor get_tile_bin_edges_tensor(
         isect_ids_sorted.contiguous().data_ptr<int64_t>(),
         (int2 *)tile_bins.contiguous().data_ptr<int>()
     );
-    CUDA_CALL(cudaDeviceSynchronize());
+    CUDA_CHECK_LAUNCH();
     return tile_bins;
 }
 
@@ -170,7 +170,7 @@ std::tuple<
         (float3 *)out_img.contiguous().data_ptr<float>()
     );
     
-    CUDA_CALL(cudaDeviceSynchronize());
+    CUDA_CHECK_LAUNCH();
     return std::make_tuple(out_img);
 }
 
@@ -226,7 +226,7 @@ std::tuple<
         colors.contiguous().data_ptr<float>(),
         out_img.contiguous().data_ptr<float>()
     );
-    CUDA_CALL(cudaDeviceSynchronize());
+    CUDA_CHECK_LAUNCH();
     return std::make_tuple(out_img);
 }
 
@@ -300,7 +300,7 @@ std::
         (float3 *)v_conic.contiguous().data_ptr<float>(),
         v_colors.contiguous().data_ptr<float>()
     );
-    CUDA_CALL(cudaDeviceSynchronize());
+    CUDA_CHECK_LAUNCH();
     return std::make_tuple(v_xy, v_conic, v_colors);
 }
 
@@ -361,7 +361,7 @@ std::tuple<
         out_img.contiguous().data_ptr<float>(),
         pixel_topk.contiguous().data_ptr<int32_t>()
     );
-    CUDA_CALL(cudaDeviceSynchronize());
+    CUDA_CHECK_LAUNCH();
     return std::make_tuple(out_img, pixel_topk);
 }
 
@@ -420,7 +420,7 @@ nd_rasterize_backward_topk_norm_tensor(
         v_colors.contiguous().data_ptr<float>(),
         pixel_topk.contiguous().data_ptr<int32_t>()
     );
-    CUDA_CALL(cudaDeviceSynchronize());
+    CUDA_CHECK_LAUNCH();
     return std::make_tuple(v_xy, v_conic, v_colors);
 }
 
@@ -474,7 +474,7 @@ std::tuple<
         out_img.contiguous().data_ptr<float>(),
         pixel_topk.contiguous().data_ptr<int32_t>()
     );
-    CUDA_CALL(cudaDeviceSynchronize());
+    CUDA_CHECK_LAUNCH();
     return std::make_tuple(out_img, pixel_topk);
 }
 
@@ -524,7 +524,7 @@ nd_rasterize_backward_no_tiles_tensor(
         v_colors.contiguous().data_ptr<float>(),
         pixel_topk.contiguous().data_ptr<int32_t>()
     );
-    CUDA_CALL(cudaDeviceSynchronize());
+    CUDA_CHECK_LAUNCH();
     return std::make_tuple(v_xy, v_conic, v_colors);
 }
 
@@ -581,7 +581,7 @@ std::tuple<
     //     out_img.contiguous().data_ptr<float>(),
     //     pixel_topk.contiguous().data_ptr<int32_t>()
     // );
-    CUDA_CALL(cudaDeviceSynchronize());
+    CUDA_CHECK_LAUNCH();
     return std::make_tuple(out_img, pixel_topk);
 }
 
@@ -636,7 +636,7 @@ nd_rasterize_backward_simple_tensor(
     //     v_colors.contiguous().data_ptr<float>(),
     //     pixel_topk.contiguous().data_ptr<int32_t>()
     // );
-    CUDA_CALL(cudaDeviceSynchronize());
+    CUDA_CHECK_LAUNCH();
     return std::make_tuple(v_xy, v_scale, v_rot, v_feat);
 }
 
@@ -753,7 +753,7 @@ project_gaussians_2d_scale_rot_forward_tensor(
         (float3 *)conics_d.contiguous().data_ptr<float>(),
         num_tiles_hit_d.contiguous().data_ptr<int32_t>()
     );
-    CUDA_CALL(cudaDeviceSynchronize());
+    CUDA_CHECK_LAUNCH();
     return std::make_tuple(
         xys_d, radii_d, conics_d, num_tiles_hit_d
     );
