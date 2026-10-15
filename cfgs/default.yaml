@@ -47,10 +47,10 @@ downsample:            False # Load a downsampled version of the input image or 
 downsample_ratio:      2.0
 
 # Gaussians
-num_gaussians:         1000 # Number of Gaussians (for compression rate control)
-qp:                    0.0 # Quantization parameter as in HEVC (0 disables it)
-qp_overestimate:       1.25 # Factor on the number of Gaussians that paid off at most for the test images at the QP (with qp)
-qp_lambda_scale:       1.0 # Factor on HEVC's lambda for pruning (with qp)
+num_gaussians:         1000 # Number of Gaussians (with qp 0; e.g., "--qp 0 --num_gaussians 2000 --prune_times 1" for a fixed number with 10% pruned in one round)
+qp:                    32.0 # Quantization parameter as in HEVC (0 disables it and uses num_gaussians); sets num_gaussians, prune_mode "lambda", prune_lambda, and the feature steps
+qp_overestimate:       0.6 # Factor on the number of Gaussians that paid off at most for the test images at the QP (with qp)
+qp_lambda_scale:       4.0 # Factor on HEVC's lambda for pruning (with qp)
 init_scale:            2.25 # Initial Gaussian scale in number of pixels
 topk:                  10 # Warning: Must match hardcoded value in CUDA kernel, modify with caution
 disable_topk_norm:     False # Disable top-K normalization
@@ -82,7 +82,7 @@ decay_threshold:       1.0e-3
 max_time:              0.0 # Time budget of the optimization in seconds (0 disables it): GPU-synchronized optimization steps plus densification and pruning, without evaluation and logging; optimization stops at max_time or max_steps, whichever comes first
 prune_time_ratio:      0.1667 # With max_time: fraction of the time budget before each pruning round (replaces prune_steps)
 decay_time_ratio:      0.8333 # With max_time: fraction of the time budget after which the learning rate decays once by decay_ratio (replaces the adaptive schedule)
-disable_prog_optim:    False # Disable error-guided progressive optimization
+disable_prog_optim:    True # Disable error-guided progressive optimization (start with all Gaussians; --no-disable_prog_optim enables it)
 initial_ratio:         0.5
 add_steps:             500
 add_times:             4
@@ -92,9 +92,10 @@ post_min_steps:        3000
 prune_mode:            "ratio" # How many Gaussians to prune, valid values include "ratio" (prune_ratio of num_gaussians) and "lambda" (the Gaussians whose removal costs less than prune_lambda times their bits; requires prune_score "loo")
 prune_ratio:           0.1 # Fraction of num_gaussians with the lowest score to prune once progressive optimization has added all Gaussians (prune_mode "ratio"; the compression rate is based on the remaining Gaussians)
 prune_lambda:          0.0 # Rate-distortion trade-off of prune_mode "lambda": increase of the squared error (summed over pixels, averaged over channels, in 8-bit units, i.e., MSE x pixels) per bit; HEVC uses 0.57 * 2^((QP-12)/3)
-prune_max_ratio:       0.1 # Maximum fraction of the Gaussians removed per round with prune_mode "lambda" (leave-one-out scores ignore that removed neighbors compensate each other)
-prune_add_ratio:       0.0 # With prune_mode "lambda": after each pruning round but the last, add this fraction of the Gaussians at high-error pixels, which the next round keeps only if they pay off (so the number of Gaussians can grow)
-prune_times:           1 # Number of pruning rounds, each removing an equal share (prune_mode "ratio"), or maximum number of rounds, which stop early once a round finds no Gaussian to remove (prune_mode "lambda")
+prune_max_ratio:       0.25 # Maximum fraction of the Gaussians removed per round with prune_mode "lambda" (leave-one-out scores ignore that removed neighbors compensate each other)
+prune_add_ratio:       0.25 # With prune_mode "lambda" (ignored otherwise): after each pruning round but the last, add this fraction of the Gaussians at high-error pixels, which the next round keeps only if they pay off (so the number of Gaussians can grow)
+prune_times:           4 # Number of pruning rounds, each removing an equal share (prune_mode "ratio"), or maximum number of rounds, which stop early once a round finds no Gaussian to remove (prune_mode "lambda")
 prune_steps:           500 # Optimization steps before each pruning round
+prune_min_steps:       20 # With max_time: minimum number of optimization steps before each pruning round (since the previous one or the start), so that a stall does not set off several rounds at consecutive steps; rounds still due at the learning rate decay (decay_time_ratio) are skipped
 prune_score:           "loo" # Ranking of Gaussians for pruning, valid values include "contribution" (total blending weight) and "loo" (leave-one-out increase of the L1 loss)
 relocate_ratio:        0.0 # Fraction of the Gaussians with the lowest score to replace at each densification step by additional error-guided Gaussians (keeps the number of Gaussians unchanged)

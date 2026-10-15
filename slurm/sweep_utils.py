@@ -35,7 +35,7 @@ def run_main(exp, input_path, expected, cwd, label):
         return True
     cmd = [sys.executable, "main.py", f"--log_root={REPO}/results", f"--data_root={DATA_ROOT}", f"--input_path={input_path}",
            f"--exp_name={exp}"]
-    cmd += [f"--{k}={v}" for k, v in expected.items() if not isinstance(v, bool)] + [f"--{k}" for k, v in expected.items() if v is True]
+    cmd += [f"--{k}={v}" if not isinstance(v, bool) else f"--{k}" if v else f"--no-{k}" for k, v in expected.items()]
     out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     ok = finished_ok(f"{REPO}/results/{exp}", expected)
     print(f"{label} {'done' if ok else 'FAILED'}", flush=True)

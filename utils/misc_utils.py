@@ -1,7 +1,7 @@
 import os
 import random
 import shutil
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 
 import numpy as np
 import torch
@@ -35,8 +35,8 @@ def load_cfg(cfg_path: str, parser: ArgumentParser) -> ArgumentParser:
     for key, value in cfg.items():
         if value is None:
             raise ValueError("'None' is not a supported value in the config file")
-        if isinstance(value, bool):
-            parser.add_argument(f"--{key}", action="store_true", default=value)
+        if isinstance(value, bool):  # --<key> switches it on, --no-<key> off
+            parser.add_argument(f"--{key}", action=BooleanOptionalAction, default=value)
         else:
             parser.add_argument(f"--{key}", type=type(value), default=value)
     return parser

@@ -1,3 +1,4 @@
+import gc
 import logging
 import math
 import os
@@ -153,7 +154,7 @@ class GaussianSplatting2D(nn.Module):
         if args.qp < 0.0:
             raise ValueError(f"Quantization parameter must be positive (or 0 to disable it) but got: {args.qp}")
         if args.quant_mode != "step":
-            raise ValueError("The quantization parameter requires quant_mode 'step'")
+            raise ValueError("The quantization parameter requires quant_mode 'step' (qp 0 disables it)")
         if args.qp_overestimate <= 0.0 or args.qp_lambda_scale <= 0.0:
             raise ValueError(f"Overestimation and lambda factors must be positive but got: {args.qp_overestimate}, {args.qp_lambda_scale}")
         density = QP_DENSITY * 2.0**((32.0 - args.qp) / QP_DENSITY_DOUBLING)
@@ -339,7 +340,11 @@ class GaussianSplatting2D(nn.Module):
         self.final_num_gaussians = self.total_num_gaussians - self.num_prune
         self.num_pruned = 0
         self.prune_rounds_done = 0
+        self.prune_round_step = 0  # Step of the last pruning round
         self.prune_finished = self.prune_mode == "ratio" and self.num_prune == 0
+        if args.prune_min_steps < 0:
+            raise ValueError(f"Minimum number of steps between pruning rounds must be non-negative but got: {args.prune_min_steps:d}")
+        self.prune_min_steps = args.prune_min_steps
         self.relocate_ratio = args.relocate_ratio
         if self.evaluate:
             # Checkpoints only contain the Gaussians that survived pruning
@@ -365,8 +370,6 @@ class GaussianSplatting2D(nn.Module):
             self.worklog.info(f"Pruning with lambda {self.prune_lambda:g}: up to {args.prune_times:d} rounds of at most {100.0*self.prune_max_ratio:g}% "
                               f"of the Gaussians, sizes logged before pruning assume all {self.total_num_gaussians:d}"
                               + (f", adding {100.0*self.prune_add_ratio:g}% after each round but the last" if self.prune_add_ratio > 0.0 else ""))
-        elif args.prune_add_ratio > 0.0:
-            raise ValueError("Adding Gaussians between pruning rounds requires prune_mode 'lambda'")
         if not self.prune_finished or self.relocate_ratio > 0.0:
             self.prune_score = args.prune_score
             if self.prune_score not in ["contribution", "loo"]:
@@ -453,7 +456,9 @@ class GaussianSplatting2D(nn.Module):
         if self.cuda_graph and not (self.realtime and self.quant_mode != "minmax" and not self.disable_tiles):
             raise ValueError("cuda_graph requires realtime, quant_mode 'step' or 'none', and tiles")
         self.graph, self.graph_key, self.graph_capacity, self.prev_step_event = None, None, 0, None
+        self.graph_pool, self.graph_stream = None, None  # Shared by all captures, created by the first one
         self.graph_captures, self.graph_capture_time = 0, 0.0
+        self.graph_capture_max = (0.0, 0, 0.0)  # Slowest capture: seconds, step, seconds of its eager step
         # Peak number of tile intersections since the last capture, on the GPU and copied to pinned memory by every replay
         self.isect_peak = torch.zeros(1, dtype=torch.int64, device=self.device)
         self.isect_peak_host = torch.zeros(1, dtype=torch.int64, pin_memory=self.cuda_graph)
@@ -788,6 +793,7 @@ class GaussianSplatting2D(nn.Module):
         self.decay_times, self.no_improvement_steps = 0, 0
         self.render_time_accum, self.total_time_accum = 0.0, 0.0
         self.round_time_accum = 0.0  # Wall-clock time of the densification and pruning rounds
+        self.round_time_max = (0.0, 0)  # Slowest round: seconds, step
         self.lpips_final, self.flip_final, self.msssim_final = 1.0, 1.0, 0.0
 
         self.step = 0
@@ -796,6 +802,9 @@ class GaussianSplatting2D(nn.Module):
         with torch.no_grad():
             if not self.realtime:
                 self._log_images(log_final=False, plot_gaussians=self.vis_gaussians)
+        gc_enabled = gc.isenabled()
+        if self.realtime:
+            gc.disable()  # A full garbage collection takes ~0.1 s, so it waits until after the optimization
         for step in range(self.start_step, self.max_steps+1):
             self.step = step
             step_begin = perf_counter()
@@ -841,7 +850,10 @@ class GaussianSplatting2D(nn.Module):
                         self._prune_gaussians_lambda(plot_gaussians=self.vis_gaussians)
                     else:
                         self._prune_gaussians(self.max_prune_num, plot_gaussians=self.vis_gaussians)
-                self.round_time_accum += perf_counter() - begin
+                    self.prune_round_step = self.step
+                round_time = perf_counter() - begin
+                self.round_time_accum += round_time
+                self.round_time_max = max(self.round_time_max, (round_time, self.step))
                 if self.realtime:
                     # Wall-clock time of the whole step without synchronizing: reading back the number of tile intersections in every forward
                     # pass (or waiting for the previous step of the CUDA graph) keeps the CPU at most one step ahead of the GPU
@@ -852,6 +864,8 @@ class GaussianSplatting2D(nn.Module):
                     terminate = self._time_schedule() or terminate
                 if terminate:
                     break
+        if gc_enabled:
+            gc.enable()
         torch.cuda.synchronize()
         optimization_time = perf_counter() - wall_begin
         with torch.no_grad():
@@ -860,9 +874,15 @@ class GaussianSplatting2D(nn.Module):
             self._save_model(final=True)
         torch.cuda.synchronize()
         self.wall_times = {"optimization": optimization_time, "saving": perf_counter() - wall_begin - optimization_time}
-        graph_info = f" | {self.graph_captures:d} CUDA graph captures ({self.graph_capture_time:.3f} s)" if self.cuda_graph else ""
         self.worklog.info(f"Optimization completed | Wall-clock time: {optimization_time:.3f} s optimization ({self.step:d} steps), "
-                          f"{self.wall_times['saving']:.3f} s final evaluation, checkpoint, and bitstream{graph_info}")
+                          f"{self.wall_times['saving']:.3f} s final evaluation, checkpoint, and bitstream")
+        if self.round_time_accum > 0.0:
+            self.worklog.info(f"Densification and pruning rounds: {self.round_time_accum:.3f} s, slowest {self.round_time_max[0]:.3f} s "
+                              f"(step {self.round_time_max[1]:d})")
+        if self.cuda_graph:
+            seconds, step, eager = self.graph_capture_max
+            self.worklog.info(f"CUDA graph captures: {self.graph_captures:d} ({self.graph_capture_time:.3f} s), slowest {seconds:.3f} s "
+                              f"(step {step:d}; eager step {eager:.3f} s, capture {seconds-eager:.3f} s)")
         self.worklog.info("***********************************************")
         self.worklog.info(f"Mean scale: {self._get_scale().mean().item():.4f} (pixel) | {self.scale.mean().item():.4f} (raw)")
         self.worklog.info("***********************************************")
@@ -890,10 +910,16 @@ class GaussianSplatting2D(nn.Module):
         """
         Optimization step as a CUDA graph: an eager step (on a side stream, as before any capture; it also creates the optimizer state of new
         parameters), then the capture of the next one, with buffers for isect_capacity_ratio times the current number of tile intersections.
+        All captures share one memory pool, so that each reuses the memory of the previous graph (never replayed again) instead of allocating
+        its own, and unlike torch.cuda.graph, a capture does not empty PyTorch's cache of GPU memory (cudaFree, then cudaMalloc again).
         """
         begin = perf_counter()
-        self.graph, self.graph_key, self.prev_step_event = None, None, None  # Frees the memory of the previous graph
-        stream = torch.cuda.Stream()
+        if self.graph_pool is None:
+            self.graph_pool, self.graph_stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
+        # The previous graph lives until the new one is captured: freeing the last graph of a pool would release the pool
+        previous_graph = self.graph
+        self.graph, self.graph_key, self.prev_step_event = None, None, None
+        stream = self.graph_stream
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             self.optimizer.zero_grad()
@@ -908,11 +934,14 @@ class GaussianSplatting2D(nn.Module):
                 num_tiles_hit = project_gaussians_2d_scale_rot(xy, scale, rot, self.img_h, self.img_w, self.tile_bounds)[3]
                 capacity = max(1024, round(self.isect_capacity_ratio * num_tiles_hit.sum().item()))
         torch.cuda.current_stream().wait_stream(stream)
+        eager_time = perf_counter() - begin
         self.isect_peak.zero_()
         self.isect_peak_host.zero_()
         self.optimizer.zero_grad(set_to_none=True)  # backward() then allocates the gradients from the memory pool of the graph
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        torch.cuda.synchronize()
+        with torch.cuda.stream(stream):
+            graph.capture_begin(pool=self.graph_pool)
             images, _ = self.forward(self.img_h, self.img_w, self.tile_bounds, isect_capacity=capacity)
             self._get_total_loss(images)
             self.total_loss.backward()
@@ -920,9 +949,13 @@ class GaussianSplatting2D(nn.Module):
             if self.max_scale > 0.0:
                 self._clamp_scale()
             self.isect_peak_host.copy_(self.isect_peak, non_blocking=True)
+            graph.capture_end()
+        del previous_graph
         self.graph, self.graph_key, self.graph_capacity = graph, key, capacity
         self.graph_captures += 1
-        self.graph_capture_time += perf_counter() - begin
+        capture_time = perf_counter() - begin
+        self.graph_capture_time += capture_time
+        self.graph_capture_max = max(self.graph_capture_max, (capture_time, self.step, eager_time))
 
     def _get_total_loss(self, images):
         self.total_loss = 0
@@ -1018,17 +1051,27 @@ class GaussianSplatting2D(nn.Module):
 
     def _is_prune_step(self):
         """
-        Whether the next pruning round is due: every prune_steps steps, or with a time budget, every prune_time_ratio of the budget.
+        Whether the next pruning round is due: every prune_steps steps, or with a time budget, every prune_time_ratio of the budget but at
+        least prune_min_steps steps after the previous round (or the start), so that a stall (e.g., a slow round) does not set off the next
+        rounds at consecutive steps.
         """
         if self.max_time > 0.0:
-            return self.total_time_accum >= (self.prune_rounds_done + 1) * self.prune_time_ratio * self.max_time
+            return (self.total_time_accum >= (self.prune_rounds_done + 1) * self.prune_time_ratio * self.max_time
+                    and self.step - self.prune_round_step >= self.prune_min_steps)
         return (self.step - self.prune_start_step) % self.prune_steps == 0
 
     def _time_schedule(self):
         """
         Schedule of time-budgeted optimization: a single learning rate decay after decay_time_ratio of the budget, and termination once the
-        budget is used up. Returns whether to terminate.
+        budget is used up. Pruning rounds that are still due by then are skipped (when stalls delayed them), because the steps after them
+        would not recover the image. Returns whether to terminate.
         """
+        if not self.prune_finished and self.total_time_accum >= self.decay_time_ratio * self.max_time:
+            self.prune_finished = True
+            self.final_num_gaussians = self.num_gaussians
+            self.worklog.info(f"Step: {self.step:d} | Pruning stopped after {self.prune_rounds_done:d} of {self.prune_times:d} rounds at "
+                              f"{self.total_time_accum:.2f} s with {self.num_gaussians:d} Gaussians ({self.num_pruned:d} pruned)")
+            self.worklog.info("***********************************************")
         if not self.disable_lr_schedule and self.decay_times == 0 and self.total_time_accum >= self.decay_time_ratio * self.max_time:
             self.decay_times = 1
             for param_group in self.optimizer.param_groups:

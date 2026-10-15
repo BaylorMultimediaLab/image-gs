@@ -22,7 +22,7 @@ QPS = [27, 32, 37, 42]
 FIXED = {"seed": 123, "max_steps": 1000000, "disable_prog_optim": True, "prune_score": "loo", "prune_time_ratio": 0.1667,
          "decay_time_ratio": 0.8333, "color_space": "rgb", "init_scale": 2.25, "bitstream_codec": "rans", "color_transform": "subtract-green",
          "save_image_format": "png", "quant_mode": "step", "pos_step": 0.125, "scale_step": 0.03125, "rot_step": 0.703125,
-         "qp_overestimate": 1.25}
+         "qp_overestimate": 1.25, "qp_lambda_scale": 1.0, "prune_add_ratio": 0.0}
 ARMS = {
     "cap10x4": {"prune_max_ratio": 0.1, "prune_times": 4},
     "cap25x4": {"prune_max_ratio": 0.25, "prune_times": 4},
