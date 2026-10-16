@@ -5,6 +5,7 @@ import os
 import struct
 import sys
 import warnings
+from contextlib import contextmanager
 from time import perf_counter
 
 import numpy as np
@@ -42,6 +43,7 @@ from utils.image_utils import (
 from utils.misc_utils import clean_dir, get_latest_ckpt_step, save_cfg, set_random_seed
 from utils.quantization_utils import dequantize, quantize_minmax, quantize_step
 from utils.saliency_utils import get_smap
+from utils.stall_utils import StallTracer
 
 warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=FutureWarning, module="torchvision")
@@ -459,6 +461,9 @@ class GaussianSplatting2D(nn.Module):
         self.graph_pool, self.graph_stream = None, None  # Shared by all captures, created by the first one
         self.graph_captures, self.graph_capture_time = 0, 0.0
         self.graph_capture_max = (0.0, 0, 0.0)  # Slowest capture: seconds, step, seconds of its eager step
+        if args.stall_trace < 0.0:
+            raise ValueError(f"Stall threshold must be non-negative but got: {args.stall_trace}")
+        self.stall_trace, self.stall_tracer = args.stall_trace, None
         # Peak number of tile intersections since the last capture, on the GPU and copied to pinned memory by every replay
         self.isect_peak = torch.zeros(1, dtype=torch.int64, device=self.device)
         self.isect_peak_host = torch.zeros(1, dtype=torch.int64, pin_memory=self.cuda_graph)
@@ -805,6 +810,8 @@ class GaussianSplatting2D(nn.Module):
         gc_enabled = gc.isenabled()
         if self.realtime:
             gc.disable()  # A full garbage collection takes ~0.1 s, so it waits until after the optimization
+        if self.stall_trace > 0.0:
+            self.stall_tracer = StallTracer(self.stall_trace, os.path.join(self.log_dir, "stalls.txt"))
         for step in range(self.start_step, self.max_steps+1):
             self.step = step
             step_begin = perf_counter()
@@ -846,10 +853,11 @@ class GaussianSplatting2D(nn.Module):
                         self._remove_lowest_score(relocate_num, action="Relocating", plot_gaussians=self.vis_gaussians)
                     self._add_gaussians(self.max_add_num + relocate_num, plot_gaussians=self.vis_gaussians)
                 if not self.prune_finished and self.step > self.prune_start_step and self._is_prune_step():
-                    if self.prune_mode == "lambda":
-                        self._prune_gaussians_lambda(plot_gaussians=self.vis_gaussians)
-                    else:
-                        self._prune_gaussians(self.max_prune_num, plot_gaussians=self.vis_gaussians)
+                    with self._stall_trace("pruning round"):
+                        if self.prune_mode == "lambda":
+                            self._prune_gaussians_lambda(plot_gaussians=self.vis_gaussians)
+                        else:
+                            self._prune_gaussians(self.max_prune_num, plot_gaussians=self.vis_gaussians)
                     self.prune_round_step = self.step
                 round_time = perf_counter() - begin
                 self.round_time_accum += round_time
@@ -866,6 +874,9 @@ class GaussianSplatting2D(nn.Module):
                     break
         if gc_enabled:
             gc.enable()
+        if self.stall_tracer is not None:
+            self.stall_tracer.close()
+            self.stall_tracer = None
         torch.cuda.synchronize()
         optimization_time = perf_counter() - wall_begin
         with torch.no_grad():
@@ -897,7 +908,8 @@ class GaussianSplatting2D(nn.Module):
         key = (self.xy, self.scale, self.rot, self.feat, self.optimizer)
         overflow = int(self.isect_peak_host[0]) > self.graph_capacity  # Peak of a recent step (written by the replays)
         if self.graph is None or overflow or any(a is not b for a, b in zip(key, self.graph_key)):
-            self._capture_step(key)
+            with self._stall_trace("CUDA graph capture"):
+                self._capture_step(key)
             return
         self.graph.replay()
         event = torch.cuda.Event()
@@ -905,6 +917,20 @@ class GaussianSplatting2D(nn.Module):
         if self.prev_step_event is not None:
             self.prev_step_event.synchronize()
         self.prev_step_event = event
+
+    @contextmanager
+    def _stall_trace(self, event):
+        """
+        With stall_trace, logs the event if it takes longer than that (with its stacks in stalls.txt).
+        """
+        if self.stall_tracer is None:
+            yield
+            return
+        self.stall_tracer.begin()
+        yield
+        message = self.stall_tracer.end(event)
+        if message is not None:
+            self.worklog.info(f"Step: {self.step:d} | {message}")
 
     def _capture_step(self, key):
         """

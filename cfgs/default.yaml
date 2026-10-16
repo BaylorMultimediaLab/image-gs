@@ -1,6 +1,7 @@
 seed:                  123
 device:                "cuda:0"
 realtime:              False # Real-time encoding: skip what an encoder does not need (saved images, LPIPS/MS-SSIM/FLIP, periodic evaluation unless the adaptive learning rate schedule uses it, bitstream verification, PSNR measurement of pruning rounds), use fused Adam, and charge the time budget (max_time) by wall-clock time without synchronizing at every step
+stall_trace:           0.0 # Pruning rounds and CUDA graph captures that take longer than this many seconds write samples of the Python stack of the main thread (one per this many seconds) to stalls.txt in the log directory and log their CPU time, context switches, page faults, and CPU throttling (0 disables it)
 cuda_graph:            False # Real-time mode only: replay each optimization step from a CUDA graph (one launch instead of about 110 kernels, so that a step costs its GPU time rather than its CPU time), captured again whenever pruning or densification replaces the Gaussians or the tile intersections outgrow their fixed-capacity buffers; requires quant_mode "step" or "none" and tiles
 # Evaluation
 eval:                  False # Render the optimized Image-GS representation
