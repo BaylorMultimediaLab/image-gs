@@ -8,7 +8,7 @@ from torch import Tensor
 from torch.autograd import Function
 
 import gsplat.cuda as _C
-from .utils import bin_and_sort_gaussians, bin_and_sort_gaussians_capacity, compute_cumulative_intersects
+from .utils import bin_and_sort_gaussians_capacity, compute_cumulative_intersects, sort_intersects_by_tile
 
 
 def rasterize_gaussians_sum(
@@ -96,19 +96,8 @@ class _RasterizeGaussiansSum(Function):
                 gaussian_ids_sorted = torch.zeros(0, 1, device=xys.device)
                 tile_bins =           torch.zeros(0, 2, device=xys.device)
             else:
-                (
-                    isect_ids_unsorted,
-                    gaussian_ids_unsorted,
-                    isect_ids_sorted,
-                    gaussian_ids_sorted,
-                    tile_bins,
-                ) = bin_and_sort_gaussians(
-                    num_points,
-                    num_intersects,
-                    xys,
-                    radii,
-                    cum_tiles_hit,
-                    tile_bounds,
+                gaussian_ids_sorted, tile_bins = sort_intersects_by_tile(
+                    num_points, num_intersects, xys, radii, cum_tiles_hit, tile_bounds
                 )
         
         ctx.img_width = img_width
@@ -143,6 +132,7 @@ class _RasterizeGaussiansSum(Function):
                 colors
             )
         else:
+            # Rendered channel-planar [C, H, W] and returned as an [H, W, C] view, so that callers that permute to [C, H, W] need no copy
             out_img, pixel_topk = _C.nd_rasterize_forward_topk_norm(
                 tile_bounds,
                 block,
@@ -154,13 +144,12 @@ class _RasterizeGaussiansSum(Function):
                 colors,
             )
             ctx.save_for_backward(
-                gaussian_ids_sorted,
-                tile_bins,
                 xys,
                 conics,
                 colors,
                 pixel_topk.contiguous()
             )
+            out_img = out_img.permute(1, 2, 0)
 
         return out_img
 
@@ -204,8 +193,6 @@ class _RasterizeGaussiansSum(Function):
             )
         else:
             (
-                gaussian_ids_sorted,
-                tile_bins,
                 xys,
                 conics,
                 colors,
@@ -216,12 +203,10 @@ class _RasterizeGaussiansSum(Function):
                 img_width,
                 BLOCK_H,
                 BLOCK_W,
-                gaussian_ids_sorted,
-                tile_bins,
-                xys,
-                conics,
-                colors,
-                v_out_img,
+                xys.contiguous(),
+                conics.contiguous(),
+                colors.contiguous(),
+                v_out_img.permute(2, 0, 1).contiguous(),  # channel-planar
                 pixel_topk
             )
 

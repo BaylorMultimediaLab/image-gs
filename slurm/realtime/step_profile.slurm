@@ -9,7 +9,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-gpu=18
 #SBATCH --gpus-per-node=1
-#SBATCH --time=00:10:00
+#SBATCH --time=00:20:00
 
 # Profile of an optimization step in real-time mode (slurm/realtime/step_profile.py): wall-clock vs GPU busy time per step, i.e., what CUDA
 # graphs can save, plus GPU time per kernel and CPU time per phase. A single job (no array), so it runs on the debug partition; a few minutes.

@@ -62,7 +62,6 @@ __global__ void map_gaussian_to_intersects(
     const int* __restrict__ radii,
     const int32_t* __restrict__ cum_tiles_hit,
     const dim3 tile_bounds,
-    const int capacity,
     int64_t* __restrict__ isect_ids,
     int32_t* __restrict__ gaussian_ids
 );
@@ -70,6 +69,24 @@ __global__ void map_gaussian_to_intersects(
 __global__ void get_tile_bin_edges(
     const int num_intersects, 
     const int64_t* __restrict__ isect_ids_sorted,
+    int2* __restrict__ tile_bins
+);
+
+__global__ void map_intersects_to_tiles(
+    const int num_points,
+    const int capacity,
+    const float2* __restrict__ xys,
+    const int* __restrict__ radii,
+    const int32_t* __restrict__ cum_tiles_hit,
+    const dim3 tile_bounds,
+    uint32_t* __restrict__ isect_tiles,
+    int32_t* __restrict__ gaussian_ids
+);
+
+__global__ void get_tile_bin_edges_from_tiles(
+    const int num_intersects,
+    const int num_tiles,
+    const uint32_t* __restrict__ isect_tiles_sorted,
     int2* __restrict__ tile_bins
 );
 
@@ -83,4 +100,17 @@ __global__ void rasterize_forward(
     const float3* __restrict__ conics,
     const float3* __restrict__ colors,
     float3* __restrict__ out_img
+);
+
+__global__ void topk_norm_loo_loss_increase(
+    const dim3 img_size,
+    const unsigned channels,
+    const float2* __restrict__ xys,
+    const float3* __restrict__ conics,
+    const float* __restrict__ colors,
+    const int32_t* __restrict__ pixel_topk,
+    const float* __restrict__ targets,
+    const bool squared,
+    const float eps,
+    float* __restrict__ loss_increase
 );

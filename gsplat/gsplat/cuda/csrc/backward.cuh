@@ -19,20 +19,22 @@ __global__ void nd_rasterize_backward_kernel(
     float* __restrict__ v_rgb
 );
 
-__global__ void nd_rasterize_backward_topk_norm_kernel(
+// Launches the top-K backward kernel (backward.cu) for 5 + channels <= 32 gradient values per Gaussian; the block's width must be a
+// multiple of 8 and its height a multiple of 4
+void nd_rasterize_backward_topk_norm(
     const dim3 tile_bounds,
+    const dim3 block,
     const dim3 img_size,
     const unsigned channels,
-    const int32_t* __restrict__ gaussians_ids_sorted,
-    const int2* __restrict__ tile_bins,
-    const float2* __restrict__ xys,
-    const float3* __restrict__ conics,
-    const float* __restrict__ rgbs,
-    const float* __restrict__ v_output,
-    float2* __restrict__ v_xy,
-    float3* __restrict__ v_conic,
-    float* __restrict__ v_rgb,
-    int* __restrict__ pixel_topk
+    const float2* xys,
+    const float3* conics,
+    const float* rgbs,
+    const float* v_output,
+    float2* v_xy,
+    float3* v_conic,
+    float* v_rgb,
+    const int32_t* pixel_topk,
+    cudaStream_t stream
 );
 
 __global__ void nd_rasterize_backward_no_tiles_kernel(

@@ -1,5 +1,6 @@
 #include "backward.cuh"
 #include "helpers.cuh"
+#include <climits>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -155,20 +156,43 @@ __global__ void nd_rasterize_backward_kernel(
     }
 }
 
-// Sum over the 32 lanes of a warp, returned to every lane (all lanes must be active)
-inline __device__ float warp_sum_all(float value) {
+// Sums NV values (a power of two, at most 32) over the 32 lanes of a warp by recursive halving: NV - 1 shuffles for the halving plus
+// log2(32 / NV) for the final sum, instead of 5 per value. Lane l receives the total of value warp_reduce_scatter_index<NV>(l), which
+// lanes with l % (32 / NV) == 0 hold without repetition. All lanes must be active.
+template <int NV>
+inline __device__ float warp_reduce_scatter(float (&a)[NV], const int lane) {
     #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2)
-        value += __shfl_xor_sync(0xffffffff, value, offset);
-    return value;
+    for (int half = NV / 2, offset = 16; half >= 1; half /= 2, offset /= 2) {
+        const bool upper = lane & offset;
+        #pragma unroll
+        for (int v = 0; v < half; ++v)
+            a[v] = (upper ? a[v + half] : a[v]) + __shfl_xor_sync(0xffffffff, upper ? a[v] : a[v + half], offset);
+    }
+    float sum = a[0];
+    #pragma unroll
+    for (int offset = 16 / NV; offset > 0; offset /= 2)
+        sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    return sum;
 }
 
+template <int NV>
+inline __device__ int warp_reduce_scatter_index(const int lane) {
+    int index = 0;
+    #pragma unroll
+    for (int half = NV / 2, offset = 16; half >= 1; half /= 2, offset /= 2)
+        if (lane & offset) index += half;
+    return index;
+}
+
+// Gradients of the top-K normalized rendering out = sum_k d_k f_k / (sum_k d_k + EPS), d_k = exp(-sigma_k), for the top-K Gaussians that
+// the forward pass stored per pixel. Each warp covers an 8x4 patch of its tile and visits the union of its pixels' top-K Gaussians in
+// increasing ID order (a warp-wide minimum per step), so the cost grows with that union (about 10-16 Gaussians at 480p/720p), not with
+// the tile's list. Per Gaussian, the warp sums its NV gradient values (v_conic 0-2, v_xy 3-4, v_rgb 5-, zero padding) with one
+// reduce-scatter and adds them with one atomic per value.
+template <int NV>
 __global__ void nd_rasterize_backward_topk_norm_kernel(
-    const dim3 tile_bounds,
     const dim3 img_size,
     const unsigned channels,
-    const int32_t* __restrict__ gaussians_ids_sorted,
-    const int2* __restrict__ tile_bins,
     const float2* __restrict__ xys,
     const float3* __restrict__ conics,
     const float* __restrict__ rgbs,
@@ -176,47 +200,43 @@ __global__ void nd_rasterize_backward_topk_norm_kernel(
     float2* __restrict__ v_xy,
     float3* __restrict__ v_conic,
     float* __restrict__ v_rgb,
-    int* __restrict__ pixel_topk
+    const int32_t* __restrict__ pixel_topk
 ) {
-
-    auto block = cg::this_thread_block();
-    int32_t tile_id =
-        block.group_index().y * tile_bounds.x + block.group_index().x;
-    unsigned i =
-        block.group_index().y * block.group_dim().y + block.thread_index().y;
-    unsigned j =
-        block.group_index().x * block.group_dim().x + block.thread_index().x;
-
+    constexpr int MAX_C = NV - 5;
+    const int tr = threadIdx.y * blockDim.x + threadIdx.x;
+    const int warp = tr / 32;
+    const int lane = tr % 32;
+    const int patches_x = blockDim.x / 8;
+    const unsigned j = blockIdx.x * blockDim.x + (warp % patches_x) * 8 + lane % 8;
+    const unsigned i = blockIdx.y * blockDim.y + (warp / patches_x) * 4 + lane / 8;
     const float px = (float)j;
     const float py = (float)i;
-    // clamp this value to the last pixel
-    const int32_t pix_id = min(i * img_size.x + j, img_size.x * img_size.y - 1);
-
-    // threads outside the image take part in the warp sums with an empty top-K list
+    // threads outside the image take part in the warp steps with an empty top-K list
     const bool inside = (i < img_size.y && j < img_size.x);
+    const int32_t num_pixels = img_size.x * img_size.y;
+    const int32_t pix_id = inside ? i * img_size.x + j : 0;
 
-    // df/d_out for this pixel
-    const float* v_out = &(v_output[channels * pix_id]);
+    // df/d_out for this pixel, from the channel-planar [C, H, W] gradient
+    float v_out[MAX_C];
+    #pragma unroll
+    for (int c = 0; c < MAX_C; ++c)
+        v_out[c] = (inside && c < channels) ? v_output[c * num_pixels + pix_id] : 0.f;
 
-    // topk gs ids for this pixel and their weights d = exp(-sigma)
-    int32_t topk[TOP_K];
+    // top-K Gaussian IDs of this pixel (INT_MAX for none) and their weights d = exp(-sigma)
+    int32_t ids[TOP_K];
     float d_local[TOP_K];
     float denom = EPS;
-    int cnt = 0;
     #pragma unroll
     for (int k = 0; k < TOP_K; ++k) {
-        topk[k] = inside ? pixel_topk[pix_id * TOP_K + k] : -1;
+        const int32_t g_id = inside ? pixel_topk[pix_id * TOP_K + k] : -1;
+        ids[k] = g_id < 0 ? INT_MAX : g_id;
         d_local[k] = 0.f;
-        int g_id = topk[k];
         if (g_id < 0) continue;
-        ++cnt;
-        float3 conic = conics[g_id];
-        float2 xy = xys[g_id];
-        float2 delta = {xy.x - px, xy.y - py};
-        float sigma = 0.5f * (conic.x * delta.x * delta.x +
-                                    conic.z * delta.y * delta.y) +
-                            conic.y * delta.x * delta.y;
-        float d = __expf(-sigma);
+        const float3 conic = conics[g_id];
+        const float2 xy = xys[g_id];
+        const float2 delta = {xy.x - px, xy.y - py};
+        const float sigma = 0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) + conic.y * delta.x * delta.y;
+        const float d = __expf(-sigma);
         denom += d;
         d_local[k] = d;
     }
@@ -227,12 +247,12 @@ __global__ void nd_rasterize_backward_topk_norm_kernel(
     #pragma unroll
     for (int k = 0; k < TOP_K; ++k) {
         v_norm_d[k] = 0.f;
-        int g_id = topk[k];
-        if (g_id < 0) continue;
-        const float* rgb = &rgbs[channels * g_id];
-        for (int c = 0; c < channels; ++c)
-            v_norm_d[k] += rgb[c] * v_out[c];
-        v_d_shared += -d_local[k] / (denom*denom) * v_norm_d[k];
+        if (ids[k] == INT_MAX) continue;
+        const float* rgb = &rgbs[channels * ids[k]];
+        #pragma unroll
+        for (int c = 0; c < MAX_C; ++c)
+            if (c < channels) v_norm_d[k] += rgb[c] * v_out[c];
+        v_d_shared += -d_local[k] / (denom * denom) * v_norm_d[k];
     }
 
     // per top-K entry: the weight of its color and dL/dsigma = -d dL/dd
@@ -244,107 +264,73 @@ __global__ void nd_rasterize_backward_topk_norm_kernel(
         v_sigma_local[k] = -d_local[k] * (v_norm_d[k] / denom + v_d_shared);
     }
 
-    const int2 range = tile_bins[tile_id];
-    if (range.y - range.x > TOPK_WALK_MAX_GAUSSIANS) {
-        // crowded tile (the same branch for the whole block): walking its list would cost more than per-pixel atomic adds
-        if (!inside) return;
+    const int value_index = warp_reduce_scatter_index<NV>(lane);
+    const bool adds = lane % (32 / NV) == 0 && value_index < 5 + (int)channels;
+    float* target = value_index < 3 ? (float*)v_conic + value_index
+                  : value_index < 5 ? (float*)v_xy + (value_index - 3)
+                  : v_rgb + (value_index - 5);
+    const int target_stride = value_index < 3 ? 3 : value_index < 5 ? 2 : channels;
+    while (true) {
+        int32_t head = ids[0];
+        #pragma unroll
+        for (int k = 1; k < TOP_K; ++k)
+            head = min(head, ids[k]);
+        const int32_t g_id = __reduce_min_sync(0xffffffff, head);
+        if (g_id == INT_MAX)
+            break;
+        float rgb_weight = 0.f;
+        float v_sigma = 0.f;
         #pragma unroll
         for (int k = 0; k < TOP_K; ++k) {
-            int g_id = topk[k];
-            if (g_id < 0) continue;
-            float v_sigma = v_sigma_local[k];
-            float3 conic = conics[g_id];
-            float2 xy = xys[g_id];
-            float2 delta = {xy.x - px, xy.y - py};
-            float* v_conic_ptr = (float*)(v_conic);
-            atomicAdd(v_conic_ptr + 3*g_id + 0, 0.5f * v_sigma * delta.x * delta.x);
-            atomicAdd(v_conic_ptr + 3*g_id + 1, v_sigma * delta.x * delta.y);
-            atomicAdd(v_conic_ptr + 3*g_id + 2, 0.5f * v_sigma * delta.y * delta.y);
-            float* v_xy_ptr = (float*)(v_xy);
-            atomicAdd(v_xy_ptr + 2*g_id + 0, v_sigma * (conic.x * delta.x + conic.y * delta.y));
-            atomicAdd(v_xy_ptr + 2*g_id + 1, v_sigma * (conic.y * delta.x + conic.z * delta.y));
-            for (int c = 0; c < channels; ++c)
-                atomicAdd(v_rgb + channels * g_id + c, rgb_weight_local[k] * v_out[c]);
+            if (ids[k] == g_id) {
+                rgb_weight = rgb_weight_local[k];
+                v_sigma = v_sigma_local[k];
+                ids[k] = INT_MAX;
+            }
         }
-        return;
+        // lanes without this Gaussian add zeros
+        const float3 conic = conics[g_id];
+        const float2 xy = xys[g_id];
+        const float2 delta = {xy.x - px, xy.y - py};
+        float values[NV];
+        values[0] = 0.5f * v_sigma * delta.x * delta.x;
+        values[1] = v_sigma * delta.x * delta.y;
+        values[2] = 0.5f * v_sigma * delta.y * delta.y;
+        values[3] = v_sigma * (conic.x * delta.x + conic.y * delta.y);
+        values[4] = v_sigma * (conic.y * delta.x + conic.z * delta.y);
+        #pragma unroll
+        for (int c = 0; c < MAX_C; ++c)
+            values[5 + c] = rgb_weight * v_out[c];
+        const float sum = warp_reduce_scatter<NV>(values, lane);
+        if (adds)
+            atomicAdd(target + target_stride * g_id, sum);
     }
+}
 
-    // walk the tile's Gaussians in batches loaded into shared memory, as in the forward pass
-    const int block_size = block.size();
-    const int num_batches = (range.y - range.x + block_size - 1) / block_size;
-
-    __shared__ int32_t id_batch[BLOCK_SIZE];
-    __shared__ float2 xy_batch[BLOCK_SIZE];
-    __shared__ float3 conic_batch[BLOCK_SIZE];
-
-    const int tr = block.thread_rank();
-    const int lane = tr % 32;
-    // values per Gaussian, lane v adds value v: v_conic (0-2), v_xy (3-4), v_rgb (5-)
-    const int num_values = 5 + channels;
-    int remaining = cnt;  // top-K Gaussians of this pixel not reached yet
-
-    for (int b = 0; b < num_batches; ++b) {
-        // end early once every pixel of the tile has reached all of its top-K Gaussians
-        if (__syncthreads_count(remaining > 0) == 0) {
-            break;
-        }
-        int batch_start = range.x + block_size * b;
-        int idx = batch_start + tr;
-        if (idx < range.y) {
-            int32_t g_id = gaussians_ids_sorted[idx];
-            id_batch[tr] = g_id;
-            xy_batch[tr] = xys[g_id];
-            conic_batch[tr] = conics[g_id];
-        }
-        block.sync();
-
-        // all branches below are uniform within the warp
-        int batch_size = min(block_size, range.y - batch_start);
-        for (int t = 0; t < batch_size; ++t) {
-            if (!__any_sync(0xffffffff, remaining > 0))
-                break;
-            const int32_t g_id = id_batch[t];
-            float rgb_weight = 0.f;
-            float v_sigma = 0.f;
-            bool hit = false;
-            #pragma unroll
-            for (int k = 0; k < TOP_K; ++k) {
-                if (topk[k] == g_id) {
-                    rgb_weight = rgb_weight_local[k];
-                    v_sigma = v_sigma_local[k];
-                    hit = true;
-                }
-            }
-            if (!__any_sync(0xffffffff, hit))
-                continue;
-            remaining -= hit;
-
-            const float3 conic = conic_batch[t];
-            const float2 xy = xy_batch[t];
-            const float2 delta = {xy.x - px, xy.y - py};
-            float value = 0.f;
-            float sum;
-            sum = warp_sum_all(0.5f * v_sigma * delta.x * delta.x);
-            if (lane == 0) value = sum;
-            sum = warp_sum_all(v_sigma * delta.x * delta.y);
-            if (lane == 1) value = sum;
-            sum = warp_sum_all(0.5f * v_sigma * delta.y * delta.y);
-            if (lane == 2) value = sum;
-            sum = warp_sum_all(v_sigma * (conic.x * delta.x + conic.y * delta.y));
-            if (lane == 3) value = sum;
-            sum = warp_sum_all(v_sigma * (conic.y * delta.x + conic.z * delta.y));
-            if (lane == 4) value = sum;
-            for (int c = 0; c < channels; ++c) {
-                sum = warp_sum_all(rgb_weight * v_out[c]);
-                if (lane == 5 + c) value = sum;
-            }
-            if (lane < num_values) {
-                float* target = lane < 3 ? (float*)v_conic + 3 * g_id + lane
-                              : lane < 5 ? (float*)v_xy + 2 * g_id + (lane - 3)
-                              : v_rgb + channels * g_id + (lane - 5);
-                atomicAdd(target, value);
-            }
-        }
+void nd_rasterize_backward_topk_norm(
+    const dim3 tile_bounds,
+    const dim3 block,
+    const dim3 img_size,
+    const unsigned channels,
+    const float2* xys,
+    const float3* conics,
+    const float* rgbs,
+    const float* v_output,
+    float2* v_xy,
+    float3* v_conic,
+    float* v_rgb,
+    const int32_t* pixel_topk,
+    cudaStream_t stream
+) {
+    if (5 + channels <= 8) {
+        nd_rasterize_backward_topk_norm_kernel<8><<<tile_bounds, block, 0, stream>>>(
+            img_size, channels, xys, conics, rgbs, v_output, v_xy, v_conic, v_rgb, pixel_topk);
+    } else if (5 + channels <= 16) {
+        nd_rasterize_backward_topk_norm_kernel<16><<<tile_bounds, block, 0, stream>>>(
+            img_size, channels, xys, conics, rgbs, v_output, v_xy, v_conic, v_rgb, pixel_topk);
+    } else {
+        nd_rasterize_backward_topk_norm_kernel<32><<<tile_bounds, block, 0, stream>>>(
+            img_size, channels, xys, conics, rgbs, v_output, v_xy, v_conic, v_rgb, pixel_topk);
     }
 }
 

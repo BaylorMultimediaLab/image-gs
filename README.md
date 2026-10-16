@@ -16,8 +16,9 @@ pip install -r requirements.txt
 # CUDA extensions, compiled for the compute capability of your GPU (e.g., 8.0 for an A100, 8.6 for an RTX 30 series)
 export TORCH_CUDA_ARCH_LIST="8.6"
 pip install ./gsplat --no-build-isolation
-# fused-ssim at the commit of its pull request #45, which launches the kernels on PyTorch's current stream (needed by cuda_graph)
-pip install git+https://github.com/rahul-goel/fused-ssim/@732c243fc6731ac0ffa25de17a0d7219f90b61c6 --no-build-isolation
+# fused-ssim at the head of its pull request #46: kernels on PyTorch's current stream (needed by cuda_graph), and
+# fused_l1_ssim, the training loss in one forward and one backward kernel
+pip install git+https://github.com/rahul-goel/fused-ssim/@77aba120314babc98140cd6c7e8c7119fa92cbee --no-build-isolation
 
 # C++ rANS coder (rebuild after changing compress/csrc/rans.cpp; compress/rans_codec.py refuses a build from another source)
 pip install ./compress/csrc --no-build-isolation

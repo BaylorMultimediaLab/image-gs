@@ -8,6 +8,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("nd_rasterize_forward_topk_norm",  &nd_rasterize_forward_topk_norm_tensor);
     m.def("nd_rasterize_backward_topk_norm", &nd_rasterize_backward_topk_norm_tensor);
+    m.def("topk_norm_loo_loss_increase", &topk_norm_loo_loss_increase_tensor);
 
     m.def("nd_rasterize_forward_no_tiles", &nd_rasterize_forward_no_tiles_tensor);
     m.def("nd_rasterize_backward_no_tiles", &nd_rasterize_backward_no_tiles_tensor);
@@ -24,6 +25,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // utils
     m.def("compute_cov2d_bounds", &compute_cov2d_bounds_tensor);
     m.def("map_gaussian_to_intersects", &map_gaussian_to_intersects_tensor);
-    m.def("map_gaussian_to_intersects_capacity", &map_gaussian_to_intersects_capacity_tensor);
+    m.def("sort_intersects_by_tile", &sort_intersects_by_tile_tensor);
     m.def("get_tile_bin_edges", &get_tile_bin_edges_tensor);
 }

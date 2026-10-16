@@ -9,14 +9,12 @@ namespace cg = cooperative_groups;
 
 // kernel to map each intersection from tile ID and depth to a gaussian
 // writes output to isect_ids and gaussian_ids
-// intersections at index capacity and beyond are dropped (fixed-capacity buffers of map_gaussian_to_intersects_capacity_tensor)
 __global__ void map_gaussian_to_intersects(
     const int num_points,
     const float2* __restrict__ xys,
     const int* __restrict__ radii,
     const int32_t* __restrict__ cum_tiles_hit,
     const dim3 tile_bounds,
-    const int capacity,
     int64_t* __restrict__ isect_ids,
     int32_t* __restrict__ gaussian_ids
 ) {
@@ -35,8 +33,6 @@ __global__ void map_gaussian_to_intersects(
     int64_t depth_id = 0;
     for (int i = tile_min.y; i < tile_max.y; ++i) {
         for (int j = tile_min.x; j < tile_max.x; ++j) {
-            if (cur_idx >= capacity)
-                return;
             // isect_id is tile ID and depth as int32
             int64_t tile_id = i * tile_bounds.x + j; // tile within image
             isect_ids[cur_idx] = (tile_id << 32) | depth_id; // tile | depth id
@@ -49,22 +45,80 @@ __global__ void map_gaussian_to_intersects(
 // kernel to map sorted intersection IDs to tile bins
 // expect that intersection IDs are sorted by increasing tile ID
 // i.e. intersections of a tile are in contiguous chunks
-// each entry sets the start of its tile if it is the first of the tile, and the end if it is the last one; entries with the padding ID
-// ISECT_ID_PADDING (sorted last, see map_gaussian_to_intersects_capacity_tensor) are skipped
 __global__ void get_tile_bin_edges(
     const int num_intersects, const int64_t* __restrict__ isect_ids_sorted, int2* __restrict__ tile_bins
 ) {
     unsigned idx = cg::this_grid().thread_rank();
     if (idx >= num_intersects)
         return;
-    const int64_t isect_id = isect_ids_sorted[idx];
-    if (isect_id == ISECT_ID_PADDING)
+    // save the indices where the tile_id changes
+    int32_t cur_tile_idx = (int32_t)(isect_ids_sorted[idx] >> 32);
+    if (idx == 0 || idx == num_intersects - 1) {
+        if (idx == 0)
+            tile_bins[cur_tile_idx].x = 0;
+        if (idx == num_intersects - 1)
+            tile_bins[cur_tile_idx].y = num_intersects;
+    }
+    if (idx == 0)
         return;
-    int32_t cur_tile_idx = (int32_t)(isect_id >> 32);
-    if (idx == 0 || (int32_t)(isect_ids_sorted[idx - 1] >> 32) != cur_tile_idx)
+    int32_t prev_tile_idx = (int32_t)(isect_ids_sorted[idx - 1] >> 32);
+    if (prev_tile_idx != cur_tile_idx) {
+        tile_bins[prev_tile_idx].y = idx;
         tile_bins[cur_tile_idx].x = idx;
-    if (idx == num_intersects - 1 || (int32_t)(isect_ids_sorted[idx + 1] >> 32) != cur_tile_idx)
-        tile_bins[cur_tile_idx].y = idx + 1;
+        return;
+    }
+}
+
+// Tile (sort key) and Gaussian of each tile intersection, one thread per intersection: intersection idx belongs to the Gaussian g with
+// cum_tiles_hit[g - 1] <= idx < cum_tiles_hit[g] and is the tile at position idx - cum_tiles_hit[g - 1] of its tile bounding box in row-major
+// order, as in map_gaussian_to_intersects. Entries from the number of intersections (cum_tiles_hit[num_points - 1]) on keep the key that the
+// caller set for padding; intersections beyond the capacity are dropped.
+__global__ void map_intersects_to_tiles(
+    const int num_points,
+    const int capacity,
+    const float2* __restrict__ xys,
+    const int* __restrict__ radii,
+    const int32_t* __restrict__ cum_tiles_hit,
+    const dim3 tile_bounds,
+    uint32_t* __restrict__ isect_tiles,
+    int32_t* __restrict__ gaussian_ids
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= capacity || idx >= cum_tiles_hit[num_points - 1])
+        return;
+    // the first Gaussian whose cumulative number of intersections exceeds idx
+    int lo = 0;
+    int hi = num_points - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (cum_tiles_hit[mid] > idx)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    const int local = idx - (lo == 0 ? 0 : cum_tiles_hit[lo - 1]);
+    uint2 tile_min, tile_max;
+    get_tile_bbox(xys[lo], radii[lo], tile_bounds, tile_min, tile_max);
+    const int width = tile_max.x - tile_min.x;
+    isect_tiles[idx] = (tile_min.y + local / width) * tile_bounds.x + tile_min.x + local % width;
+    gaussian_ids[idx] = lo;
+}
+
+// Tile ranges in the intersections sorted by tile ID: each entry sets the start of its tile if it is the first of the tile, and the end if
+// it is the last one; padding entries (tile ID num_tiles or above, sorted last) are skipped
+__global__ void get_tile_bin_edges_from_tiles(
+    const int num_intersects, const int num_tiles, const uint32_t* __restrict__ isect_tiles_sorted, int2* __restrict__ tile_bins
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_intersects)
+        return;
+    const uint32_t tile = isect_tiles_sorted[idx];
+    if (tile >= num_tiles)
+        return;
+    if (idx == 0 || isect_tiles_sorted[idx - 1] != tile)
+        tile_bins[tile].x = idx;
+    if (idx == num_intersects - 1 || isect_tiles_sorted[idx + 1] != tile)
+        tile_bins[tile].y = idx + 1;
 }
 
 // kernel function for rasterizing each tile
@@ -206,15 +260,23 @@ __global__ void nd_rasterize_forward_topk_norm(
     // each thread loads one gaussian at a time before rasterizing its
     // designated pixel
     int tr = block.thread_rank();
-    
+
     // **** max 12 channels for speed ***
     float pix_out[MAX_CHANNELS] = {0.f};
-    
-    // top k Gaussian ids
+
+    // top k Gaussian ids, filled in slot order, with the running minimum cached: a Gaussian enters if its alpha exceeds the
+    // minimum (always while slots are free), replacing the first slot that holds the minimum. Slots are only indexed in unrolled
+    // loops, so that the arrays stay in registers.
     int32_t topk[TOP_K];
-    float topk_vals[TOP_K] = {0.f};
-    for (int k = 0; k < TOP_K; ++k)
+    float topk_vals[TOP_K];
+#pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
         topk[k] = -1;
+        topk_vals[k] = 0.f;
+    }
+    int num_filled = 0;
+    int min_slot = 0;
+    float min_val = -1.f;
 
     for (int b = 0; b < num_batches; ++b) {
         // resync all threads before beginning next batch
@@ -253,47 +315,59 @@ __global__ void nd_rasterize_forward_topk_norm(
             }
             
             const float alpha = __expf(-sigma);
-            int32_t g = id_batch[t];
-
-            // find the minimum value in topk
-            int32_t min_topk_id = -1;
-            float min_topk_val = 1e30f;
-            for (int32_t k = 0; k < TOP_K; ++k) {
-                if (topk[k] < 0) {
-                    min_topk_id = k;
-                    min_topk_val = -1.0f;
-                    break;
-                } else if (topk_vals[k] < min_topk_val) {
-                    min_topk_id = k;
-                    min_topk_val = topk_vals[k];
+            if (!(alpha > min_val)) {
+                continue;
+            }
+            const int slot = num_filled < TOP_K ? num_filled : min_slot;
+            const int32_t g = id_batch[t];
+#pragma unroll
+            for (int k = 0; k < TOP_K; ++k) {
+                if (k == slot) {
+                    topk[k] = g;
+                    topk_vals[k] = alpha;
                 }
             }
-            if (alpha > min_topk_val) {
-                topk[min_topk_id] = g;
-                topk_vals[min_topk_id] = alpha;
+            if (num_filled < TOP_K) {
+                ++num_filled;
+            }
+            if (num_filled == TOP_K) {
+                min_slot = 0;
+                min_val = topk_vals[0];
+#pragma unroll
+                for (int k = 1; k < TOP_K; ++k) {
+                    if (topk_vals[k] < min_val) {
+                        min_slot = k;
+                        min_val = topk_vals[k];
+                    }
+                }
             }
         }
     }
 
-    for (int c = 0; c < channels; ++c) {
-        float sum_val = 0.f;
-        for (int k = 0; k < TOP_K; ++k) {
-            if (topk[k] < 0) continue;
-            sum_val += topk_vals[k];
-        }
-        for (int k = 0; k < TOP_K; ++k) {
-            int32_t g = topk[k];
-            if (g < 0) continue;
-            // normalize by sum of topk values
-            float vis = topk_vals[k] / (sum_val + EPS);
+    // normalize by the sum of the top k values; each channel accumulates over the slots in slot order
+    float sum_val = 0.f;
+#pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+        if (topk[k] < 0) continue;
+        sum_val += topk_vals[k];
+    }
+#pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+        int32_t g = topk[k];
+        if (g < 0) continue;
+        float vis = topk_vals[k] / (sum_val + EPS);
+        for (int c = 0; c < channels; ++c) {
             pix_out[c] += colors[g * channels + c] * vis;
         }
     }
 
+    // every pixel of the image is written, so the outputs need no initialization; the image is channel-planar [C, H, W]
     if (inside) {
+        const int32_t num_pixels = img_size.x * img_size.y;
         for (int c = 0; c < channels; ++c) {
-            out_img[pix_id * channels + c] = pix_out[c];
+            out_img[c * num_pixels + pix_id] = pix_out[c];
         }
+#pragma unroll
         for (int k = 0; k < TOP_K; ++k) {
             pixel_topk[pix_id * TOP_K + k] = topk[k];
         }
@@ -583,4 +657,82 @@ __device__ void scale_rot_to_cov3d(
     cov3d[3] = tmp[1][1];
     cov3d[4] = tmp[1][2];
     cov3d[5] = tmp[2][2];
+}
+
+// Increase of the loss when removing each Gaussian on its own (leave-one-out) from the top-K normalized rendering, one thread per pixel
+// with the top-K lists of the forward pass: removing Gaussian k from a pixel changes its value from S_f / (S_w + eps) to
+// (S_f - w_k f_k) / (S_w - w_k + eps), where S_w and S_f are the sums of the top-K weights w = exp(-sigma) and of the weighted colors. Adds
+// to each Gaussian the change of the pixel's error summed over the channels, absolute or squared. Ignores the Gaussian that would move into
+// the top-K list.
+__global__ void topk_norm_loo_loss_increase(
+    const dim3 img_size,
+    const unsigned channels,
+    const float2* __restrict__ xys,
+    const float3* __restrict__ conics,
+    const float* __restrict__ colors,
+    const int32_t* __restrict__ pixel_topk,
+    const float* __restrict__ targets,
+    const bool squared,
+    const float eps,
+    float* __restrict__ loss_increase
+) {
+    const int32_t num_pixels = img_size.x * img_size.y;
+    const int32_t pix_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pix_id >= num_pixels)
+        return;
+    const float px = (float)(pix_id % img_size.x);
+    const float py = (float)(pix_id / img_size.x);
+
+    int32_t ids[TOP_K];
+    float weights[TOP_K];
+    float sum_w = 0.f;
+    float sum_f[MAX_CHANNELS];
+    float target[MAX_CHANNELS];
+    #pragma unroll
+    for (int c = 0; c < MAX_CHANNELS; ++c) {
+        sum_f[c] = 0.f;
+        target[c] = c < channels ? targets[c * num_pixels + pix_id] : 0.f;
+    }
+    #pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+        const int32_t g = pixel_topk[pix_id * TOP_K + k];
+        ids[k] = g;
+        weights[k] = 0.f;
+        if (g < 0)
+            continue;
+        const float3 conic = conics[g];
+        const float2 xy = xys[g];
+        const float2 delta = {xy.x - px, xy.y - py};
+        const float sigma = 0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) + conic.y * delta.x * delta.y;
+        const float w = __expf(-sigma);
+        weights[k] = w;
+        sum_w += w;
+        #pragma unroll
+        for (int c = 0; c < MAX_CHANNELS; ++c)
+            if (c < channels) sum_f[c] += w * colors[g * channels + c];
+    }
+
+    float error = 0.f;
+    #pragma unroll
+    for (int c = 0; c < MAX_CHANNELS; ++c) {
+        if (c >= channels) continue;
+        const float diff = sum_f[c] / (sum_w + eps) - target[c];
+        error += squared ? diff * diff : fabsf(diff);
+    }
+    #pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+        const int32_t g = ids[k];
+        if (g < 0)
+            continue;
+        const float w = weights[k];
+        const float inv = 1.f / (sum_w - w + eps);
+        float loo_error = 0.f;
+        #pragma unroll
+        for (int c = 0; c < MAX_CHANNELS; ++c) {
+            if (c >= channels) continue;
+            const float diff = (sum_f[c] - w * colors[g * channels + c]) * inv - target[c];
+            loo_error += squared ? diff * diff : fabsf(diff);
+        }
+        atomicAdd(loss_increase + g, loo_error - error);
+    }
 }

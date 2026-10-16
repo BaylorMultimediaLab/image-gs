@@ -162,6 +162,30 @@ def bin_and_sort_gaussians(
     return isect_ids, gaussian_ids, isect_ids_sorted, gaussian_ids_sorted, tile_bins
 
 
+def sort_intersects_by_tile(
+    num_points: int,
+    capacity: int,
+    xys: Float[Tensor, "batch 2"],
+    radii: Float[Tensor, "batch 1"],
+    cum_tiles_hit: Float[Tensor, "batch 1"],
+    tile_bounds: Tuple[int, int, int],
+) -> Tuple[Float[Tensor, "capacity 1"], Float[Tensor, "num_tiles 2"]]:
+    """The tile lists of bin_and_sort_gaussians (Gaussians in increasing ID within each tile) from a stable radix sort of 32-bit tile IDs
+    over only the bits that they use, with the Gaussian IDs as values. Never reads the number of intersections back to the CPU, so that it
+    can be captured in a CUDA graph: the buffers hold capacity intersections, the unused entries sort last and belong to no tile, and
+    intersections beyond the capacity are dropped (the caller checks cum_tiles_hit[-1] against it).
+
+    Returns:
+        A tuple of {Tensor, Tensor}:
+
+        - **gaussian_ids_sorted** (Tensor): Gaussian IDs of the intersections sorted by tile (capacity entries).
+        - **tile_bins** (Tensor): range of gaussians hit per tile.
+    """
+    return _C.sort_intersects_by_tile(
+        num_points, capacity, xys.contiguous(), radii.contiguous(), cum_tiles_hit.contiguous(), tile_bounds
+    )
+
+
 def bin_and_sort_gaussians_capacity(
     num_points: int,
     capacity: int,
@@ -170,22 +194,6 @@ def bin_and_sort_gaussians_capacity(
     num_tiles_hit: Float[Tensor, "batch 1"],
     tile_bounds: Tuple[int, int, int],
 ) -> Tuple[Float[Tensor, "capacity 1"], Float[Tensor, "num_tiles 2"]]:
-    """Fixed-capacity variant of bin_and_sort_gaussians that never reads the number of intersections back to the CPU, so that it can be
-    captured in a CUDA graph: the buffers hold capacity intersections, the unused entries sort last and belong to no tile, and intersections
-    beyond the capacity are dropped (the caller checks num_tiles_hit.sum() against it). Sorts stably, so that the Gaussians of each tile keep
-    the order of bin_and_sort_gaussians.
-
-    Returns:
-        A tuple of {Tensor, Tensor}:
-
-        - **gaussian_ids_sorted** (Tensor): Gaussian IDs of the intersections sorted by tile (capacity entries).
-        - **tile_bins** (Tensor): range of gaussians hit per tile.
-    """
+    """sort_intersects_by_tile from the number of tiles that each Gaussian hits, for fixed-capacity buffers (CUDA graph capture)."""
     cum_tiles_hit = torch.cumsum(num_tiles_hit, dim=0, dtype=torch.int32)
-    isect_ids, gaussian_ids = _C.map_gaussian_to_intersects_capacity(
-        num_points, capacity, xys.contiguous(), radii.contiguous(), cum_tiles_hit, tile_bounds
-    )
-    isect_ids_sorted, sorted_indices = torch.sort(isect_ids, stable=True)
-    gaussian_ids_sorted = torch.gather(gaussian_ids, 0, sorted_indices)
-    tile_bins = get_tile_bin_edges(capacity, tile_bounds[0]*tile_bounds[1], isect_ids_sorted)
-    return gaussian_ids_sorted, tile_bins
+    return sort_intersects_by_tile(num_points, capacity, xys, radii, cum_tiles_hit, tile_bounds)

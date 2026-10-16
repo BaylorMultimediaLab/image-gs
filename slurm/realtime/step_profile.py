@@ -46,6 +46,7 @@ def no_range(name):
 
 def step(model, label=no_range):
     """One optimization step as in GaussianSplatting2D.optimize() in real-time mode, without the time and schedule bookkeeping."""
+    model.step = getattr(model, "step", 0) + 1  # The step counter of optimize(), which the graph captures log
     if model.cuda_graph:
         with label("graph_step"):
             model._graph_step()

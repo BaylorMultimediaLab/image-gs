@@ -6,12 +6,6 @@
 #define MAX_REGISTER_CHANNELS 3
 #define MAX_CHANNELS 12
 #define TOP_K 10
-// Intersection ID of the unused entries of fixed-capacity intersection buffers: sorts after every tile (tile IDs are below 2^31)
-#define ISECT_ID_PADDING INT64_MAX
-// Top-K backward pass: tiles with more Gaussians than this add their gradients per pixel instead of summing them per warp (backward.cu)
-#ifndef TOPK_WALK_MAX_GAUSSIANS
-#define TOPK_WALK_MAX_GAUSSIANS 256
-#endif
 #define EPS 1e-4
 #define EPS_no_tiles 1e-7
 

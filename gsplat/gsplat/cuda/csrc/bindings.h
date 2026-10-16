@@ -28,7 +28,7 @@ std::tuple<torch::Tensor, torch::Tensor> map_gaussian_to_intersects_tensor(
     const std::tuple<int, int, int> tile_bounds
 );
 
-std::tuple<torch::Tensor, torch::Tensor> map_gaussian_to_intersects_capacity_tensor(
+std::tuple<torch::Tensor, torch::Tensor> sort_intersects_by_tile_tensor(
     const int num_points,
     const int capacity,
     const torch::Tensor &xys,
@@ -101,12 +101,10 @@ std::
         const unsigned img_width,
         const unsigned BLOCK_H,
         const unsigned BLOCK_W,
-        const torch::Tensor &gaussians_ids_sorted,
-        const torch::Tensor &tile_bins,
         const torch::Tensor &xys,
         const torch::Tensor &conics,
         const torch::Tensor &colors,
-        const torch::Tensor &v_output,  // dL_dout_color
+        const torch::Tensor &v_output,  // dL_dout_color, channel-planar [C, H, W]
         const torch::Tensor &pixel_topk
     );
 
@@ -230,4 +228,16 @@ project_gaussians_2d_scale_rot_backward_tensor(
     torch::Tensor &conics,
     torch::Tensor &v_xy,
     torch::Tensor &v_conic
+);
+
+torch::Tensor topk_norm_loo_loss_increase_tensor(
+    const unsigned img_height,
+    const unsigned img_width,
+    const torch::Tensor &xys,
+    const torch::Tensor &conics,
+    const torch::Tensor &colors,
+    const torch::Tensor &pixel_topk,
+    const torch::Tensor &targets,
+    const bool squared,
+    const double eps
 );

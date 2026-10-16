@@ -1,8 +1,7 @@
-# Matches the A100 cluster toolchain (wICE: Python 3.13.1, PyTorch-bundle 2.9.1 with CUDA 12.8, SciPy-bundle 2025.06), see slurm/setup.slurm.
-# Locally, install torch and torchvision with CUDA 12.8 first:
-#   pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
 torch==2.9.1
+# torch==2.11.0
 torchvision==0.24.1
+# torchvision==0.26.0
 numpy==2.3.1
 scipy==1.16.0
 pandas==2.3.0
@@ -18,8 +17,3 @@ pyyaml==6.0.3
 rich==15.0.0
 scikit-image==0.26.0
 tqdm==4.70.1
-# CUDA extensions, built with the CUDA 12.8 toolkit for the GPU's compute capability (e.g., TORCH_CUDA_ARCH_LIST="8.6" for an RTX 2050,
-# "8.0" for an A100), without build isolation so that they compile against the installed torch:
-#   pip install ./gsplat --no-build-isolation
-#   pip install git+https://github.com/rahul-goel/fused-ssim/@732c243fc6731ac0ffa25de17a0d7219f90b61c6 --no-build-isolation
-#   (the commit of fused-ssim pull request #45: kernels on PyTorch's current stream, which cuda_graph needs)

@@ -12,20 +12,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fused_ssim import fused_ssim
+from fused_ssim import fused_l1_ssim, fused_ssim
 from lpips import LPIPS
 from pytorch_msssim import MS_SSIM
 from torchvision.transforms.functional import gaussian_blur
 
 from compress import decode_bitstream, encode_bitstream, estimate_bits
 from gsplat import (
-    bin_and_sort_gaussians,
     compute_cumulative_intersects,
     project_gaussians_2d_scale_rot,
     rasterize_gaussians_no_tiles,
     rasterize_gaussians_sum,
 )
-from gsplat.cuda import nd_rasterize_forward_topk_norm
+from gsplat.cuda import nd_rasterize_forward_topk_norm, topk_norm_loo_loss_increase
+from gsplat.utils import sort_intersects_by_tile
 from utils.color_utils import get_color_transforms, get_yuv_channel_indices, transform_images
 from utils.flip import LDRFLIPLoss
 from utils.image_utils import (
@@ -174,7 +174,9 @@ class GaussianSplatting2D(nn.Module):
     def _load_target_images(self, path, downsample_ratio=None):
         self.gt_images, self.input_channels, self.image_fnames, self.bit_depths = load_images(
             load_path=path, downsample_ratio=downsample_ratio, gamma=self.gamma)
-        self.gt_images = torch.from_numpy(self.gt_images).to(dtype=self.dtype, device=self.device)
+        # Contiguous, so that the losses read them directly (a channel-first view of the loaded [H, W, C] data costs strided kernels and
+        # copies every step)
+        self.gt_images = torch.from_numpy(self.gt_images).to(dtype=self.dtype, device=self.device).contiguous()
         self.img_h, self.img_w = self.gt_images.shape[1:]
         self.tile_bounds = ((self.img_w + self.block_w - 1) // self.block_w, (self.img_h + self.block_h - 1) // self.block_h, 1)
 
@@ -1036,6 +1038,15 @@ class GaussianSplatting2D(nn.Module):
         self.graph_capture_max = max(self.graph_capture_max, (capture_time, self.step, eager_time))
 
     def _get_total_loss(self, images):
+        if self.l1_loss_ratio > 1e-7 and self.ssim_loss_ratio > 1e-7 and self.l2_loss_ratio <= 1e-7:
+            # The default losses from one forward and one backward kernel of fused-ssim; the gradient equals that of F.l1_loss plus
+            # fused_ssim up to float rounding
+            l1, ssim = fused_l1_ssim(images.unsqueeze(0), self.target_images.unsqueeze(0), padding="same")
+            self.l1_loss = self.l1_loss_ratio * l1
+            self.ssim_loss = self.ssim_loss_ratio * (1 - ssim)
+            self.l2_loss = None
+            self.total_loss = self.l1_loss + self.ssim_loss
+            return
         self.total_loss = 0
         if self.l1_loss_ratio > 1e-7:
             self.l1_loss = self.l1_loss_ratio * F.l1_loss(images, self.target_images)
@@ -1246,17 +1257,26 @@ class GaussianSplatting2D(nn.Module):
             contribution, = torch.autograd.grad(images.sum(), ones)
         return contribution.squeeze(dim=-1)
 
+    def _get_pixel_topk(self, xy, scale, rot, feat):
+        """
+        Projected positions and conics of the Gaussians, and the top-K Gaussians of each pixel [H, W, K] as the rasterizer selects them (-1
+        for empty entries).
+        """
+        xy, radii, conics, num_tiles_hit = project_gaussians_2d_scale_rot(xy, scale, rot, self.img_h, self.img_w, self.tile_bounds)
+        num_intersects, cum_tiles_hit = compute_cumulative_intersects(num_tiles_hit)
+        gaussian_ids_sorted, tile_bins = sort_intersects_by_tile(len(xy), num_intersects, xy, radii, cum_tiles_hit, self.tile_bounds)
+        xy, conics = xy.contiguous(), conics.contiguous()
+        _, pixel_topk = nd_rasterize_forward_topk_norm(self.tile_bounds, (self.block_w, self.block_h, 1), (self.img_w, self.img_h, 1),
+                                                       gaussian_ids_sorted, tile_bins, xy, conics, feat.contiguous())
+        return xy, conics, pixel_topk
+
     def _iter_topk_weights(self, xy, scale, rot, feat, chunk_size=2**18):
         """
         Top-K Gaussians of each pixel with their blending weights before normalization, in chunks of pixels to bound memory usage at high
         resolutions: yields the first pixel of the chunk, the ids [P, K] (empty entries as 0), valid [P, K], and the weights [P, K] (0 for
         empty entries).
         """
-        xy, radii, conics, num_tiles_hit = project_gaussians_2d_scale_rot(xy, scale, rot, self.img_h, self.img_w, self.tile_bounds)
-        num_intersects, cum_tiles_hit = compute_cumulative_intersects(num_tiles_hit)
-        _, _, _, gaussian_ids_sorted, tile_bins = bin_and_sort_gaussians(len(xy), num_intersects, xy, radii, cum_tiles_hit, self.tile_bounds)
-        _, pixel_topk = nd_rasterize_forward_topk_norm(self.tile_bounds, (self.block_w, self.block_h, 1), (self.img_w, self.img_h, 1),
-                                                       gaussian_ids_sorted, tile_bins, xy.contiguous(), conics.contiguous(), feat.contiguous())
+        xy, conics, pixel_topk = self._get_pixel_topk(xy, scale, rot, feat)
         pixel_topk = pixel_topk.view(-1, self.topk).long()  # [H*W, K], -1 for empty entries
         rows, cols = torch.meshgrid(torch.arange(self.img_h, device=self.device), torch.arange(self.img_w, device=self.device), indexing="ij")
         pixels = torch.stack([cols, rows], dim=-1).reshape(-1, 1, 2).to(self.dtype)  # Pixel coordinates used by the rasterizer
@@ -1283,29 +1303,19 @@ class GaussianSplatting2D(nn.Module):
             fixed_point.index_add_(0, ids[valid], torch.round(normalized[valid].square() * 2.0**40).to(torch.int64))
         return fixed_point.to(torch.float64) / 2.0**40
 
-    def _get_loo_loss_increase(self, metric="l1", chunk_size=2**18):
+    def _get_loo_loss_increase(self, metric="l1"):
         """
-        Increase of the loss when removing each Gaussian on its own (leave-one-out), computed from a single rendering pass.
-        The loss is the L1 loss (metric "l1") or the squared error summed over pixels and averaged over channels in 8-bit units (metric "sse").
-        Removing Gaussian k from the top-K list of a pixel changes its value from S_f / (S_w + eps) to (S_f - w_k f_k) / (S_w - w_k + eps),
-        where S_w and S_f are the sums of the top-K weights and weighted features. Ignores the Gaussian that would move into the top-K list.
+        Increase of the loss when removing each Gaussian on its own (leave-one-out), computed from a single rendering pass in one kernel
+        (topk_norm_loo_loss_increase). The loss is the L1 loss (metric "l1") or the squared error summed over pixels and averaged over
+        channels in 8-bit units (metric "sse"). Removing Gaussian k from the top-K list of a pixel changes its value from S_f / (S_w + eps) to
+        (S_f - w_k f_k) / (S_w - w_k + eps), where S_w and S_f are the sums of the top-K weights and weighted features. Ignores the Gaussian
+        that would move into the top-K list.
         """
         xy, scale, rot, feat = self._get_params()
-        targets = self.target_images.permute(1, 2, 0).reshape(-1, self.feat_dim)
-        loss_increase = torch.zeros(self.num_gaussians, dtype=self.dtype, device=self.device)
-        for begin, ids, valid, weights in self._iter_topk_weights(xy, scale, rot, feat, chunk_size):
-            weighted_feat = weights.unsqueeze(-1) * feat[ids]  # [P, K, C]
-            sum_weights = weights.sum(dim=1, keepdim=True)  # [P, 1]
-            sum_feat = weighted_feat.sum(dim=1)  # [P, C]
-            target = targets[begin:begin+chunk_size]
-            loo_values = (sum_feat.unsqueeze(1) - weighted_feat) / (sum_weights - weights + self.eps).unsqueeze(-1)  # [P, K, C]
-            diff, loo_diff = sum_feat / (sum_weights + self.eps) - target, loo_values - target.unsqueeze(1)
-            if metric == "sse":
-                error, loo_error = diff.square().sum(dim=-1, keepdim=True), loo_diff.square().sum(dim=-1)  # [P, 1], [P, K]
-            else:
-                error, loo_error = diff.abs().sum(dim=-1, keepdim=True), loo_diff.abs().sum(dim=-1)
-            loss_increase.index_add_(0, ids[valid], (loo_error - error)[valid])
-        return loss_increase * (255.0**2 / self.feat_dim if metric == "sse" else 1.0 / targets.numel())
+        xy, conics, pixel_topk = self._get_pixel_topk(xy, scale, rot, feat)
+        loss_increase = topk_norm_loo_loss_increase(self.img_h, self.img_w, xy, conics, feat.contiguous(), pixel_topk,
+                                                    self.target_images.contiguous(), metric == "sse", self.eps)
+        return loss_increase * (255.0**2 / self.feat_dim if metric == "sse" else 1.0 / self.target_images.numel())
 
     def _prune_gaussians(self, prune_num, plot_gaussians=False):
         prune_num = min(prune_num, self.max_prune_num, self.num_prune-self.num_pruned)

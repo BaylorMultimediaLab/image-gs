@@ -17,9 +17,11 @@
 #   n=$(python3 slurm/realtime/sweep.py --count <arguments>)
 #   sbatch --array=0-$((n-1)) slurm/realtime/sweep.slurm <arguments>
 # Arguments: --phase <name> (results/realtime/<name>), --res, --images, --arms, --budgets, --set key=value (see slurm/realtime/sweep.py --help)
+# Submitted without --array, the job runs all tasks one after the other, e.g., a small sweep on the debug partition:
+#   sbatch --partition=gpu_a100_debug --time=00:30:00 slurm/realtime/sweep.slurm <arguments>
 # The log directory must exist before submitting: mkdir -p results/slurm-logs
 set -eo pipefail  # No -u: module (Lmod) and venv activation read unset variables
 
 source slurm/env.sh
 nvidia-smi --query-gpu=name,clocks.max.sm --format=csv,noheader
-python slurm/realtime/sweep.py --task "${SLURM_ARRAY_TASK_ID}" "$@"
+python slurm/realtime/sweep.py ${SLURM_ARRAY_TASK_ID:+--task "${SLURM_ARRAY_TASK_ID}"} "$@"
