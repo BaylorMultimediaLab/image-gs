@@ -5,6 +5,11 @@ budgets, persistent process), at 480p/720p on the UVG test frames. Arms (setting
   fixed-n-noprune    the same without pruning (no rounds, so no CUDA graph recaptures either)
   qp-lam4            QP rate control, lambda x4 pruning from an overestimate (slurm/qp/sweep.py, arm cap25x4-lam4)
   qp-lam4-mid-add25  the same, starting in the middle and adding Gaussians between the rounds (slurm/qp/sweep.py, cap25x4-lam4-mid-add25)
+  qp-lam4-mid-add25-weight, qp-lam4-mid-add25-area
+                     the same with per-Gaussian feature steps in the saved model (feat_step_adapt "weight" or "area"); not in the default arms
+  qp-lam4-mid-add25-float
+                     the same without quantization (pruning estimates the bits of a Gaussian as if quantized with the QP's steps; bytes
+                     is the float32 size): the quality that quantization costs; not in the default arms
 Pruning rounds and the learning rate decay come at fixed fractions of the budget, i.e., within a few dozen steps at the shortest budgets.
 Each task encodes one rate point (number of Gaussians or QP) of one image and arm at every budget, shortest first, in one process after a
 discarded warm-up encode of WARMUP_BUDGET seconds (long enough for all pruning rounds after the one-time costs of the first CUDA graph
@@ -47,7 +52,14 @@ ARMS = {
     "fixed-n-noprune": ({**LOWRES.FIXED, **LOWRES.ARMS["step-feat64"], "prune_ratio": 0.0}, "num_gaussians", LOWRES.NUM_GAUSSIANS),
     "qp-lam4": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4"]}, "qp", {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
     "qp-lam4-mid-add25": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"]}, "qp", {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
+    "qp-lam4-mid-add25-weight": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "feat_step_adapt": "weight", "feat_step_gamma": 0.25}, "qp",
+                                 {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
+    "qp-lam4-mid-add25-area": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "feat_step_adapt": "area", "feat_step_gamma": 0.3}, "qp",
+                               {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
+    "qp-lam4-mid-add25-float": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "quant_mode": "none", "bitstream_codec": "none"}, "qp",
+                                {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
 }
+DEFAULT_ARMS = ["fixed-n", "fixed-n-noprune", "qp-lam4", "qp-lam4-mid-add25"]
 
 
 def run_task(index, job, phase, budgets, extra):
@@ -94,7 +106,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--phase", default="time-to-hevc", help="Results go to results/realtime/<phase>")
     parser.add_argument("--res", default=",".join(LOWRES.NUM_GAUSSIANS), help="Resolutions (comma-separated)")
-    parser.add_argument("--arms", default=",".join(ARMS), help=f"Arms (comma-separated) from: {', '.join(ARMS)}")
+    parser.add_argument("--arms", default=",".join(DEFAULT_ARMS), help=f"Arms (comma-separated) from: {', '.join(ARMS)}")
     parser.add_argument("--images", default=",".join(LOWRES.IMAGES), help="Images in media/uvg/<res>/ without extension (comma-separated)")
     parser.add_argument("--rates", default="", help="Rate points replacing those of every arm (comma-separated QPs or numbers of Gaussians, "
                         "so only for arms with the same rate setting)")

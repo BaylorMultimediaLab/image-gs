@@ -57,6 +57,8 @@ QP_DENSITY = 8.0  # Gaussians per 1000 pixels at QP 32
 QP_DENSITY_DOUBLING = 5.0  # QPs over which the number of Gaussians doubles
 QP_FEAT_STEP = 1.0 / 64.0  # Feature step at QP 37
 QP_FEAT_STEP_HALVING = 15.0  # QPs over which the feature step halves
+FEAT_STEP_ADAPT_DIVISIONS = 4  # feat_step_adapt multipliers are powers of 2^(1/4) ...
+FEAT_STEP_ADAPT_OCTAVES = 2  # ... between 2^-2 and 2^2
 
 
 class GaussianSplatting2D(nn.Module):
@@ -155,8 +157,8 @@ class GaussianSplatting2D(nn.Module):
             return
         if args.qp < 0.0:
             raise ValueError(f"Quantization parameter must be positive (or 0 to disable it) but got: {args.qp}")
-        if args.quant_mode != "step":
-            raise ValueError("The quantization parameter requires quant_mode 'step' (qp 0 disables it)")
+        if args.quant_mode not in ["step", "none"]:
+            raise ValueError("The quantization parameter requires quant_mode 'step' or 'none' (qp 0 disables it)")
         if args.qp_overestimate <= 0.0 or args.qp_lambda_scale <= 0.0:
             raise ValueError(f"Overestimation and lambda factors must be positive but got: {args.qp_overestimate}, {args.qp_lambda_scale}")
         density = QP_DENSITY * 2.0**((32.0 - args.qp) / QP_DENSITY_DOUBLING)
@@ -210,7 +212,7 @@ class GaussianSplatting2D(nn.Module):
         self.y_bits = args.y_bits
         self.uv_bits = args.uv_bits
         all_steps = [args.pos_step, args.scale_step, args.rot_step, args.feat_step, args.y_step, args.uv_step]
-        if self.quant_mode == "step" and min(all_steps) <= 0.0:
+        if self.quant_mode != "minmax" and min(all_steps) <= 0.0:
             raise ValueError(f"Quantization steps must be positive but got: {', '.join(f'{step:g}' for step in all_steps)}")
         self.pos_step = args.pos_step  # Pixels
         self.scale_step = args.scale_step  # Octaves (log2 of the scale in pixels)
@@ -218,15 +220,25 @@ class GaussianSplatting2D(nn.Module):
         self.feat_step = args.feat_step
         self.y_step = args.y_step
         self.uv_step = args.uv_step
-        if self.quant_mode == "step":
+        if self.quant_mode != "minmax":
             # Per-channel steps of the position, scale, rotation, and features as GPU tensors, created once: creating them from Python numbers
-            # at every optimization step copies them to the GPU and synchronizes
+            # at every optimization step copies them to the GPU and synchronizes. Without quantization ("none"), they only estimate the bits
+            # that step quantization would give (lambda pruning)
             feat_steps = torch.empty(self.feat_dim, dtype=self.dtype, device=self.device)
             for channels, _, step in self._get_feat_groups():
                 feat_steps[channels] = step
             self.quant_steps = [self.pos_step / torch.tensor([self.img_w, self.img_h], dtype=self.dtype, device=self.device),
                                 torch.full((2,), self.scale_step, dtype=self.dtype, device=self.device),
                                 torch.full((1,), self.rot_step, dtype=self.dtype, device=self.device), feat_steps]
+        self.feat_step_adapt = args.feat_step_adapt
+        if self.feat_step_adapt not in ["none", "area", "weight"]:
+            raise ValueError(f"Unsupported feature step adaptation '{self.feat_step_adapt}', valid values include 'none', 'area', and 'weight'")
+        if self.feat_step_adapt != "none" and self.quant_mode != "step":
+            raise ValueError("feat_step_adapt requires quant_mode 'step'")
+        self.feat_step_gamma = float(np.float32(args.feat_step_gamma))  # The value that the bitstream stores
+        # The per-Gaussian feature steps apply to the saved model and in evaluation; optimization uses the uniform steps
+        self.feat_step_adapt_active = self.feat_step_adapt != "none" and self.evaluate
+        self.feat_step_multiplier_cache = None
         self.wrap_rot = args.wrap_rot
         self.bitstream_codec = args.bitstream_codec
         if self.bitstream_codec not in ["none", "lzma", "rans"]:
@@ -267,22 +279,29 @@ class GaussianSplatting2D(nn.Module):
     def _canonicalize(self, scale, rot):
         """
         Equivalent Gaussian parameters to quantize: ellipses are symmetric under rotation by pi,
-        and rendering only depends on squared scales (scales are quantized in the log domain in "step" mode).
+        and rendering only depends on squared scales (scales are quantized in the log domain in "step" mode, and in the rate estimate of "none").
         """
         if self.wrap_rot:
             rot = torch.remainder(rot, math.pi)
-        if self.quant_mode == "step":
+        if self.quant_mode != "minmax":
             scale = scale.abs()
         return scale, rot
 
     def _get_symbols(self, xy, scale, rot, feat):
         """
         Quantization indices [P, C] of the canonicalized Gaussian parameters (scale in pixels), with the per-channel steps and origins [C]
-        that dequantize them. Scales are quantized in pixels in "minmax" mode and in log2 pixels in "step" mode.
+        that dequantize them. Scales are quantized in pixels in "minmax" mode and in log2 pixels in "step" mode. Without quantization ("none"),
+        the "step" indices estimate the rate. With per-Gaussian feature steps (feat_step_adapt), the feature steps are the base steps, which
+        _get_feat_step_multipliers scales per Gaussian.
         """
         with torch.no_grad():
-            if self.quant_mode == "step":
-                return [quantize_step(x, steps) for x, steps in zip([xy, torch.log2(scale), rot, feat], self.quant_steps)]
+            if self.quant_mode != "minmax":
+                if not self.feat_step_adapt_active:
+                    return [quantize_step(x, steps) for x, steps in zip([xy, torch.log2(scale), rot, feat], self.quant_steps)]
+                symbols = [quantize_step(x, steps) for x, steps in zip([xy, torch.log2(scale), rot], self.quant_steps[:3])]
+                steps = self.quant_steps[3]
+                q_feat = torch.round(feat / (steps * self._get_feat_step_multipliers(symbols)[:, None]))
+                return symbols + [(q_feat, steps, torch.zeros_like(steps))]
             symbols = [quantize_minmax(xy, self.pos_bits), quantize_minmax(scale, self.scale_bits), quantize_minmax(rot, self.rot_bits)]
             q_feat, feat_steps, feat_origins = torch.empty_like(feat), feat.new_empty(self.feat_dim), feat.new_empty(self.feat_dim)
             for channels, bits, _ in self._get_feat_groups():
@@ -294,9 +313,38 @@ class GaussianSplatting2D(nn.Module):
         Gaussian parameters (scale in pixels) from their quantization indices.
         """
         xy, scale, rot, feat = [dequantize(*symbol) for symbol in symbols]
-        if self.quant_mode == "step":
+        if self.quant_mode != "minmax":
+            if self.feat_step_adapt_active:
+                q_feat, steps, origins = symbols[3]
+                feat = dequantize(q_feat, steps * self._get_feat_step_multipliers(symbols[:3])[:, None], origins)
             scale = torch.exp2(scale)
         return xy, scale, rot, feat
+
+    def _get_feat_step_multipliers(self, geometry_symbols):
+        """
+        Per-Gaussian multipliers [P] of the feature steps (feat_step_adapt): (proxy / its geometric mean)^(-feat_step_gamma), snapped to
+        powers of 2^(1/FEAT_STEP_ADAPT_DIVISIONS) within 2^(+-FEAT_STEP_ADAPT_OCTAVES). The proxy is the Gaussian's area ("area") or the sum
+        of its squared normalized top-K weights over the pixels ("weight"), the sensitivity of the rendered image to its features. Both only
+        depend on the quantization indices of the geometry [position, scale, rotation], and neither depends on the order of the Gaussians,
+        so a decoder computes the same multipliers. The multipliers of the last geometry are cached.
+        """
+        indices = [q for q, _, _ in geometry_symbols]
+        cache = self.feat_step_multiplier_cache
+        if cache is not None and all(a.shape == b.shape and torch.equal(a, b) for a, b in zip(cache[0], indices)):
+            return cache[1]
+        if self.feat_step_adapt == "area":
+            # log2 of the area is the scale step times the sum of the two log2-scale indices, whose mean is exact
+            sums = indices[1].sum(dim=1).to(torch.float64)
+            log_proxy = (sums - sums.sum() / len(sums)) * geometry_symbols[1][1][0].to(torch.float64)
+        else:
+            xy, log_scale, rot = [dequantize(*symbol) for symbol in geometry_symbols]
+            log_proxy = torch.log2(self._get_feature_weights(xy, torch.exp2(log_scale), rot).clamp(min=2.0**-40))
+            log_proxy = log_proxy - log_proxy.mean()
+        limit = FEAT_STEP_ADAPT_DIVISIONS * FEAT_STEP_ADAPT_OCTAVES
+        divisions = torch.round(-FEAT_STEP_ADAPT_DIVISIONS * self.feat_step_gamma * log_proxy).clamp(-limit, limit)
+        multipliers = torch.exp2(divisions / FEAT_STEP_ADAPT_DIVISIONS).to(self.dtype)
+        self.feat_step_multiplier_cache = (indices, multipliers)
+        return multipliers
 
     def _init_gaussians(self, args):
         self.num_gaussians = args.num_gaussians
@@ -362,8 +410,6 @@ class GaussianSplatting2D(nn.Module):
                 raise ValueError(f"Maximum pruning ratio per round must be in (0, 1) but got: {args.prune_max_ratio}")
             if args.prune_score != "loo":
                 raise ValueError("Pruning mode 'lambda' requires prune_score 'loo'")
-            if self.quant_mode == "none":
-                raise ValueError("Pruning mode 'lambda' requires quantization to estimate the bits per Gaussian")
             if args.prune_add_ratio < 0.0:
                 raise ValueError(f"Ratio of added Gaussians per round must be non-negative but got: {args.prune_add_ratio}")
             self.prune_lambda = args.prune_lambda
@@ -433,7 +479,8 @@ class GaussianSplatting2D(nn.Module):
         bpp_compressed = float(bits_compressed) / self.num_pixels
         bppc_compressed = bpp_compressed / self.feat_dim
         self.num_bytes = bytes_compressed
-        self.worklog.info(f"Compressed: {bytes_compressed/1e3:.2f} KB | {bpp_compressed:.3f} bpp | {bppc_compressed:.3f} bppc")
+        label = "Gaussians (float32, not quantized)" if self.quant_mode == "none" else "Compressed"
+        self.worklog.info(f"{label}: {bytes_compressed/1e3:.2f} KB | {bpp_compressed:.3f} bpp | {bppc_compressed:.3f} bppc")
         self.worklog.info(f"Compression rate: {self.bpp_uncompressed/bpp_compressed:.2f}x | {100.0*bpp_compressed/self.bpp_uncompressed:.2f}%")
         self.worklog.info("***********************************************")
 
@@ -584,9 +631,10 @@ class GaussianSplatting2D(nn.Module):
 
     def _save_model(self, final=False):
         if self.quant_mode != "none":
+            self.feat_step_adapt_active = self.feat_step_adapt != "none"
             self._quantize()
-            if self.quant_mode == "step" and not self.realtime:
-                self._log_compressed_size(self._get_fixed_length_bits())
+        if self.quant_mode != "step" or not self.realtime:  # Fixed-length size of the Gaussians (float32 without quantization)
+            self._log_compressed_size(self._get_fixed_length_bits())
         psnr, ssim = self._evaluate(log=False, upsample=False)
         if self.realtime:
             self.lpips_final, self.flip_final, self.msssim_final = float("nan"), float("nan"), float("nan")
@@ -611,6 +659,8 @@ class GaussianSplatting2D(nn.Module):
         self.worklog.info(
             f"PSNR: {psnr:.2f} | SSIM: {ssim:.4f} | LPIPS: {self.lpips_final:.4f} | FLIP: {self.flip_final:.4f} | MS-SSIM: {self.msssim_final:.4f}")
         self.worklog.info("***********************************************")
+        if not final:  # Optimization continues with the uniform feature steps
+            self.feat_step_adapt_active = False
 
     def _quantize(self):
         """
@@ -642,6 +692,8 @@ class GaussianSplatting2D(nn.Module):
             attributes = [(q.cpu().numpy().astype(np.int64), steps.cpu().numpy().astype(np.float64), origins.cpu().numpy().astype(np.float64))
                           for q, steps, origins in symbols]
             meta = struct.pack("<IIBB", self.img_h, self.img_w, ["minmax", "step"].index(self.quant_mode), ["rgb", "yuv"].index(self.color_space))
+            if self.feat_step_adapt != "none":  # A decoder computes the per-Gaussian feature steps from the decoded geometry
+                meta += struct.pack("<Bf", ["area", "weight"].index(self.feat_step_adapt) + 1, self.feat_step_gamma)
             data, order, attribute_bytes = encode_bitstream(attributes, meta, codec=self.bitstream_codec, channel_refs=self._get_channel_refs())
             with open(path, "wb") as file:
                 file.write(data)
@@ -1194,6 +1246,43 @@ class GaussianSplatting2D(nn.Module):
             contribution, = torch.autograd.grad(images.sum(), ones)
         return contribution.squeeze(dim=-1)
 
+    def _iter_topk_weights(self, xy, scale, rot, feat, chunk_size=2**18):
+        """
+        Top-K Gaussians of each pixel with their blending weights before normalization, in chunks of pixels to bound memory usage at high
+        resolutions: yields the first pixel of the chunk, the ids [P, K] (empty entries as 0), valid [P, K], and the weights [P, K] (0 for
+        empty entries).
+        """
+        xy, radii, conics, num_tiles_hit = project_gaussians_2d_scale_rot(xy, scale, rot, self.img_h, self.img_w, self.tile_bounds)
+        num_intersects, cum_tiles_hit = compute_cumulative_intersects(num_tiles_hit)
+        _, _, _, gaussian_ids_sorted, tile_bins = bin_and_sort_gaussians(len(xy), num_intersects, xy, radii, cum_tiles_hit, self.tile_bounds)
+        _, pixel_topk = nd_rasterize_forward_topk_norm(self.tile_bounds, (self.block_w, self.block_h, 1), (self.img_w, self.img_h, 1),
+                                                       gaussian_ids_sorted, tile_bins, xy.contiguous(), conics.contiguous(), feat.contiguous())
+        pixel_topk = pixel_topk.view(-1, self.topk).long()  # [H*W, K], -1 for empty entries
+        rows, cols = torch.meshgrid(torch.arange(self.img_h, device=self.device), torch.arange(self.img_w, device=self.device), indexing="ij")
+        pixels = torch.stack([cols, rows], dim=-1).reshape(-1, 1, 2).to(self.dtype)  # Pixel coordinates used by the rasterizer
+        for begin in range(0, len(pixel_topk), chunk_size):
+            ids = pixel_topk[begin:begin+chunk_size]
+            valid = ids >= 0
+            ids = ids.clamp(min=0)
+            delta = xy[ids] - pixels[begin:begin+chunk_size]  # [P, K, 2]
+            conic = conics[ids]  # [P, K, 3]
+            sigma = 0.5 * (conic[..., 0] * delta[..., 0]**2 + conic[..., 2] * delta[..., 1]**2) + conic[..., 1] * delta[..., 0] * delta[..., 1]
+            yield begin, ids, valid, torch.exp(-sigma) * valid
+
+    def _get_feature_weights(self, xy, scale, rot):
+        """
+        Sum over the pixels of each Gaussian's squared normalized top-K weight [P] (float64): the sensitivity of the rendered image to its
+        features. The weights are normalized in float64 and summed in fixed point with integer atomics, so the sums do not depend on the
+        order of the Gaussians or of the additions.
+        """
+        fixed_point = torch.zeros(len(xy), dtype=torch.int64, device=self.device)
+        no_feat = torch.zeros(len(xy), 1, dtype=self.dtype, device=self.device)  # The top-K lists do not depend on the features
+        for _, ids, valid, weights in self._iter_topk_weights(xy, scale, rot, no_feat):
+            weights = weights.to(torch.float64)
+            normalized = weights / (weights.sum(dim=1, keepdim=True) + self.eps)
+            fixed_point.index_add_(0, ids[valid], torch.round(normalized[valid].square() * 2.0**40).to(torch.int64))
+        return fixed_point.to(torch.float64) / 2.0**40
+
     def _get_loo_loss_increase(self, metric="l1", chunk_size=2**18):
         """
         Increase of the loss when removing each Gaussian on its own (leave-one-out), computed from a single rendering pass.
@@ -1202,26 +1291,9 @@ class GaussianSplatting2D(nn.Module):
         where S_w and S_f are the sums of the top-K weights and weighted features. Ignores the Gaussian that would move into the top-K list.
         """
         xy, scale, rot, feat = self._get_params()
-        xy, radii, conics, num_tiles_hit = project_gaussians_2d_scale_rot(xy, scale, rot, self.img_h, self.img_w, self.tile_bounds)
-        num_intersects, cum_tiles_hit = compute_cumulative_intersects(num_tiles_hit)
-        _, _, _, gaussian_ids_sorted, tile_bins = bin_and_sort_gaussians(
-            self.num_gaussians, num_intersects, xy, radii, cum_tiles_hit, self.tile_bounds)
-        _, pixel_topk = nd_rasterize_forward_topk_norm(self.tile_bounds, (self.block_w, self.block_h, 1), (self.img_w, self.img_h, 1),
-                                                       gaussian_ids_sorted, tile_bins, xy.contiguous(), conics.contiguous(), feat.contiguous())
-        pixel_topk = pixel_topk.view(-1, self.topk).long()  # [H*W, K], -1 for empty entries
-        rows, cols = torch.meshgrid(torch.arange(self.img_h, device=self.device), torch.arange(self.img_w, device=self.device), indexing="ij")
-        pixels = torch.stack([cols, rows], dim=-1).reshape(-1, 1, 2).to(self.dtype)  # Pixel coordinates used by the rasterizer
         targets = self.target_images.permute(1, 2, 0).reshape(-1, self.feat_dim)
         loss_increase = torch.zeros(self.num_gaussians, dtype=self.dtype, device=self.device)
-        # Process pixels in chunks to bound memory usage at high resolutions
-        for begin in range(0, len(pixel_topk), chunk_size):
-            ids = pixel_topk[begin:begin+chunk_size]
-            valid = ids >= 0
-            ids = ids.clamp(min=0)
-            delta = xy[ids] - pixels[begin:begin+chunk_size]  # [P, K, 2]
-            conic = conics[ids]  # [P, K, 3]
-            sigma = 0.5 * (conic[..., 0] * delta[..., 0]**2 + conic[..., 2] * delta[..., 1]**2) + conic[..., 1] * delta[..., 0] * delta[..., 1]
-            weights = torch.exp(-sigma) * valid  # [P, K]
+        for begin, ids, valid, weights in self._iter_topk_weights(xy, scale, rot, feat, chunk_size):
             weighted_feat = weights.unsqueeze(-1) * feat[ids]  # [P, K, C]
             sum_weights = weights.sum(dim=1, keepdim=True)  # [P, 1]
             sum_feat = weighted_feat.sum(dim=1)  # [P, C]

@@ -8,7 +8,7 @@ eval:                  False # Render the optimized Image-GS representation
 render_height:         480 # Image height for rendering (aspect ratio is maintained)
 
 # Bit precision
-quant_mode:            "step" # Quantization of Gaussian parameters, valid values include "none" (float32), "minmax" (2^bits levels over the range of each attribute, set by the *_bits values), and "step" (fixed steps anchored at zero, set by the *_step values)
+quant_mode:            "step" # Quantization of Gaussian parameters, valid values include "none" (float32; the *_step values still estimate the bits for lambda pruning and qp), "minmax" (2^bits levels over the range of each attribute, set by the *_bits values), and "step" (fixed steps anchored at zero, set by the *_step values)
 # quant_mode: "minmax" configuration:
 pos_bits:              16 # Bit precision of individual coordinate dimension
 scale_bits:            16 # Bit precision of individual scale dimension
@@ -23,6 +23,8 @@ rot_step:              0.703125 # Rotation step in degrees
 feat_step:             0.015625 # Step of individual feature dimensions
 y_step:                0.015625 # Step of the Y feature dimension
 uv_step:               0.015625 # Step of individual U and V feature dimensions
+feat_step_adapt:       "none" # Per-Gaussian feature steps of the saved model (optimization uses the uniform steps), valid values include "none", "area" (by Gaussian area), and "weight" (by the sum of the Gaussian's squared normalized blending weights over the pixels); computed from the quantized geometry, so decoders repeat them
+feat_step_gamma:       0.25 # feat_step_adapt multiplies the feature steps by (proxy / its geometric mean)^(-feat_step_gamma), snapped to powers of 2^(1/4) between 1/4 and 4
 
 wrap_rot:              False # Wrap Gaussian orientations to [0, pi) before quantization
 bitstream_codec:       "rans" # Write a compressed bitstream of the quantized Gaussians after optimization (or with eval) and verify that it decodes losslessly, valid values include "none", "lzma", and "rans"

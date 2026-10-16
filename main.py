@@ -43,8 +43,13 @@ def get_gaussian_cfg(args):
         gaussian_cfg += f"_bits-{args.pos_bits:d}-{args.scale_bits:d}-{args.rot_bits:d}-{args.feat_bits:d}"
         if args.color_space == "yuv":
             gaussian_cfg += f"_yuv-{args.y_bits:d}-{args.uv_bits:d}"
+    if args.quant_mode == "none" and (args.qp > 0.0 or args.prune_mode == "lambda"):  # The steps estimate the bits for lambda pruning
+        feat_step = "qp" if args.qp > 0.0 else f"{args.feat_step:g}"
+        gaussian_cfg += f"_rate-steps-{args.pos_step:g}-{args.scale_step:g}-{args.rot_step:g}-{feat_step}"
     if args.quant_mode != "none" and args.wrap_rot:
         gaussian_cfg += "_wrap-rot"
+    if args.quant_mode == "step" and args.feat_step_adapt != "none":
+        gaussian_cfg += f"_feat-adapt-{args.feat_step_adapt}-{args.feat_step_gamma:g}"
     if not args.disable_topk_norm:
         gaussian_cfg += f"_top-{args.topk:d}"
     gaussian_cfg += f"_{args.init_mode[0]}-{args.init_random_ratio:.1f}"
