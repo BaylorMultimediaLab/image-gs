@@ -6,7 +6,8 @@ budgets, persistent process), at 480p/720p on the UVG test frames. Arms (setting
   qp-lam4            QP rate control, lambda x4 pruning from an overestimate (slurm/qp/sweep.py, arm cap25x4-lam4)
   qp-lam4-mid-add25  the same, starting in the middle and adding Gaussians between the rounds (slurm/qp/sweep.py, cap25x4-lam4-mid-add25)
   qp-lam4-mid-add25-weight, qp-lam4-mid-add25-area
-                     the same with per-Gaussian feature steps in the saved model (feat_step_adapt "weight" or "area"); not in the default arms
+                     the same with per-Gaussian feature steps in the saved model (feat_step_adapt "weight", the default configuration, or
+                     "area"; the other arms keep the uniform step of the earlier sweeps); not in the default arms
   qp-lam4-mid-add25-float
                      the same without quantization (pruning estimates the bits of a Gaussian as if quantized with the QP's steps; bytes
                      is the float32 size): the quality that quantization costs; not in the default arms

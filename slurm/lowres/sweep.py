@@ -21,7 +21,7 @@ NUM_GAUSSIANS = {"480p": [500, 1000, 2000, 4000], "720p": [1125, 2250, 4500, 900
 # max_steps only caps runaway runs.
 FIXED = {"seed": 123, "max_steps": 1000000, "disable_prog_optim": True, "qp": 0.0, "prune_ratio": 0.1, "prune_times": 1, "prune_score": "loo",
          "prune_time_ratio": 0.1667, "decay_time_ratio": 0.8333, "color_space": "rgb", "init_scale": 2.25, "bitstream_codec": "rans",
-         "color_transform": "subtract-green", "save_image_format": "png"}
+         "color_transform": "subtract-green", "save_image_format": "png", "feat_step_adapt": "none"}
 STEP = {"quant_mode": "step", "pos_step": 0.125, "scale_step": 0.03125, "rot_step": 0.703125, "feat_step": 0.03125}
 ARMS = {
     "minmax-16-8-8-10": {"quant_mode": "minmax", "pos_bits": 16, "scale_bits": 8, "rot_bits": 8, "feat_bits": 10},

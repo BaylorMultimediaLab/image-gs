@@ -232,11 +232,9 @@ class GaussianSplatting2D(nn.Module):
             self.quant_steps = [self.pos_step / torch.tensor([self.img_w, self.img_h], dtype=self.dtype, device=self.device),
                                 torch.full((2,), self.scale_step, dtype=self.dtype, device=self.device),
                                 torch.full((1,), self.rot_step, dtype=self.dtype, device=self.device), feat_steps]
-        self.feat_step_adapt = args.feat_step_adapt
-        if self.feat_step_adapt not in ["none", "area", "weight"]:
-            raise ValueError(f"Unsupported feature step adaptation '{self.feat_step_adapt}', valid values include 'none', 'area', and 'weight'")
-        if self.feat_step_adapt != "none" and self.quant_mode != "step":
-            raise ValueError("feat_step_adapt requires quant_mode 'step'")
+        if args.feat_step_adapt not in ["none", "area", "weight"]:
+            raise ValueError(f"Unsupported feature step adaptation '{args.feat_step_adapt}', valid values include 'none', 'area', and 'weight'")
+        self.feat_step_adapt = args.feat_step_adapt if self.quant_mode == "step" else "none"  # Only the step mode has feature steps
         self.feat_step_gamma = float(np.float32(args.feat_step_gamma))  # The value that the bitstream stores
         # The per-Gaussian feature steps apply to the saved model and in evaluation; optimization uses the uniform steps
         self.feat_step_adapt_active = self.feat_step_adapt != "none" and self.evaluate
