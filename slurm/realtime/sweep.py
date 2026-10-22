@@ -6,8 +6,11 @@ budgets, persistent process), at 480p/720p on the UVG test frames. Arms (setting
   qp-lam4            QP rate control, lambda x4 pruning from an overestimate (slurm/qp/sweep.py, arm cap25x4-lam4)
   qp-lam4-mid-add25  the same, starting in the middle and adding Gaussians between the rounds (slurm/qp/sweep.py, cap25x4-lam4-mid-add25)
   qp-lam4-mid-add25-weight, qp-lam4-mid-add25-area
-                     the same with per-Gaussian feature steps in the saved model (feat_step_adapt "weight", the default configuration, or
-                     "area"; the other arms keep the uniform step of the earlier sweeps); not in the default arms
+                     the same with per-Gaussian feature steps in the saved model (feat_step_adapt "weight" or "area"; the other arms keep
+                     the uniform step of the earlier sweeps); not in the default arms
+  qp-lam4-mid-add25-weight-map
+                     the weight arm with the settings derived at the mapped QP 6.47 + 0.767 * QP, so that the PSNR matches x265's at the
+                     same QP (the default configuration; the other QP arms derive them at the QP itself); not in the default arms
   qp-lam4-mid-add25-float
                      the same without quantization (pruning estimates the bits of a Gaussian as if quantized with the QP's steps; bytes
                      is the float32 size): the quality that quantization costs; not in the default arms
@@ -24,6 +27,8 @@ Locally:  slurm/realtime/sweep.py --phase <name> [--res ...] [--images ...] [--a
 Slurm:    slurm/realtime/sweep.py --task <i> [...]   runs only task i (one per array task, see slurm/realtime/sweep.slurm)
 Count:    slurm/realtime/sweep.py --count [...]      prints the number of tasks (the array size)
 Analysis: .venv/bin/python experiments/realtime/analyze.py <phase> [<phase> ...]
+          experiments/realtime/qp_refit.py <phase> (QP remap to x265's quality, from a dense grid of --rates)
+          experiments/realtime/stalls.py <phase> (stalls traced with --set stall_trace=<seconds>)
 """
 import argparse
 import csv
@@ -45,7 +50,7 @@ def load_module(name, path):
 
 LOWRES = load_module("lowres_sweep", "slurm/lowres/sweep.py")
 QP = load_module("qp_sweep", "slurm/qp/sweep.py")
-BUDGETS = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
+BUDGETS = [0.5, 1.0, 2.0, 4.0]
 WARMUP_BUDGET = 2.0
 # Settings, the option that sets the rate, and its values per resolution
 ARMS = {
@@ -55,6 +60,8 @@ ARMS = {
     "qp-lam4-mid-add25": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"]}, "qp", {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
     "qp-lam4-mid-add25-weight": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "feat_step_adapt": "weight", "feat_step_gamma": 0.25}, "qp",
                                  {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
+    "qp-lam4-mid-add25-weight-map": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "feat_step_adapt": "weight", "feat_step_gamma": 0.25,
+                                     "qp_offset": 6.47, "qp_slope": 0.767}, "qp", {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
     "qp-lam4-mid-add25-area": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "feat_step_adapt": "area", "feat_step_gamma": 0.3}, "qp",
                                {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
     "qp-lam4-mid-add25-float": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "quant_mode": "none", "bitstream_codec": "none"}, "qp",

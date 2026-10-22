@@ -2,13 +2,14 @@ import argparse
 
 import torch
 
-from model import GaussianSplatting2D
+from model import GaussianSplatting2D, get_mapped_qp
 from utils.misc_utils import load_cfg
 
 
 def get_gaussian_cfg(args):
-    if args.qp > 0.0:  # The number of Gaussians, the feature step, and lambda are derived from the QP
-        gaussian_cfg = f"qp-{args.qp:g}-over-{args.qp_overestimate:g}_prune-x{args.prune_times:d}-max-{args.prune_max_ratio:g}"
+    if args.qp > 0.0:  # The number of Gaussians, the feature step, and lambda are derived from the (mapped) QP
+        gaussian_cfg = (f"qp-{args.qp:g}-at-{get_mapped_qp(args):.4g}-over-{args.qp_overestimate:g}_prune-x{args.prune_times:d}-"
+                        f"max-{args.prune_max_ratio:g}")
         if args.qp_lambda_scale != 1.0:
             gaussian_cfg += f"-lambda-x{args.qp_lambda_scale:g}"
         if args.prune_add_ratio > 0.0:
@@ -27,6 +28,12 @@ def get_gaussian_cfg(args):
         gaussian_cfg += f"_scale-{args.init_scale:.1f}"
     else:
         gaussian_cfg += f"_inv-scale-{args.init_scale:.1f}"
+    if args.init_scale_knn > 0.0:
+        gaussian_cfg += f"-knn-{args.init_scale_knn:g}"
+    if args.init_aspect > 1.0:
+        gaussian_cfg += f"_aspect-{args.init_aspect:g}"
+    if args.add_color_init != "residual":
+        gaussian_cfg += f"_add-{args.add_color_init}"
     if args.max_scale > 0.0:
         gaussian_cfg += f"_max-scale-{args.max_scale:g}"
     if args.quant_mode == "none":

@@ -18,11 +18,11 @@ from sweep_utils import IMAGES, REPO, TIME_BUDGET, run_main  # noqa: E402
 
 QPS = [27, 32, 37, 42]
 # Pruning rounds at 1/6, 2/6, ... of the budget (prune_time_ratio) and a single LR decay at 5/6, as in the lowres sweep. The geometry steps
-# are pinned; the feature step comes from the QP.
+# are pinned; the feature step comes from the QP, which is not mapped (qp_offset 0, qp_slope 1).
 FIXED = {"seed": 123, "max_steps": 1000000, "disable_prog_optim": True, "prune_score": "loo", "prune_time_ratio": 0.1667,
          "decay_time_ratio": 0.8333, "color_space": "rgb", "init_scale": 2.25, "bitstream_codec": "rans", "color_transform": "subtract-green",
          "save_image_format": "png", "quant_mode": "step", "pos_step": 0.125, "scale_step": 0.03125, "rot_step": 0.703125,
-         "qp_overestimate": 1.25, "qp_lambda_scale": 1.0, "prune_add_ratio": 0.0, "feat_step_adapt": "none"}
+         "qp_overestimate": 1.25, "qp_lambda_scale": 1.0, "prune_add_ratio": 0.0, "feat_step_adapt": "none", "qp_offset": 0.0, "qp_slope": 1.0}
 ARMS = {
     "cap10x4": {"prune_max_ratio": 0.1, "prune_times": 4},
     "cap25x4": {"prune_max_ratio": 0.25, "prune_times": 4},

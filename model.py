@@ -30,6 +30,7 @@ from utils.color_utils import get_color_transforms, get_yuv_channel_indices, tra
 from utils.flip import LDRFLIPLoss
 from utils.image_utils import (
     compute_image_gradients,
+    compute_structure_tensor,
     get_grid,
     get_psnr,
     load_images,
@@ -52,7 +53,9 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="lpips")
 # Settings derived from the quantization parameter (qp), fitted on the 480p/720p UVG equal-time runs (A100, 40/90 s; experiments/qp/fit.py):
 # x265's RD slope in the units of prune_lambda is 0.9-1.1x HEVC's lambda at QP 22-37. The number of Gaussians that paid off doubles every
 # ~5 QP (4.7-5.6 per image) and varies 2.5x between images; QP_DENSITY is the most for any image. Refining the feature step paid off
-# from QP ~44 (1/32 -> 1/64) and below QP ~29 (1/64 -> 1/128), i.e., the optimal step halves every ~15 QP.
+# from QP ~44 (1/32 -> 1/64) and below QP ~29 (1/64 -> 1/128), i.e., the optimal step halves every ~15 QP. The settings are derived at the
+# mapped QP qp_offset + qp_slope * qp; the default mapping matches the PSNR of x265 all-intra 4:2:0 (results/lowres/hevc.csv) at the same QP,
+# fitted on the real-time runs at QPs 16-40 with 2-4 s A100 budgets (phase qp-refit, experiments/realtime/qp_refit.py).
 QP_DENSITY = 8.0  # Gaussians per 1000 pixels at QP 32
 QP_DENSITY_DOUBLING = 5.0  # QPs over which the number of Gaussians doubles
 QP_FEAT_STEP = 1.0 / 64.0  # Feature step at QP 37
@@ -61,8 +64,16 @@ FEAT_STEP_ADAPT_DIVISIONS = 4  # feat_step_adapt multipliers are powers of 2^(1/
 FEAT_STEP_ADAPT_OCTAVES = 2  # ... between 2^-2 and 2^2
 
 
+def get_mapped_qp(args):
+    """
+    The QP at which the rate settings are derived from the quantization parameter qp.
+    """
+    return args.qp_offset + args.qp_slope * args.qp
+
+
 class GaussianSplatting2D(nn.Module):
     isect_capacity_ratio = 2.0  # Tile intersection buffers of CUDA graphs, relative to the number at capture time
+    structure_tensor_sigma = 2.0  # Smoothing of the structure tensor for init_aspect, in pixels
 
     def __init__(self, args):
         super(GaussianSplatting2D, self).__init__()
@@ -150,8 +161,9 @@ class GaussianSplatting2D(nn.Module):
 
     def _init_qp(self, args):
         """
-        Rate settings from the quantization parameter: lambda pruning with HEVC's lambda at this QP, starting from a content-agnostic
-        overestimate of the number of Gaussians, and a feature step that halves every QP_FEAT_STEP_HALVING QPs. The other steps are unchanged.
+        Rate settings from the quantization parameter, derived at the mapped QP qp_offset + qp_slope * qp: lambda pruning with HEVC's lambda
+        at the mapped QP, starting from a content-agnostic overestimate of the number of Gaussians, and a feature step that halves every
+        QP_FEAT_STEP_HALVING QPs. The other steps are unchanged.
         """
         if args.qp == 0.0:
             return
@@ -161,13 +173,17 @@ class GaussianSplatting2D(nn.Module):
             raise ValueError("The quantization parameter requires quant_mode 'step' or 'none' (qp 0 disables it)")
         if args.qp_overestimate <= 0.0 or args.qp_lambda_scale <= 0.0:
             raise ValueError(f"Overestimation and lambda factors must be positive but got: {args.qp_overestimate}, {args.qp_lambda_scale}")
-        density = QP_DENSITY * 2.0**((32.0 - args.qp) / QP_DENSITY_DOUBLING)
+        if args.qp_slope <= 0.0:
+            raise ValueError(f"QP slope must be positive but got: {args.qp_slope}")
+        qp = get_mapped_qp(args)
+        density = QP_DENSITY * 2.0**((32.0 - qp) / QP_DENSITY_DOUBLING)
         args.num_gaussians = max(1, round(args.qp_overestimate * density * self.img_h * self.img_w / 1000.0))
-        args.feat_step = args.y_step = args.uv_step = QP_FEAT_STEP * 2.0**((args.qp - 37.0) / QP_FEAT_STEP_HALVING)
+        args.feat_step = args.y_step = args.uv_step = QP_FEAT_STEP * 2.0**((qp - 37.0) / QP_FEAT_STEP_HALVING)
         args.prune_mode = "lambda"
-        args.prune_lambda = args.qp_lambda_scale * 0.57 * 2.0**((args.qp - 12.0) / 3.0)
-        self.worklog.info(f"QP {args.qp:g}: {args.num_gaussians:d} Gaussians before pruning ({args.qp_overestimate:g} x {density:.2f} per 1000 pixels), "
-                          f"feature step 1/{1.0/args.feat_step:.1f}, lambda {args.prune_lambda:.2f} ({args.qp_lambda_scale:g} x HEVC's)")
+        args.prune_lambda = args.qp_lambda_scale * 0.57 * 2.0**((qp - 12.0) / 3.0)
+        self.worklog.info(f"QP {args.qp:g} (settings of QP {qp:.2f}): {args.num_gaussians:d} Gaussians before pruning ({args.qp_overestimate:g} x "
+                          f"{density:.2f} per 1000 pixels), feature step 1/{1.0/args.feat_step:.1f}, lambda {args.prune_lambda:.2f} "
+                          f"({args.qp_lambda_scale:g} x HEVC's)")
         if not self.evaluate:
             save_cfg(path=f"{self.log_dir}/cfg_train.yaml", args=args)  # Record the derived settings
 
@@ -364,6 +380,14 @@ class GaussianSplatting2D(nn.Module):
         self.topk = args.topk  # Warning: Must match hardcoded value in CUDA kernel, modify with caution
         self.eps = 1e-7 if args.disable_tiles else 1e-4  # Warning: Must match hardcoded value in CUDA kernel, modify with caution
         self.init_scale = args.init_scale
+        self.init_scale_knn = args.init_scale_knn
+        self.init_aspect = args.init_aspect
+        if self.init_scale_knn < 0.0 or self.init_aspect < 1.0:
+            raise ValueError(f"Initial scale factor must be non-negative and aspect at least 1 but got: {self.init_scale_knn}, {self.init_aspect}")
+        self.structure_tensor = None  # Of the target [3, H*W], computed when init_aspect first needs it
+        self.add_color_init = args.add_color_init
+        if self.add_color_init not in ["residual", "target"]:
+            raise ValueError(f"Unsupported color initialization '{self.add_color_init}', valid values include 'residual' and 'target'")
         self.disable_topk_norm = args.disable_topk_norm
         self.disable_inverse_scale = args.disable_inverse_scale
         self.max_scale = args.max_scale
@@ -560,11 +584,71 @@ class GaussianSplatting2D(nn.Module):
                 self.xy.copy_(self._sample_pos(prob=self.saliency))
             else:
                 self.xy.copy_(self.pixel_xy.detach().clone()[self._sample_pixels(self.num_gaussians)])
-            # Scale
-            self.scale.fill_(self.init_scale if self.disable_inverse_scale else 1.0/self.init_scale)
+            # Scale and rotation
+            scale, rot = self._get_init_shapes(self.xy, self.xy)
+            self.scale.copy_(scale)
+            self.rot.copy_(rot)
             # Feature
             if not self.disable_color_init:
                 self.feat.copy_(self._get_target_features(positions=self.xy).detach().clone())
+
+    def _get_init_shapes(self, all_xy, new_xy):
+        """
+        Initial scale parameters [M, 2] and rotations [M, 1] of the Gaussians at new_xy [M, 2], which are among all Gaussians all_xy [N, 2]:
+        init_scale pixels, or init_scale_knn times the RMS distance to the 3 nearest other Gaussians, so that the Gaussians cover the image
+        wherever they are sparse. With init_aspect > 1, they are elongated along the edges of the target (perpendicular to the dominant
+        gradient direction of the structure tensor) by an aspect ratio of up to init_aspect, by the coherence of the structure tensor, at the
+        same area.
+        """
+        num = len(new_xy)
+        if self.init_scale_knn > 0.0 and len(all_xy) > 3:
+            size = torch.tensor([self.img_w, self.img_h], dtype=self.dtype, device=self.device)
+            distance = self._estimate_knn_distance(all_xy * size, new_xy * size, self.img_h, self.img_w)
+            scale = (self.init_scale_knn * distance).clamp(0.5, 0.25 * min(self.img_h, self.img_w))
+        else:
+            scale = torch.full((num,), self.init_scale, dtype=self.dtype, device=self.device)
+        scale, rot = torch.stack([scale, scale], dim=1), torch.zeros(num, 1, dtype=self.dtype, device=self.device)
+        if self.init_aspect > 1.0:
+            if self.structure_tensor is None:
+                images = torch.pow(self.gt_images, 1.0/self.gamma)
+                self.structure_tensor = compute_structure_tensor(images, self.structure_tensor_sigma).reshape(3, -1)
+            column = (new_xy[:, 0] * self.img_w).long().clamp(0, self.img_w-1)
+            row = (new_xy[:, 1] * self.img_h).long().clamp(0, self.img_h-1)
+            jxx, jxy, jyy = self.structure_tensor[:, row * self.img_w + column]
+            # Dominant gradient direction, and coherence ((l1 - l2) / (l1 + l2))^2 of the eigenvalues l1 >= l2
+            phi = 0.5 * torch.atan2(2.0 * jxy, jxx - jyy)
+            coherence = (torch.hypot(jxx - jyy, 2.0 * jxy) / (jxx + jyy).clamp(min=1e-12)).square()
+            aspect = torch.sqrt(1.0 + (self.init_aspect - 1.0) * coherence)
+            scale = scale * torch.stack([aspect, 1.0 / aspect], dim=1)
+            # The first scale points along (cos rot, -sin rot) in pixels (x, y), which is to be the edge direction phi + pi/2
+            rot = -(phi + 0.5 * math.pi).unsqueeze(dim=1)
+        return (scale if self.disable_inverse_scale else 1.0 / scale), rot
+
+    @staticmethod
+    def _estimate_knn_distance(points, queries, img_h, img_w, k=3):
+        """
+        Estimated RMS distance [M] of each query [M, 2] to its k nearest points [N, 2] other than itself (in pixels; the queries are among the
+        points), in O(pixels) instead of O(M N): from the number n of points in the 3x3 cells around the query at the finest level of a
+        pyramid of square cells (1, 2, 4, ... pixels wide) where n > k, as in a Poisson process of density rho = n / area, where the squared
+        distance to the i-th nearest point is i / (pi rho) on average. Within about 25% of the exact distance (sampled positions, 480p).
+        """
+        levels = math.ceil(math.log2(max(img_h, img_w)))
+        size = 1 << levels
+        column = points[:, 0].long().clamp(0, img_w-1)
+        row = points[:, 1].long().clamp(0, img_h-1)
+        counts = torch.zeros(size * size, dtype=points.dtype, device=points.device)
+        counts = counts.index_add_(0, row * size + column, torch.ones_like(points[:, 0])).view(1, 1, size, size)
+        column = queries[:, 0].long().clamp(0, img_w-1)
+        row = queries[:, 1].long().clamp(0, img_h-1)
+        window = torch.ones(1, 1, 3, 3, dtype=points.dtype, device=points.device)
+        distance = torch.full_like(queries[:, 0], float("nan"))
+        for level in range(levels + 1):
+            if level > 0:
+                counts = 4.0 * F.avg_pool2d(counts, 2)
+            n = F.conv2d(counts, window, padding=1)[0, 0, row >> level, column >> level]
+            estimate = torch.sqrt(0.5 * (k + 1) * 9.0 * 4.0**level / (math.pi * n))
+            distance = torch.where(torch.isnan(distance) & (n > k), estimate, distance)
+        return distance
 
     def _sample_pixels(self, num, prob=None):
         """
@@ -1208,11 +1292,9 @@ class GaussianSplatting2D(nn.Module):
         selected = self._sample_pixels(add_num, prob=sample_prob)
         # New Gaussians
         new_xy = self.pixel_xy.detach().clone()[selected]
-        new_scale = torch.ones(add_num, 2, dtype=self.dtype, device=self.device)
-        init_scale = self.init_scale
-        new_scale.fill_(init_scale if self.disable_inverse_scale else 1.0/init_scale)
-        new_rot = torch.zeros(add_num, 1, dtype=self.dtype, device=self.device)
-        new_feat = self._from_rgb(diff_map).permute(1, 2, 0).reshape(-1, self.feat_dim)[selected]
+        new_scale, new_rot = self._get_init_shapes(torch.cat([self.xy.detach(), new_xy], dim=0), new_xy)
+        colors = self.target_images if self.add_color_init == "target" else self._from_rgb(diff_map)
+        new_feat = colors.permute(1, 2, 0).reshape(-1, self.feat_dim)[selected]
         new_vis_feat = torch.rand_like(new_feat)
         # Old Gaussians
         old_xy = self.xy.detach().clone()

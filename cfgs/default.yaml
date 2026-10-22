@@ -54,13 +54,18 @@ num_gaussians:         1000 # Number of Gaussians (with qp 0; e.g., "--qp 0 --nu
 qp:                    32.0 # Quantization parameter as in HEVC (0 disables it and uses num_gaussians); sets num_gaussians, prune_mode "lambda", prune_lambda, and the feature steps
 qp_overestimate:       0.6 # Factor on the number of Gaussians that paid off at most for the test images at the QP (with qp)
 qp_lambda_scale:       4.0 # Factor on HEVC's lambda for pruning (with qp)
+qp_offset:             6.47 # The settings are derived at QP qp_offset + qp_slope * qp, so that the PSNR at a QP matches x265's (all-intra, qp=) at the same QP at encoding budgets of 2-4 s (with qp; 0 and 1 derive them at qp itself)
+qp_slope:              0.767 # See qp_offset
 init_scale:            2.25 # Initial Gaussian scale in number of pixels
+init_scale_knn:        0.0 # With a positive value: the initial scale of each Gaussian, also of those added by densification, is this factor times the RMS distance to its 3 nearest Gaussians in pixels instead of init_scale, so that sparse Gaussians cover the image from the start (0 uses init_scale)
+init_aspect:           1.0 # Maximum aspect ratio of initial and added Gaussians: elongated along the edges of the target by the coherence of its structure tensor, at the same area (1 keeps them isotropic)
 topk:                  10 # Warning: Must match hardcoded value in CUDA kernel, modify with caution
 disable_topk_norm:     False # Disable top-K normalization
 disable_inverse_scale: False # Disable inverse Gaussian scale optimization
 max_scale:             0.0 # Upper bound of the Gaussian scales in pixels (0 disables it), enforced after each optimization step; large Gaussians slow down rasterization
 ckpt_file:             ""
 disable_color_init:    False
+add_color_init:        "residual" # Features of Gaussians added by densification, valid values include "residual" (the error of the rendered image at the pixel) and "target" (the target at the pixel, as at initialization)
 init_mode:             "gradient" # Gaussian position initialization mode, valid values include "gradient", "saliency", and "random"
 init_random_ratio:     0.3 # Ratio of Gaussians with randomly initialized position
 smap_filter_size:      20 # Gaussian filter size for smoothing saliency maps

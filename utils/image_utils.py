@@ -1,3 +1,4 @@
+import math
 import os
 
 import cv2
@@ -55,6 +56,25 @@ def compute_image_gradients(images):
     gradients = F.conv2d(F.pad(images.unsqueeze(1), (1, 1, 1, 1), mode="replicate"), kernels)  # [C, 2, H, W]
     gy, gx = torch.linalg.vector_norm(gradients, dim=0)
     return gy, gx
+
+
+def compute_structure_tensor(images, sigma):
+    """
+    Structure tensor (Jxx, Jxy, Jyy) [3, H, W] of a tensor [C, H, W]: products of the Sobel derivatives of each channel, summed over channels and
+    smoothed with a Gaussian of sigma pixels (repeating the edge pixels).
+    """
+    smooth = torch.tensor([1.0, 2.0, 1.0], dtype=images.dtype, device=images.device)
+    derivative = torch.tensor([-1.0, 0.0, 1.0], dtype=images.dtype, device=images.device)
+    kernels = torch.stack([torch.outer(smooth, derivative), torch.outer(derivative, smooth)]).unsqueeze(1)  # [2, 1, 3, 3]: d/dx, d/dy
+    gx, gy = F.conv2d(F.pad(images.unsqueeze(1), (1, 1, 1, 1), mode="replicate"), kernels).unbind(dim=1)  # [C, H, W] each
+    tensor = torch.stack([(gx * gx).sum(dim=0), (gx * gy).sum(dim=0), (gy * gy).sum(dim=0)]).unsqueeze(1)  # [3, 1, H, W]
+    radius = max(1, math.ceil(3.0 * sigma))
+    t = torch.arange(-radius, radius + 1, dtype=images.dtype, device=images.device)
+    kernel = torch.exp(-0.5 * (t / sigma) ** 2)
+    kernel = kernel / kernel.sum()
+    tensor = F.conv2d(F.pad(tensor, (radius, radius, 0, 0), mode="replicate"), kernel.view(1, 1, 1, -1))
+    tensor = F.conv2d(F.pad(tensor, (0, 0, radius, radius), mode="replicate"), kernel.view(1, 1, -1, 1))
+    return tensor.squeeze(dim=1)
 
 
 def load_images(load_path, downsample_ratio=None, gamma=None):
