@@ -1,6 +1,7 @@
 """
 Encoding time at which image-gs overtakes HEVC: RD curves of rate-control arms at a series of time budgets in real-time mode (wall-clock
-budgets, persistent process), at 480p/720p on the UVG test frames. Arms (settings loaded from the earlier sweeps):
+budgets, persistent process), at 480p/720p on the UVG test frames (or at 1080p, their source resolution, with the QP arms or --rates).
+Arms (settings loaded from the earlier sweeps):
   fixed-n            fixed numbers of Gaussians, 10% pruned at 1/6 of the budget (slurm/lowres/sweep.py, arm step-feat64)
   fixed-n-noprune    the same without pruning (no rounds, so no CUDA graph recaptures either)
   qp-lam4            QP rate control, lambda x4 pruning from an overestimate (slurm/qp/sweep.py, arm cap25x4-lam4)
@@ -51,21 +52,23 @@ def load_module(name, path):
 LOWRES = load_module("lowres_sweep", "slurm/lowres/sweep.py")
 QP = load_module("qp_sweep", "slurm/qp/sweep.py")
 BUDGETS = [0.5, 1.0, 2.0, 4.0]
+RESOLUTIONS = [*LOWRES.NUM_GAUSSIANS, "1080p"]  # 1080p: no numbers of Gaussians for the fixed-N arms (only with --rates)
+QP_RATES = {res: QP.QPS for res in RESOLUTIONS}
 WARMUP_BUDGET = 2.0
 # Settings, the option that sets the rate, and its values per resolution
 ARMS = {
     "fixed-n": ({**LOWRES.FIXED, **LOWRES.ARMS["step-feat64"]}, "num_gaussians", LOWRES.NUM_GAUSSIANS),
     "fixed-n-noprune": ({**LOWRES.FIXED, **LOWRES.ARMS["step-feat64"], "prune_ratio": 0.0}, "num_gaussians", LOWRES.NUM_GAUSSIANS),
-    "qp-lam4": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4"]}, "qp", {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
-    "qp-lam4-mid-add25": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"]}, "qp", {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
+    "qp-lam4": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4"]}, "qp", QP_RATES),
+    "qp-lam4-mid-add25": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"]}, "qp", QP_RATES),
     "qp-lam4-mid-add25-weight": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "feat_step_adapt": "weight", "feat_step_gamma": 0.25}, "qp",
-                                 {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
+                                 QP_RATES),
     "qp-lam4-mid-add25-weight-map": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "feat_step_adapt": "weight", "feat_step_gamma": 0.25,
-                                     "qp_offset": 6.47, "qp_slope": 0.767}, "qp", {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
+                                     "qp_offset": 6.47, "qp_slope": 0.767}, "qp", QP_RATES),
     "qp-lam4-mid-add25-area": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "feat_step_adapt": "area", "feat_step_gamma": 0.3}, "qp",
-                               {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
+                               QP_RATES),
     "qp-lam4-mid-add25-float": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "quant_mode": "none", "bitstream_codec": "none"}, "qp",
-                                {res: QP.QPS for res in LOWRES.NUM_GAUSSIANS}),
+                                QP_RATES),
 }
 DEFAULT_ARMS = ["fixed-n", "fixed-n-noprune", "qp-lam4", "qp-lam4-mid-add25"]
 
@@ -134,9 +137,12 @@ def parse_args():
         args.extra = {key: yaml.safe_load(value) for key, value in (item.split("=", 1) for item in args.set)}
     else:
         args.extra = {}
-    unknown = [arm for arm in args.arms if arm not in ARMS] + [res for res in args.res if res not in LOWRES.NUM_GAUSSIANS]
+    unknown = [arm for arm in args.arms if arm not in ARMS] + [res for res in args.res if res not in RESOLUTIONS]
     if unknown:
         parser.error(f"Unknown arms or resolutions: {', '.join(unknown)}")
+    missing = [f"{arm} at {res}" for arm in args.arms for res in args.res if res not in ARMS[arm][2] and not args.rates]
+    if missing:
+        parser.error(f"No rate points for {', '.join(missing)}: pass --rates")
     return args
 
 
