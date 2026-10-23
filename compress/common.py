@@ -1,10 +1,29 @@
 """
 Building blocks shared by the bitstream container and the entropy coders: bit-packed header fields, Morton order of the Gaussian positions,
-lossless channel transforms, and zigzag mapping of signed integers.
+lossless channel transforms, zigzag mapping of signed integers, and loading the C++ modules of compress/csrc.
 """
+import hashlib
+import importlib
+import os
 import struct
 
 import numpy as np
+
+
+def load_extension(module_name, source_name):
+    """
+    The C++ module module_name, after checking that it was built from the current compress/csrc/<source_name> (setup.py stores its hash).
+    """
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", source_name)
+    build = "pip install compress/csrc --no-build-isolation (from the repository root)"
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as error:
+        raise ImportError(f"The C++ module {module_name} is not installed: {build}") from error
+    with open(source, "rb") as file:
+        if module.SOURCE_HASH != hashlib.sha256(file.read()).hexdigest()[:16]:
+            raise ImportError(f"The installed C++ module {module_name} was built from another version of {source}: {build}")
+    return module
 
 
 class BitWriter:

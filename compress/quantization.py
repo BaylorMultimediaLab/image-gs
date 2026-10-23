@@ -74,14 +74,14 @@ def canonicalize(scale, rot, quarter_turns, wrap_rot, log_scale):
 def get_step_symbols(xy, scale, rot, feat, steps, feat_step_multipliers=None):
     """
     Symbols of "step" quantization of the canonicalized Gaussian parameters (scale in pixels, quantized in log2 pixels), with the per-channel
-    steps of position, log2 scale, rotation, and features. feat_step_multipliers(geometry_symbols) gives per-Gaussian multipliers [P] of the
-    feature steps, which the returned feature steps (the base steps) do not include.
+    steps of position, log2 scale, rotation, and features. feat_step_multipliers(geometry_symbols) gives per-Gaussian multipliers [P, C] of
+    the feature steps, which the returned feature steps (the base steps) do not include.
     """
     with torch.no_grad():
         if feat_step_multipliers is None:
             return [quantize_step(x, x_steps) for x, x_steps in zip([xy, torch.log2(scale), rot, feat], steps)]
         symbols = [quantize_step(x, x_steps) for x, x_steps in zip([xy, torch.log2(scale), rot], steps[:3])]
-        q_feat = torch.round(feat / (steps[3] * feat_step_multipliers(symbols)[:, None]))
+        q_feat = torch.round(feat / (steps[3] * feat_step_multipliers(symbols)))
         return symbols + [(q_feat, steps[3], torch.zeros_like(steps[3]))]
 
 
@@ -107,18 +107,18 @@ def dequantize_symbols(symbols, log_scale, feat_step_multipliers=None):
     if log_scale:
         if feat_step_multipliers is not None:
             q_feat, steps, origins = symbols[3]
-            feat = dequantize(q_feat, steps * feat_step_multipliers(symbols[:3])[:, None], origins)
+            feat = dequantize(q_feat, steps * feat_step_multipliers(symbols[:3]), origins)
         scale = torch.exp2(scale)
     return xy, scale, rot, feat
 
 
-def feat_step_multipliers(geometry_symbols, mode, gamma, get_feature_weights=None):
+def feat_step_multipliers(geometry_symbols, mode, gammas, get_feature_weights=None):
     """
-    Per-Gaussian multipliers [P] (float64) of the feature steps: (proxy / its geometric mean)^(-gamma), snapped to powers of
-    2^(1/FEAT_STEP_ADAPT_DIVISIONS) within 2^(+-FEAT_STEP_ADAPT_OCTAVES). The proxy is the Gaussian's area (mode "area") or
-    get_feature_weights(xy, scale, rot) of the dequantized geometry (mode "weight", see feature_weights), the sensitivity of the rendered
-    image to its features. Both only depend on the symbols of the geometry [position, log2 scale, rotation], and neither depends on the order
-    of the Gaussians, so a decoder computes the same multipliers.
+    Per-Gaussian multipliers [P, C] (float64) of the feature steps: (proxy / its geometric mean)^(-gamma) with the gamma of each channel
+    (gammas [C], float64), snapped to powers of 2^(1/FEAT_STEP_ADAPT_DIVISIONS) within 2^(+-FEAT_STEP_ADAPT_OCTAVES). The proxy is the
+    Gaussian's area (mode "area") or get_feature_weights(xy, scale, rot) of the dequantized geometry (mode "weight", see feature_weights),
+    the sensitivity of the rendered image to its features. Both only depend on the symbols of the geometry [position, log2 scale,
+    rotation], and neither depends on the order of the Gaussians, so a decoder computes the same multipliers.
     """
     if mode == "area":
         # log2 of the area is the scale step times the sum of the two log2-scale indices, whose mean is exact
@@ -129,7 +129,7 @@ def feat_step_multipliers(geometry_symbols, mode, gamma, get_feature_weights=Non
         log_proxy = torch.log2(get_feature_weights(xy, torch.exp2(log_scale), rot).clamp(min=2.0**-40))
         log_proxy = log_proxy - log_proxy.mean()
     limit = FEAT_STEP_ADAPT_DIVISIONS * FEAT_STEP_ADAPT_OCTAVES
-    divisions = torch.round(-FEAT_STEP_ADAPT_DIVISIONS * gamma * log_proxy).clamp(-limit, limit)
+    divisions = torch.round((-FEAT_STEP_ADAPT_DIVISIONS * gammas)[None, :] * log_proxy[:, None]).clamp(-limit, limit)
     return torch.exp2(divisions / FEAT_STEP_ADAPT_DIVISIONS)
 
 
@@ -186,12 +186,15 @@ def symbols_to_numpy(symbols):
             for q, steps, origins in symbols]
 
 
-def bitstream_meta(img_h, img_w, quant_mode, color_space, feat_step_adapt, feat_step_gamma):
+def bitstream_meta(img_h, img_w, quant_mode, color_space, feat_prediction, feat_step_adapt, feat_step_gamma, uv_step_gamma):
     """
-    Model metadata of the bitstream: image size, quantization mode, color space, and the per-Gaussian feature steps (feat_step_adapt "none",
-    "area", or "weight" with feat_step_gamma), which a decoder computes from the decoded geometry.
+    Model metadata of the bitstream: image size, quantization mode, color space, whether the features are coded as residuals of their
+    prediction (compress.prediction with get_prediction_refs), and the per-Gaussian feature steps (feat_step_adapt "none", "area", or
+    "weight" with feat_step_gamma, and in YUV mode uv_step_gamma for U and V), which a decoder computes from the decoded geometry.
     """
-    meta = struct.pack("<IIBB", img_h, img_w, ["minmax", "step"].index(quant_mode), ["rgb", "yuv"].index(color_space))
+    meta = struct.pack("<IIBBB", img_h, img_w, ["minmax", "step"].index(quant_mode), ["rgb", "yuv"].index(color_space), int(feat_prediction))
     if feat_step_adapt != "none":
         meta += struct.pack("<Bf", ["area", "weight"].index(feat_step_adapt) + 1, feat_step_gamma)
+        if color_space == "yuv":
+            meta += struct.pack("<f", uv_step_gamma)
     return meta

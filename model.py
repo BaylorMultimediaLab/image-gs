@@ -16,8 +16,11 @@ from lpips import LPIPS
 from pytorch_msssim import MS_SSIM
 
 from compress import decode_bitstream, encode_bitstream
+from compress.common import morton_order
+from compress.prediction import get_prediction_refs, predict_residuals, reconstruct_indices
 from compress.pruning import add_probabilities, contribution, keep_gaussians, loo_loss_increase, select_lambda_pruning
 from compress.quantization import (
+    FEAT_STEP_ADAPT_DIVISIONS,
     bitstream_meta,
     canonicalize,
     dequantize_symbols,
@@ -38,7 +41,7 @@ from gsplat import (
 )
 from gsplat.cuda import nd_rasterize_forward_topk_norm
 from gsplat.utils import sort_intersects_by_tile
-from utils.color_utils import get_color_transforms, get_yuv_channel_indices, transform_images
+from utils.color_utils import UV_STEP_SCALE, Y_STEP_SCALE, get_color_transforms, get_loss_transform, get_yuv_channel_indices, transform_images
 from utils.flip import LDRFLIPLoss
 from utils.image_utils import (
     compute_image_gradients,
@@ -172,10 +175,11 @@ class GaussianSplatting2D(nn.Module):
         """
         Rate settings from the quantization parameter, derived at the mapped QP qp_offset + qp_slope * qp: lambda pruning with HEVC's lambda
         at the mapped QP, starting from a content-agnostic overestimate of the number of Gaussians, and a feature step that halves every
-        QP_FEAT_STEP_HALVING QPs (in YUV mode the Y step, and uv_step_ratio times it for U and V). The other steps are unchanged.
+        QP_FEAT_STEP_HALVING QPs. In YUV mode, Y, and U and V get the error per channel of RGB features at that step (Y_STEP_SCALE and
+        UV_STEP_SCALE times it), times y_step_ratio and uv_step_ratio. The other steps are unchanged.
         """
-        if args.uv_step_ratio <= 0.0 or (args.uv_step_ratio != 1.0 and (args.qp == 0.0 or args.color_space != "yuv")):
-            raise ValueError(f"UV step ratio must be positive, and other than 1 only with color_space 'yuv' and qp, but got: {args.uv_step_ratio:g}")
+        if args.y_step_ratio <= 0.0 or args.uv_step_ratio <= 0.0:
+            raise ValueError(f"Y and UV step ratios must be positive but got: {args.y_step_ratio:g}, {args.uv_step_ratio:g}")
         if args.qp == 0.0:
             return
         if args.qp < 0.0:
@@ -189,13 +193,14 @@ class GaussianSplatting2D(nn.Module):
         qp = get_mapped_qp(args)
         density = QP_DENSITY * 2.0**((32.0 - qp) / QP_DENSITY_DOUBLING)
         args.num_gaussians = max(1, round(args.qp_overestimate * density * self.img_h * self.img_w / 1000.0))
-        args.feat_step = args.y_step = QP_FEAT_STEP * 2.0**((qp - 37.0) / QP_FEAT_STEP_HALVING)
-        args.uv_step = args.uv_step_ratio * args.y_step
+        args.feat_step = QP_FEAT_STEP * 2.0**((qp - 37.0) / QP_FEAT_STEP_HALVING)
+        args.y_step = args.y_step_ratio * Y_STEP_SCALE * args.feat_step
+        args.uv_step = args.uv_step_ratio * UV_STEP_SCALE * args.feat_step
         args.prune_mode = "lambda"
         args.prune_lambda = args.qp_lambda_scale * 0.57 * 2.0**((qp - 12.0) / 3.0)
-        uv_step = f" (UV 1/{1.0/args.uv_step:.1f})" if args.uv_step_ratio != 1.0 else ""
+        yuv_steps = f" (Y 1/{1.0/args.y_step:.1f}, UV 1/{1.0/args.uv_step:.1f})" if args.color_space == "yuv" else ""
         self.worklog.info(f"QP {args.qp:g} (settings of QP {qp:.2f}): {args.num_gaussians:d} Gaussians before pruning ({args.qp_overestimate:g} x "
-                          f"{density:.2f} per 1000 pixels), feature step 1/{1.0/args.feat_step:.1f}{uv_step}, lambda {args.prune_lambda:.2f} "
+                          f"{density:.2f} per 1000 pixels), feature step 1/{1.0/args.feat_step:.1f}{yuv_steps}, lambda {args.prune_lambda:.2f} "
                           f"({args.qp_lambda_scale:g} x HEVC's)")
         if not self.evaluate:
             save_cfg(path=f"{self.log_dir}/cfg_train.yaml", args=args)  # Record the derived settings
@@ -220,19 +225,20 @@ class GaussianSplatting2D(nn.Module):
         if self.color_space not in ["rgb", "yuv"]:
             raise ValueError(f"Unsupported color space '{self.color_space}', valid values include 'rgb' and 'yuv'")
         self.uv_weight = args.uv_weight
-        if self.uv_weight <= 0.0 or (self.uv_weight != 1.0 and self.color_space != "yuv"):
-            raise ValueError(f"UV weight must be positive, and other than 1 only with color_space 'yuv', but got: {self.uv_weight:g}")
+        if self.uv_weight <= 0.0:
+            raise ValueError(f"UV weight must be positive but got: {self.uv_weight:g}")
         self.feat_dim = sum(self.input_channels)
-        self.channel_weights = None
+        self.loss_transform, self.rgb_loss_transform = None, None
         if self.color_space == "yuv":
             self.rgb_to_yuv, self.yuv_to_rgb = get_color_transforms(self.input_channels, dtype=self.dtype, device=self.device)
             self.y_channels, self.uv_channels, self.other_channels = get_yuv_channel_indices(self.input_channels, device=self.device)
-            # Scales of the feature channels in the losses, the error of lambda pruning, and the error map of added Gaussians
-            self.channel_weights = torch.ones(self.feat_dim, dtype=self.dtype, device=self.device)
-            self.channel_weights[self.uv_channels] = self.uv_weight
-        # Optimization target in the color space of the Gaussian features
+            # The losses, the error of lambda pruning, and the error map of added Gaussians compare RGB images of the luma-weighted features
+            # (uv_weight 1: RGB images, as in RGB mode), from the features and from RGB images
+            self.loss_transform = get_loss_transform(self.input_channels, self.uv_weight, dtype=self.dtype, device=self.device)
+            self.rgb_loss_transform = self.loss_transform @ self.rgb_to_yuv
+        # Optimization target in the color space of the Gaussian features, and in the space of the losses
         self.target_images = self._from_rgb(self.gt_images)
-        self.loss_target_images = self.target_images if self.channel_weights is None else self.target_images * self.channel_weights[:, None, None]
+        self.loss_target_images = self.gt_images if self.loss_transform is None else transform_images(self.target_images, self.loss_transform)
 
     def _from_rgb(self, images):
         return transform_images(images, self.rgb_to_yuv) if self.color_space == "yuv" else images
@@ -272,7 +278,12 @@ class GaussianSplatting2D(nn.Module):
         if args.feat_step_adapt not in ["none", "area", "weight"]:
             raise ValueError(f"Unsupported feature step adaptation '{args.feat_step_adapt}', valid values include 'none', 'area', and 'weight'")
         self.feat_step_adapt = args.feat_step_adapt if self.quant_mode == "step" else "none"  # Only the step mode has feature steps
-        self.feat_step_gamma = float(np.float32(args.feat_step_gamma))  # The value that the bitstream stores
+        # The values that the bitstream stores, and the gamma of each feature channel
+        self.feat_step_gamma = float(np.float32(args.feat_step_gamma))
+        self.uv_step_gamma = float(np.float32(args.uv_step_gamma if args.uv_step_gamma >= 0.0 else args.feat_step_gamma))
+        self.feat_step_gammas = torch.full((self.feat_dim,), self.feat_step_gamma, dtype=torch.float64, device=self.device)
+        if self.color_space == "yuv":
+            self.feat_step_gammas[self.uv_channels] = self.uv_step_gamma
         # The per-Gaussian feature steps apply to the saved model and in evaluation; optimization uses the uniform steps
         self.feat_step_adapt_active = self.feat_step_adapt != "none" and self.evaluate
         self.feat_step_multiplier_cache = None
@@ -285,11 +296,11 @@ class GaussianSplatting2D(nn.Module):
             raise ValueError(f"Unsupported bitstream codec '{self.bitstream_codec}', valid values include 'none', 'lzma', and 'rans'")
         if self.bitstream_codec != "none" and self.quant_mode == "none":
             raise ValueError("Writing a bitstream requires quantization")
-        self.color_transform = args.color_transform
-        if self.color_transform not in ["none", "subtract-green"]:
-            raise ValueError(f"Unsupported color transform '{self.color_transform}', valid values include 'none' and 'subtract-green'")
-        if self.color_transform != "none" and self.color_space != "rgb":
-            raise ValueError("Color transforms of the bitstream require color_space 'rgb'")
+        if args.color_transform not in ["none", "subtract-green"]:
+            raise ValueError(f"Unsupported color transform '{args.color_transform}', valid values include 'none' and 'subtract-green'")
+        self.color_transform = args.color_transform if self.color_space == "rgb" else "none"  # YUV features are coded as they are
+        self.feat_prediction = args.feat_prediction
+        self.feat_prediction_refs = get_prediction_refs(self.input_channels, self.color_space)
 
     def _get_feat_groups(self):
         """
@@ -331,8 +342,9 @@ class GaussianSplatting2D(nn.Module):
 
     def _get_feat_step_multipliers(self, geometry_symbols):
         """
-        Per-Gaussian multipliers [P] of the feature steps (compress.quantization.feat_step_multipliers with feat_step_adapt and
-        feat_step_gamma; "weight" from the rasterizer's top-K weights). The multipliers of the last geometry are cached.
+        Per-Gaussian multipliers [P, C] of the feature steps (compress.quantization.feat_step_multipliers with feat_step_adapt, and
+        feat_step_gamma or for U and V uv_step_gamma; "weight" from the rasterizer's top-K weights). The multipliers of the last geometry are
+        cached.
         """
         indices = [q for q, _, _ in geometry_symbols]
         cache = self.feat_step_multiplier_cache
@@ -343,7 +355,7 @@ class GaussianSplatting2D(nn.Module):
             no_feat = torch.zeros(len(xy), 1, dtype=self.dtype, device=self.device)  # The top-K lists do not depend on the features
             return feature_weights(self._iter_topk_weights(xy, scale, rot, no_feat), len(xy), self.eps, self.device)
 
-        multipliers = feat_step_multipliers(geometry_symbols, self.feat_step_adapt, self.feat_step_gamma, get_feature_weights).to(self.dtype)
+        multipliers = feat_step_multipliers(geometry_symbols, self.feat_step_adapt, self.feat_step_gammas, get_feature_weights).to(self.dtype)
         self.feat_step_multiplier_cache = (indices, multipliers)
         return multipliers
 
@@ -723,17 +735,28 @@ class GaussianSplatting2D(nn.Module):
         with torch.no_grad():
             symbols = self._get_symbols(self.xy, *self._canonicalize(self._get_scale(), self.rot), self.feat)
             attributes = symbols_to_numpy(symbols)
-            meta = bitstream_meta(self.img_h, self.img_w, self.quant_mode, self.color_space, self.feat_step_adapt, self.feat_step_gamma)
+            meta = bitstream_meta(self.img_h, self.img_w, self.quant_mode, self.color_space, self.feat_prediction, self.feat_step_adapt,
+                                  self.feat_step_gamma, self.uv_step_gamma)
             channel_refs = get_channel_refs(self.input_channels, self.color_transform)
-            data, order, attribute_bytes = encode_bitstream(attributes, meta, codec=self.bitstream_codec, channel_refs=channel_refs)
+            coded = list(attributes)
+            if self.feat_prediction:
+                # Residuals of the features predicted in bitstream order (the order of encode_bitstream), which include the reference
+                # subtraction of the color transform
+                _, order, _ = morton_order(attributes[0][0])
+                q_feat, feat_steps, feat_origins = attributes[3]
+                residuals = np.empty_like(q_feat)
+                residuals[order] = predict_residuals(q_feat[order], feat_steps, self._get_feat_step_exponents(symbols[:3])[order],
+                                                     attributes[0][0][order], channel_refs[3], self.feat_prediction_refs)
+                coded[3], channel_refs[3] = (residuals, feat_steps, feat_origins), None
+            data, order, attribute_bytes = encode_bitstream(coded, meta, codec=self.bitstream_codec, channel_refs=channel_refs)
             with open(path, "wb") as file:
                 file.write(data)
             if not self.realtime:
                 with open(path, "rb") as file:
-                    decoded, _ = decode_bitstream(file.read())
-                if not all(np.array_equal(q[order], q_decoded) for (q, _, _), (q_decoded, _, _) in zip(attributes, decoded)):
+                    decoded_symbols = self._decode_bitstream(file.read())
+                decoded = [q.cpu().numpy() for q, _, _ in decoded_symbols]
+                if not all(np.array_equal(q[order], q_decoded) for (q, _, _), q_decoded in zip(attributes, decoded)):
                     raise RuntimeError(f"Decoding '{path}' does not reproduce the quantization indices")
-                decoded_symbols = [[torch.from_numpy(x).to(dtype=self.dtype, device=self.device) for x in attribute] for attribute in decoded]
                 images = self._rasterize(*self._dequantize_symbols(decoded_symbols), self.img_h, self.img_w, self.tile_bounds)
                 psnr, _ = self._evaluate(log=False, upsample=False)
                 decoded_psnr, _ = self._evaluate(log=False, upsample=False, images=self._to_rgb(images))
@@ -752,6 +775,29 @@ class GaussianSplatting2D(nn.Module):
             self.worklog.info(f"Lossless decoding verified | PSNR: {decoded_psnr:.4f} decoded, {psnr:.4f} encoder side")
         self.worklog.info("***********************************************")
         return len(data)
+
+    def _decode_bitstream(self, data):
+        """
+        Quantization symbols (GPU tensors) of a bitstream of _write_bitstream, with the Gaussians in bitstream order.
+        """
+        decoded, _ = decode_bitstream(data)
+        symbols = [[torch.from_numpy(x).to(dtype=self.dtype, device=self.device) for x in attribute] for attribute in decoded]
+        if self.feat_prediction:
+            residuals, feat_steps, _ = decoded[3]
+            color_refs = get_channel_refs(self.input_channels, self.color_transform)[3]
+            indices = reconstruct_indices(residuals, feat_steps, self._get_feat_step_exponents(symbols[:3]), decoded[0][0], color_refs,
+                                          self.feat_prediction_refs)
+            symbols[3][0] = torch.from_numpy(indices).to(dtype=self.dtype, device=self.device)
+        return symbols
+
+    def _get_feat_step_exponents(self, geometry_symbols):
+        """
+        Exponents d [P, C] (int64) of the per-Gaussian feature step multipliers 2^(d/4) (zero without feat_step_adapt) of the geometry symbols.
+        """
+        if not self.feat_step_adapt_active:
+            return np.zeros((len(geometry_symbols[0][0]), self.feat_dim), dtype=np.int64)
+        multipliers = self._get_feat_step_multipliers(geometry_symbols).to(torch.float64)
+        return torch.round(FEAT_STEP_ADAPT_DIVISIONS * torch.log2(multipliers)).to(torch.int64).cpu().numpy()
 
     def render(self, render_height=None):
         img_h, img_w = self.img_h, self.img_w
@@ -792,12 +838,12 @@ class GaussianSplatting2D(nn.Module):
     def forward(self, img_h, img_w, tile_bounds, upsample_ratio=None, benchmark=False, isect_capacity=None, weighted=False):
         """
         With isect_capacity, the tile intersections go to buffers of that size without reading their number back to the CPU (CUDA graph
-        capture), and their peak number is tracked in isect_peak. With weighted, the channels are scaled by channel_weights (YUV mode) for
-        the training losses: rendering is linear in the features, so scaling the features scales the image.
+        capture), and their peak number is tracked in isect_peak. With weighted, the image is in the space of the training losses (YUV mode:
+        loss_transform): rendering is linear in the features, so transforming the features transforms the image.
         """
         xy, scale, rot, feat = self._get_params(upsample_ratio=upsample_ratio)
-        if weighted and self.channel_weights is not None:
-            feat = feat * self.channel_weights
+        if weighted and self.loss_transform is not None:
+            feat = feat @ self.loss_transform.T
         begin = perf_counter()
         tmp = project_gaussians_2d_scale_rot(xy, scale, rot, img_h, img_w, tile_bounds)
         xy, radii, conics, num_tiles_hit = tmp
@@ -1071,7 +1117,7 @@ class GaussianSplatting2D(nn.Module):
 
     def _get_total_loss(self, images):
         """
-        Training losses of images rendered with weighted channels (forward with weighted) against the target with weighted channels.
+        Training losses of images rendered in the space of the losses (forward with weighted) against the target in that space.
         """
         target_images = self.loss_target_images
         if self.l1_loss_ratio > 1e-7 and self.ssim_loss_ratio > 1e-7 and self.l2_loss_ratio <= 1e-7:
@@ -1234,7 +1280,7 @@ class GaussianSplatting2D(nn.Module):
             return
         raw_images = self._render_images(upsample=False)
         images = torch.pow(torch.clamp(raw_images, 0.0, 1.0), 1.0/self.gamma)
-        sample_prob, diff_map = add_probabilities(images, torch.pow(self.gt_images, 1.0/self.gamma), self.channel_weights, self._from_rgb)
+        sample_prob, diff_map = add_probabilities(images, torch.pow(self.gt_images, 1.0/self.gamma), self.rgb_loss_transform)
         selected = self._sample_pixels(add_num, prob=sample_prob)
         # New Gaussians
         new_xy = self.pixel_xy.detach().clone()[selected]
@@ -1306,13 +1352,13 @@ class GaussianSplatting2D(nn.Module):
 
     def _get_loo_loss_increase(self, metric="l1"):
         """
-        Increase of the loss when removing each Gaussian on its own (compress.pruning.loo_loss_increase), in YUV mode with the channels scaled
-        by channel_weights, so that with uv_weight 1 the loss is that of the unscaled channels and with uv_weight -> 0 the squared error is
-        that of Y alone.
+        Increase of the loss when removing each Gaussian on its own (compress.pruning.loo_loss_increase), in YUV mode in the space of the
+        losses (loss_transform), so that with uv_weight 1 the loss is that of RGB images and with uv_weight -> 0 the squared error is that of
+        the luma (Y in every channel).
         """
         xy, scale, rot, feat = self._get_params()
         xy, conics, pixel_topk = self._get_pixel_topk(xy, scale, rot, feat)
-        return loo_loss_increase(xy, conics, feat, pixel_topk, self.target_images, self.eps, metric, self.channel_weights)
+        return loo_loss_increase(xy, conics, feat, pixel_topk, self.target_images, self.eps, metric, self.loss_transform)
 
     def _prune_gaussians(self, prune_num, plot_gaussians=False):
         prune_num = min(prune_num, self.max_prune_num, self.num_prune-self.num_pruned)

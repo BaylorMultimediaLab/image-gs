@@ -23,14 +23,17 @@ rot_step:              0.703125 # Rotation step in degrees
 feat_step:             0.015625 # Step of individual feature dimensions
 y_step:                0.015625 # Step of the Y feature dimension
 uv_step:               0.015625 # Step of individual U and V feature dimensions
-uv_step_ratio:         1.0 # With qp in YUV mode: the U and V step is this factor times the Y step that the qp sets (without qp, y_step and uv_step set both)
+uv_step_ratio:         2.0 # With qp in YUV mode: factor of the U and V step over the one that gives them the error of RGB features at the qp's step (without qp, y_step and uv_step set the steps)
+y_step_ratio:          1.0 # With qp in YUV mode: factor of the Y step over the one that gives Y the error of RGB features at the qp's step
 feat_step_adapt:       "weight" # Per-Gaussian feature steps of the saved model with quant_mode "step" (optimization uses the uniform steps), valid values include "none", "area" (by Gaussian area), and "weight" (by the sum of the Gaussian's squared normalized blending weights over the pixels); computed from the quantized geometry, so decoders repeat them
 feat_step_gamma:       0.25 # feat_step_adapt multiplies the feature steps by (proxy / its geometric mean)^(-feat_step_gamma), snapped to powers of 2^(1/4) between 1/4 and 4
+uv_step_gamma:         -1.0 # YUV mode with feat_step_adapt: feat_step_gamma of the U and V channels (negative: feat_step_gamma); above feat_step_gamma, chroma steps grow faster than luma steps on Gaussians with small feature weights
 
 wrap_rot:              False # Wrap Gaussian orientations to [0, pi) before quantization
 canonical_rot:         True # Store each Gaussian (saved model, bitstream, rate estimates) with its orientation in [-pi/4, pi/4]: rotated by a multiple of pi/2, with its axes swapped for odd multiples (the same ellipse), which makes the rotation cheaper to code; with a rot_step that divides 90 degrees, the quantization grid of the ellipses is unchanged, so optimization renders the rotation as it is
 bitstream_codec:       "rans" # Write a compressed bitstream of the quantized Gaussians after optimization (or with eval) and verify that it decodes losslessly, valid values include "none", "lzma", and "rans"
-color_transform:       "subtract-green" # Lossless transform of the quantized features before entropy coding (any bitstream_codec), valid values include "none" and "subtract-green" (R-G, G, B-G as in WebP lossless; color_space "rgb" only)
+color_transform:       "subtract-green" # Lossless transform of quantized RGB features before entropy coding (any bitstream_codec; YUV features are coded as they are), valid values include "none" and "subtract-green" (R-G, G, B-G as in WebP lossless)
+feat_prediction:       True # Code the quantized features as residuals of a lossless prediction from the nearest earlier Gaussians in bitstream order (compress.prediction): Y, or G, from their mean, and U from Y, V from U, or R-G and B-G from G, by a local linear fit (CCLM-style); decoders repeat it after decoding the geometry
 
 # Logging
 log_root:              "results"
@@ -44,8 +47,8 @@ save_ckpt_steps:       100000 # Frequency of checkpointing during optimization
 eval_steps:            100
 
 # Target images
-color_space:           "rgb" # Color space of Gaussian features and training losses, valid values include "yuv" and "rgb" (metrics and saved images are always RGB)
-uv_weight:             1.0 # YUV mode: scale of the U and V channels relative to Y in the training losses, the error of lambda pruning, and the error map that places added Gaussians (below 1 favors luma, e.g., for VMAF)
+color_space:           "yuv" # Color space of Gaussian features and training losses, valid values include "yuv" and "rgb" (metrics and saved images are always RGB); the uv_* and y_* settings apply to YUV only
+uv_weight:             0.25 # YUV mode: the training losses, the error of lambda pruning, and the error map that places added Gaussians compare the RGB images of Y and uv_weight times U and V (1: RGB images as in RGB mode; below 1 favors luma, e.g., for VMAF, while a luma error counts as in RGB)
 gamma:                 1.0 # Optimize in a gamma-corrected space, modify with caution
 data_root:             "media"
 input_path:            "uvg/480p/Beauty_0001.png" # Path to an image file or a directory containing a texture stack

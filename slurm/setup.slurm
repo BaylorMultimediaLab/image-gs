@@ -41,7 +41,7 @@ python -m pip install "${BUILD_DIR}/gsplat" -c "${CONSTRAINTS}" --no-cache-dir -
 # fused-ssim at the head of its pull request #46 and adds fused_l1_ssim (the training loss in one forward and one backward kernel)
 python -m pip install "git+https://github.com/rahul-goel/fused-ssim/@77aba120314babc98140cd6c7e8c7119fa92cbee" -c "${CONSTRAINTS}" \
     --no-cache-dir --no-build-isolation
-# C++ rANS coder of compress/rans_codec.py, built from a copy as well
+# C++ modules of compress/ (rANS coder and feature prediction), built from a copy as well
 cp -r compress/csrc "${BUILD_DIR}/rans"
 python -m pip install "${BUILD_DIR}/rans" -c "${CONSTRAINTS}" --no-cache-dir --no-build-isolation
 rm -rf "${BUILD_DIR}" "${CONSTRAINTS}"
@@ -53,7 +53,7 @@ python - <<'PY'
 import torch, torchvision, numpy, scipy
 from gsplat import csrc  # noqa: F401
 from fused_ssim import fused_ssim  # noqa: F401
-import compress  # noqa: F401  (checks that the C++ rANS coder was built from compress/csrc/rans.cpp)
+import compress.prediction  # noqa: F401  (checks that the C++ modules were built from compress/csrc)
 import lpips, pytorch_msssim, flip_evaluator, skimage, cv2  # noqa: F401
 print(f"torch {torch.__version__} | torchvision {torchvision.__version__} | numpy {numpy.__version__} | scipy {scipy.__version__} | "
       f"GPU {torch.cuda.get_device_name(0)}")

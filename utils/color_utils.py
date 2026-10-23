@@ -1,10 +1,17 @@
+import math
+
 import torch
 
 # Full-range BT.601 (JPEG) RGB -> YUV (YCbCr) without the chroma offset, so the transform stays linear and commutes with
-# Gaussian rasterization (a weighted sum of features). U and V are centered at 0 with range [-0.5, 0.5].
+# Gaussian rasterization (a weighted sum of features). U and V are centered at 0 with range [-0.5, 0.5]. The coefficients are those of the
+# limited-range BT.601 conversion that HEVC's input and the luma metrics use, which only scales and offsets Y, U, V.
 RGB_TO_YUV = [[0.299, 0.587, 0.114],
               [-0.168736, -0.331264, 0.5],
               [0.5, -0.418688, -0.081312]]
+# RMS error of Y, and of U and V (their root mean square), when R, G, B are quantized independently with step 1: YUV features quantized with
+# these factors times a step have the error per channel of RGB features quantized with that step
+Y_STEP_SCALE = math.sqrt(sum(c * c for c in RGB_TO_YUV[0]))
+UV_STEP_SCALE = math.sqrt(sum(c * c for row in RGB_TO_YUV[1:] for c in row) / 2.0)
 
 
 def get_color_transforms(input_channels, dtype, device):
@@ -17,6 +24,19 @@ def get_color_transforms(input_channels, dtype, device):
     forward = torch.block_diag(*blocks)
     inverse = torch.linalg.inv(forward)
     return forward.to(dtype=dtype, device=device), inverse.to(dtype=dtype, device=device)
+
+
+def get_loss_transform(input_channels, uv_weight, dtype, device):
+    """
+    Block-diagonal map of YUV features to the space of the losses: the RGB image of Y, uv_weight U, uv_weight V, i.e., uv_weight RGB +
+    (1 - uv_weight) times the gray image of the luma. With uv_weight 1 it is the RGB image, and for any uv_weight a luma error counts as in
+    RGB. 1-channel images are left unchanged.
+    """
+    forward, inverse = get_color_transforms(input_channels, dtype=torch.float64, device="cpu")
+    weights = torch.ones(len(forward), dtype=torch.float64)
+    _, uv_channels, _ = get_yuv_channel_indices(input_channels, device="cpu")
+    weights[uv_channels] = uv_weight
+    return (inverse * weights[None, :]).to(dtype=dtype, device=device)
 
 
 def get_yuv_channel_indices(input_channels, device):

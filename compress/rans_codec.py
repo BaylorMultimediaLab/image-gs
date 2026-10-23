@@ -9,31 +9,11 @@ probability tables are integers, so that decoding is deterministic.
 The model search, rANS coding, and decoding are implemented in C++ (compress/csrc/rans.cpp, built as the module igs_rans); this module
 writes and reads the stream headers.
 """
-import hashlib
-import os
-
 import numpy as np
 
-from compress.common import unzigzag, zigzag
+from compress.common import load_extension, unzigzag, zigzag
 
-
-def _load_extension():
-    """
-    The C++ coder, after checking that it was built from the current compress/csrc/rans.cpp.
-    """
-    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "rans.cpp")
-    build = "pip install compress/csrc --no-build-isolation (from the repository root)"
-    try:
-        import igs_rans
-    except ImportError as error:
-        raise ImportError(f"The C++ rANS coder is not installed: {build}") from error
-    with open(source, "rb") as file:
-        if igs_rans.SOURCE_HASH != hashlib.sha256(file.read()).hexdigest()[:16]:
-            raise ImportError(f"The installed C++ rANS coder was built from another version of {source}: {build}")
-    return igs_rans
-
-
-_rans = _load_extension()
+_rans = load_extension("igs_rans", "rans.cpp")
 
 
 def ue_bits(values):

@@ -10,23 +10,20 @@ from torchvision.transforms.functional import gaussian_blur
 from gsplat.cuda import topk_norm_loo_loss_increase
 
 
-def loo_loss_increase(xy, conics, feat, pixel_topk, target, eps, metric="l1", channel_weights=None):
+def loo_loss_increase(xy, conics, feat, pixel_topk, target, eps, metric="l1", transform=None):
     """
     Increase of the loss when removing each Gaussian on its own (leave-one-out), from the projected positions [N, 2], conics [N, 3], features
     [N, C], and top-K lists [H, W, K] of the rasterizer, against the target [C, H, W], in a single kernel (topk_norm_loo_loss_increase). The
     loss is the L1 loss (metric "l1") or the squared error summed over pixels and averaged over channels in 8-bit units (metric "sse").
     Removing Gaussian k from the top-K list of a pixel changes its value from S_f / (S_w + eps) to (S_f - w_k f_k) / (S_w - w_k + eps), where
     S_w and S_f are the sums of the top-K weights and weighted features. Ignores the Gaussian that would move into the top-K list. With
-    channel_weights [C], the channels are scaled by them, normalized to a mean square of 1, so that with equal weights the loss is that of
-    the unscaled channels.
+    transform [C, C], features and target are mapped by it first (rendering is linear in the features), e.g., YUV features to the space of
+    the losses (utils.color_utils.get_loss_transform).
     """
     num_channels, img_h, img_w = target.shape
-    scaled_target = target
-    if channel_weights is not None:
-        weights = channel_weights * torch.sqrt(num_channels / channel_weights.square().sum())
-        feat, scaled_target = feat * weights, target * weights[:, None, None]
-    increase = topk_norm_loo_loss_increase(img_h, img_w, xy, conics, feat.contiguous(), pixel_topk, scaled_target.contiguous(), metric == "sse",
-                                           eps)
+    if transform is not None:
+        feat, target = feat @ transform.T, torch.einsum("dc,chw->dhw", transform, target)
+    increase = topk_norm_loo_loss_increase(img_h, img_w, xy, conics, feat.contiguous(), pixel_topk, target.contiguous(), metric == "sse", eps)
     return increase * (255.0**2 / num_channels if metric == "sse" else 1.0 / target.numel())
 
 
@@ -74,12 +71,11 @@ def keep_gaussians(optimizer, keep):
     return params
 
 
-def add_probabilities(images, gt_images, channel_weights=None, from_rgb=None):
+def add_probabilities(images, gt_images, transform=None):
     """
     Sampling probabilities [H*W] of the pixels where Gaussians are added, and the error [C, H, W] of the rendered images [C, H, W] against
     the target gt_images [C, H, W] (both RGB, gamma-corrected), the target smoothed with a Gaussian whose kernel grows with the resolution:
-    the squared mean absolute error over the channels, in the color space of the features (from_rgb) with each channel scaled by
-    channel_weights if given.
+    the squared mean absolute error over the channels, mapped by transform [C, C] if given (e.g., to the space of the losses).
     """
     img_h, img_w = gt_images.shape[1:]
     kernel_size = round(np.sqrt(img_h * img_w) // 400)
@@ -88,8 +84,6 @@ def add_probabilities(images, gt_images, channel_weights=None, from_rgb=None):
         kernel_size = kernel_size + 1 if kernel_size % 2 == 0 else kernel_size
         gt_images = gaussian_blur(img=gt_images, kernel_size=kernel_size)
     diff_map = (gt_images - images).detach().clone()
-    if channel_weights is None:
-        error_map = torch.pow(torch.abs(diff_map).mean(dim=0).reshape(-1), 2.0)
-    else:
-        error_map = torch.pow((torch.abs(from_rgb(diff_map)) * channel_weights[:, None, None]).mean(dim=0).reshape(-1), 2.0)
+    error = diff_map if transform is None else torch.einsum("dc,chw->dhw", transform, diff_map)
+    error_map = torch.pow(torch.abs(error).mean(dim=0).reshape(-1), 2.0)
     return error_map / error_map.sum(), diff_map
