@@ -23,10 +23,12 @@ rot_step:              0.703125 # Rotation step in degrees
 feat_step:             0.015625 # Step of individual feature dimensions
 y_step:                0.015625 # Step of the Y feature dimension
 uv_step:               0.015625 # Step of individual U and V feature dimensions
+uv_step_ratio:         1.0 # With qp in YUV mode: the U and V step is this factor times the Y step that the qp sets (without qp, y_step and uv_step set both)
 feat_step_adapt:       "weight" # Per-Gaussian feature steps of the saved model with quant_mode "step" (optimization uses the uniform steps), valid values include "none", "area" (by Gaussian area), and "weight" (by the sum of the Gaussian's squared normalized blending weights over the pixels); computed from the quantized geometry, so decoders repeat them
 feat_step_gamma:       0.25 # feat_step_adapt multiplies the feature steps by (proxy / its geometric mean)^(-feat_step_gamma), snapped to powers of 2^(1/4) between 1/4 and 4
 
 wrap_rot:              False # Wrap Gaussian orientations to [0, pi) before quantization
+canonical_rot:         True # Store each Gaussian (saved model, bitstream, rate estimates) with its orientation in [-pi/4, pi/4]: rotated by a multiple of pi/2, with its axes swapped for odd multiples (the same ellipse), which makes the rotation cheaper to code; with a rot_step that divides 90 degrees, the quantization grid of the ellipses is unchanged, so optimization renders the rotation as it is
 bitstream_codec:       "rans" # Write a compressed bitstream of the quantized Gaussians after optimization (or with eval) and verify that it decodes losslessly, valid values include "none", "lzma", and "rans"
 color_transform:       "subtract-green" # Lossless transform of the quantized features before entropy coding (any bitstream_codec), valid values include "none" and "subtract-green" (R-G, G, B-G as in WebP lossless; color_space "rgb" only)
 
@@ -43,6 +45,7 @@ eval_steps:            100
 
 # Target images
 color_space:           "rgb" # Color space of Gaussian features and training losses, valid values include "yuv" and "rgb" (metrics and saved images are always RGB)
+uv_weight:             1.0 # YUV mode: scale of the U and V channels relative to Y in the training losses, the error of lambda pruning, and the error map that places added Gaussians (below 1 favors luma, e.g., for VMAF)
 gamma:                 1.0 # Optimize in a gamma-corrected space, modify with caution
 data_root:             "media"
 input_path:            "uvg/480p/Beauty_0001.png" # Path to an image file or a directory containing a texture stack
@@ -56,16 +59,17 @@ qp_overestimate:       0.6 # Factor on the number of Gaussians that paid off at 
 qp_lambda_scale:       4.0 # Factor on HEVC's lambda for pruning (with qp)
 qp_offset:             6.47 # The settings are derived at QP qp_offset + qp_slope * qp, so that the PSNR at a QP matches x265's (all-intra, qp=) at the same QP at encoding budgets of 2-4 s (with qp; 0 and 1 derive them at qp itself)
 qp_slope:              0.767 # See qp_offset
-init_scale:            2.25 # Initial Gaussian scale in number of pixels
-init_scale_knn:        0.0 # With a positive value: the initial scale of each Gaussian, also of those added by densification, is this factor times the RMS distance to its 3 nearest Gaussians in pixels instead of init_scale, so that sparse Gaussians cover the image from the start (0 uses init_scale)
-init_aspect:           1.0 # Maximum aspect ratio of initial and added Gaussians: elongated along the edges of the target by the coherence of its structure tensor, at the same area (1 keeps them isotropic)
+init_scale:            2.25 # Initial Gaussian scale in number of pixels (with init_scale_knn 0)
+init_scale_knn:        0.4 # With a positive value: the initial scale of each Gaussian, also of those added by densification, is this factor times the RMS distance to its 3 nearest Gaussians in pixels instead of init_scale, so that sparse Gaussians cover the image from the start (0 uses init_scale)
+init_fine_ratio:       0.5 # Fraction of the initial Gaussians placed on the strongest fine blobs of the target luma (determinant-of-Hessian maxima up to 1.4 px scale), isotropic at the blob's scale; the others are placed and sized as without it, among themselves (0 is off)
+init_aspect:           4.0 # Maximum aspect ratio of initial and added Gaussians: elongated along the edges of the target by the coherence of its structure tensor, at the same area (1 keeps them isotropic)
 topk:                  10 # Warning: Must match hardcoded value in CUDA kernel, modify with caution
 disable_topk_norm:     False # Disable top-K normalization
 disable_inverse_scale: False # Disable inverse Gaussian scale optimization
 max_scale:             0.0 # Upper bound of the Gaussian scales in pixels (0 disables it), enforced after each optimization step; large Gaussians slow down rasterization
 ckpt_file:             ""
 disable_color_init:    False
-add_color_init:        "residual" # Features of Gaussians added by densification, valid values include "residual" (the error of the rendered image at the pixel) and "target" (the target at the pixel, as at initialization)
+add_color_init:        "target" # Features of Gaussians added by densification, valid values include "residual" (the error of the rendered image at the pixel) and "target" (the target at the pixel, as at initialization)
 init_mode:             "gradient" # Gaussian position initialization mode, valid values include "gradient", "saliency", and "random"
 init_random_ratio:     0.3 # Ratio of Gaussians with randomly initialized position
 smap_filter_size:      20 # Gaussian filter size for smoothing saliency maps

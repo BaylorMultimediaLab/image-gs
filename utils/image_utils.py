@@ -77,6 +77,35 @@ def compute_structure_tensor(images, sigma):
     return tensor.squeeze(dim=1)
 
 
+def find_blobs(image, num, scales, max_scale):
+    """
+    The num strongest blobs of an image [H, W] with a scale of at most max_scale: maxima over position and the scales (pixels, ascending) of
+    the scale-normalized determinant of the Hessian sigma^4 (Lxx Lyy - Lxy^2) of the image smoothed with a Gaussian of each scale (repeating
+    the edge pixels). It peaks at the centre of bright and dark blobs, at the scale of a Gaussian blob's standard deviation, and is small on
+    edges. Pixel indices [M] (row-major, M <= num, strongest first) and scales [M] of the blobs.
+    """
+    responses = []
+    for sigma in scales:
+        radius = max(1, math.ceil(3.0 * sigma))
+        t = torch.arange(-radius, radius + 1, dtype=image.dtype, device=image.device)
+        kernel = torch.exp(-0.5 * (t / sigma) ** 2)
+        kernel = kernel / kernel.sum()
+        smooth = F.conv2d(F.pad(image[None, None], (radius, radius, 0, 0), mode="replicate"), kernel.view(1, 1, 1, -1))
+        smooth = F.conv2d(F.pad(smooth, (0, 0, radius, radius), mode="replicate"), kernel.view(1, 1, -1, 1))
+        p = F.pad(smooth, (1, 1, 1, 1), mode="replicate")[0, 0]
+        lxx = p[1:-1, 2:] - 2.0 * p[1:-1, 1:-1] + p[1:-1, :-2]
+        lyy = p[2:, 1:-1] - 2.0 * p[1:-1, 1:-1] + p[:-2, 1:-1]
+        lxy = 0.25 * (p[2:, 2:] - p[2:, :-2] - p[:-2, 2:] + p[:-2, :-2])
+        responses.append(sigma**4 * (lxx * lyy - lxy**2))
+    responses = torch.stack(responses)  # [S, H, W]
+    peaks = (responses == F.max_pool3d(responses[None, None], 3, stride=1, padding=1)[0, 0]) & (responses > 0.0)
+    peaks &= (torch.tensor(scales, device=image.device) <= max_scale)[:, None, None]
+    strength, level = torch.where(peaks, responses, 0.0).reshape(len(scales), -1).max(dim=0)  # One scale per pixel
+    pixels = strength.nonzero().squeeze(dim=1)
+    pixels = pixels[strength[pixels].argsort(descending=True)[:num]]
+    return pixels, torch.tensor(scales, dtype=image.dtype, device=image.device)[level[pixels]]
+
+
 def load_images(load_path, downsample_ratio=None, gamma=None):
     """
     Load target images or textures from a directory or a single file.

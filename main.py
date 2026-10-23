@@ -32,6 +32,8 @@ def get_gaussian_cfg(args):
         gaussian_cfg += f"-knn-{args.init_scale_knn:g}"
     if args.init_aspect > 1.0:
         gaussian_cfg += f"_aspect-{args.init_aspect:g}"
+    if args.init_fine_ratio > 0.0:
+        gaussian_cfg += f"_fine-{args.init_fine_ratio:g}"
     if args.add_color_init != "residual":
         gaussian_cfg += f"_add-{args.add_color_init}"
     if args.max_scale > 0.0:
@@ -44,8 +46,8 @@ def get_gaussian_cfg(args):
     if args.quant_mode == "step":
         feat_step = "qp" if args.qp > 0.0 else f"{args.feat_step:g}"
         gaussian_cfg += f"_steps-{args.pos_step:g}-{args.scale_step:g}-{args.rot_step:g}-{feat_step}"
-        if args.color_space == "yuv" and args.qp == 0.0:
-            gaussian_cfg += f"_yuv-{args.y_step:g}-{args.uv_step:g}"
+        if args.color_space == "yuv":
+            gaussian_cfg += f"_yuv-{args.y_step:g}-{args.uv_step:g}" if args.qp == 0.0 else f"_yuv-{args.uv_step_ratio:g}"
     else:
         gaussian_cfg += f"_bits-{args.pos_bits:d}-{args.scale_bits:d}-{args.rot_bits:d}-{args.feat_bits:d}"
         if args.color_space == "yuv":
@@ -55,8 +57,12 @@ def get_gaussian_cfg(args):
         gaussian_cfg += f"_rate-steps-{args.pos_step:g}-{args.scale_step:g}-{args.rot_step:g}-{feat_step}"
     if args.quant_mode != "none" and args.wrap_rot:
         gaussian_cfg += "_wrap-rot"
+    if args.canonical_rot:
+        gaussian_cfg += "_canonical-rot"
     if args.quant_mode == "step" and args.feat_step_adapt != "none":
         gaussian_cfg += f"_feat-adapt-{args.feat_step_adapt}-{args.feat_step_gamma:g}"
+    if args.color_space == "yuv" and args.uv_weight != 1.0:
+        gaussian_cfg += f"_uvw-{args.uv_weight:g}"
     if not args.disable_topk_norm:
         gaussian_cfg += f"_top-{args.topk:d}"
     gaussian_cfg += f"_{args.init_mode[0]}-{args.init_random_ratio:.1f}"
