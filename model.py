@@ -23,6 +23,7 @@ from compress.quantization import (
     FEAT_STEP_ADAPT_DIVISIONS,
     bitstream_meta,
     canonicalize,
+    dequantize,
     dequantize_symbols,
     estimate_symbol_bits,
     feat_step_multipliers,
@@ -33,6 +34,7 @@ from compress.quantization import (
     get_step_symbols,
     symbols_to_numpy,
 )
+from compress.rate import estimated_bits, rate_bits, rate_model
 from gsplat import (
     compute_cumulative_intersects,
     project_gaussians_2d_scale_rot,
@@ -513,6 +515,24 @@ class GaussianSplatting2D(nn.Module):
         self.l1_loss_ratio = args.l1_loss_ratio
         self.l2_loss_ratio = args.l2_loss_ratio
         self.ssim_loss_ratio = args.ssim_loss_ratio
+        # Rate term (compress.rate) with qp and quant_mode "step": rate_weight times the pruning lambda, converted from squared error per bit
+        # to L1 loss per bit
+        if args.rate_weight < 0.0:
+            raise ValueError(f"Rate weight must be non-negative but got: {args.rate_weight:g}")
+        self.rate_weight = args.rate_weight if args.qp > 0.0 and self.quant_mode == "step" else 0.0
+        if self.rate_weight > 0.0 and self.l1_loss_ratio <= 1e-7:
+            raise ValueError("rate_weight requires an L1 loss (set rate_weight 0 without one)")
+        if self.rate_weight > 0.0 and not self.canonical_rot:
+            raise ValueError("rate_weight requires canonical_rot (the rotation rate is that of canonical rotations; set rate_weight 0 without it)")
+        self.rate_lambda = args.prune_lambda
+        self.rate_color_refs = get_channel_refs(self.input_channels, self.color_transform)[3]
+        # Weights of the feature channels' bits: in YUV mode, U and V by rate_uv_weight (negative: uv_weight, so that chroma is traded off
+        # against its weight in the losses as in RGB mode)
+        self.rate_channel_weights = torch.ones(self.feat_dim, dtype=self.dtype, device=self.device)
+        if self.color_space == "yuv":
+            self.rate_channel_weights[self.uv_channels] = args.rate_uv_weight if args.rate_uv_weight >= 0.0 else self.uv_weight
+        self.rate_model, self.rate_key, self.rate_loss = None, None, None
+        self.rate_inv_rot_step = 1.0 / self.quant_steps[2] if self.rate_weight > 0.0 else None
 
     def _init_optimization(self, args):
         self.disable_tiles = args.disable_tiles
@@ -718,6 +738,25 @@ class GaussianSplatting2D(nn.Module):
             self.scale.copy_(scale if self.disable_inverse_scale else 1.0 / scale)
             self.rot.copy_(rot)
             self.feat.copy_(feat)
+
+    def _update_rate_model(self):
+        """
+        Fixed inputs of the rate term (compress.rate.rate_model: neighbors in bitstream order, Laplace scales per feature channel and per aspect
+        class of the rotation) from the current quantized Gaussians, written into the existing buffers while the number of Gaussians is
+        unchanged, so that a captured optimization step uses them.
+        """
+        with torch.no_grad():
+            symbols = self._get_symbols(self.xy, *self._canonicalize(self._get_scale(), self.rot), self.feat)
+            model = rate_model(symbols[0][0].cpu().numpy().astype(np.int64), self._dequantize_symbols(symbols)[3], dequantize(*symbols[1]),
+                               symbols[2][0][:, 0], self.rate_color_refs, self.feat_prediction_refs, self.quant_steps[3], self.dtype,
+                               self.device)
+            if self.rate_model is not None and self.rate_model[0].shape == model[0].shape:
+                for buffer, value in zip(self.rate_model, model):
+                    if isinstance(buffer, torch.Tensor):  # Not the channel operands, which never change
+                        buffer.copy_(value)
+            else:
+                self.rate_model = model
+            self.rate_key = (self.xy,)  # In a tuple, as a Parameter attribute would be registered as a parameter of the model
 
     def _estimate_bits(self):
         """
@@ -947,6 +986,8 @@ class GaussianSplatting2D(nn.Module):
         for step in range(self.start_step, self.max_steps+1):
             self.step = step
             step_begin = perf_counter()
+            if self.rate_weight > 0.0 and (self.rate_key is None or self.rate_key[0] is not self.xy):  # New Gaussians, before a capture
+                self._update_rate_model()
             if self.cuda_graph:
                 self._graph_step()
             else:
@@ -1028,6 +1069,12 @@ class GaussianSplatting2D(nn.Module):
                               f"(step {step:d}; eager step {eager:.3f} s, capture {seconds-eager:.3f} s)")
         self.worklog.info("***********************************************")
         self.worklog.info(f"Mean scale: {self._get_scale().mean().item():.4f} (pixel) | {self.scale.mean().item():.4f} (raw)")
+        if self.rate_weight > 0.0:
+            with torch.no_grad():
+                self._update_rate_model()
+                feat_bits, rot_bits = estimated_bits(self.feat, self.rot, self.rate_model, self.rate_inv_rot_step)
+            self.worklog.info(f"Rate term (weight {self.rate_weight:g}): estimated bits per Gaussian of the features "
+                              f"{feat_bits.item()/self.num_gaussians:.2f}, rotation by aspect class {rot_bits.item()/self.num_gaussians:.2f}")
         self.worklog.info("***********************************************")
         return self.psnr_curr, self.ssim_curr
 
@@ -1128,23 +1175,30 @@ class GaussianSplatting2D(nn.Module):
             self.ssim_loss = self.ssim_loss_ratio * (1 - ssim)
             self.l2_loss = None
             self.total_loss = self.l1_loss + self.ssim_loss
-            return
-        self.total_loss = 0
-        if self.l1_loss_ratio > 1e-7:
-            self.l1_loss = self.l1_loss_ratio * F.l1_loss(images, target_images)
-            self.total_loss += self.l1_loss
         else:
-            self.l1_loss = None
-        if self.l2_loss_ratio > 1e-7:
-            self.l2_loss = self.l2_loss_ratio * F.mse_loss(images, target_images)
-            self.total_loss += self.l2_loss
-        else:
-            self.l2_loss = None
-        if self.ssim_loss_ratio > 1e-7:
-            self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), target_images.unsqueeze(0)))
-            self.total_loss += self.ssim_loss
-        else:
-            self.ssim_loss = None
+            self.total_loss = 0
+            if self.l1_loss_ratio > 1e-7:
+                self.l1_loss = self.l1_loss_ratio * F.l1_loss(images, target_images)
+                self.total_loss += self.l1_loss
+            else:
+                self.l1_loss = None
+            if self.l2_loss_ratio > 1e-7:
+                self.l2_loss = self.l2_loss_ratio * F.mse_loss(images, target_images)
+                self.total_loss += self.l2_loss
+            else:
+                self.l2_loss = None
+            if self.ssim_loss_ratio > 1e-7:
+                self.ssim_loss = self.ssim_loss_ratio * (1 - fused_ssim(images.unsqueeze(0), target_images.unsqueeze(0)))
+                self.total_loss += self.ssim_loss
+            else:
+                self.ssim_loss = None
+        if self.rate_weight > 0.0:
+            # Lambda is the increase of the squared error (8-bit units, summed over pixels) per bit; near the current mean absolute error,
+            # a squared error increase dSSE changes the L1 loss by dSSE / (2 255^2 pixels L1)
+            l1 = (self.l1_loss / self.l1_loss_ratio).detach().clamp(min=1e-4)
+            bits = rate_bits(self.feat, self.rot, self.rate_model, self.rate_inv_rot_step, self.rate_channel_weights)
+            self.rate_loss = self.rate_weight * self.rate_lambda / (2.0 * 255.0**2 * self.num_pixels * l1) * (bits[0] + bits[1])
+            self.total_loss = self.total_loss + self.rate_loss
 
     def _evaluate(self, log=True, upsample=False, images=None):
         """
@@ -1247,6 +1301,8 @@ class GaussianSplatting2D(nn.Module):
             self.decay_times = 1
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] /= self.decay_ratio
+            if self.rate_weight > 0.0:
+                self._update_rate_model()  # The Gaussians have moved since the last pruning round
             self.worklog.info(f"Step: {self.step:d} | Learning rate decayed by {self.decay_ratio:.1f} after {self.total_time_accum:.2f} s")
             self.worklog.info("***********************************************")
         if self.total_time_accum >= self.max_time:

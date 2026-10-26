@@ -14,6 +14,8 @@ def get_gaussian_cfg(args):
             gaussian_cfg += f"-lam-x{args.qp_lambda_scale:g}"
         if args.prune_add_ratio > 0.0:
             gaussian_cfg += f"-add-{args.prune_add_ratio:g}"
+        if args.rate_weight > 0.0 and args.quant_mode == "step":
+            gaussian_cfg += f"_rw-{args.rate_weight:g}" + (f"-uv-{args.rate_uv_weight:g}" if args.rate_uv_weight >= 0.0 else "")
     else:
         gaussian_cfg = f"num-{args.num_gaussians:d}"
         if args.prune_mode == "lambda":

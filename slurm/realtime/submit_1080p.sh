@@ -1,6 +1,6 @@
 #!/bin/bash
 # Quick time-to-HEVC sweep at 1080p on the A100 debug partition, as one job that runs its tasks one after the other (no array): the default
-# configuration (fine-blob init, YUV features with luma weighting, feature prediction; the sweep arms pin RGB, so this sets color_space yuv as
+# configuration (fine-blob init, YUV features with luma weighting, feature prediction, rate term; the sweep arms pin RGB, so this sets color_space yuv as
 # submit_yuv.sh's yuv-w0.25-r2) on the three UVG frames at their source resolution, QP 22-37, budgets 0.5-4 s: 12 tasks of ~15 s each
 # (a warm-up encode and four budgets), a few minutes in all.
 # The frames are media/uvg/1080p/<image>.png (frame 1 of the UVG 1920x1080 PNGs, from which media/uvg/480p and 720p are downsampled); media/

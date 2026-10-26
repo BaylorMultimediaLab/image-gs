@@ -60,6 +60,8 @@ num_gaussians:         1000 # Number of Gaussians (with qp 0; e.g., "--qp 0 --nu
 qp:                    32.0 # Quantization parameter as in HEVC (0 disables it and uses num_gaussians); sets num_gaussians, prune_mode "lambda", prune_lambda, and the feature steps
 qp_overestimate:       0.6 # Factor on the number of Gaussians that paid off at most for the test images at the QP (with qp)
 qp_lambda_scale:       4.0 # Factor on HEVC's lambda for pruning (with qp)
+rate_weight:           0.5 # With qp and quant_mode "step": weight of a rate term in the training loss, relative to the pruning lambda (converted from squared error to the L1 loss at its current value): estimated bits of the features as residuals of their prediction and of the canonical rotations by aspect class (compress.rate), 0 is off
+rate_uv_weight:        -1.0 # YUV mode with rate_weight: weight of the U and V bits in the rate term (negative: uv_weight, which trades chroma off as in RGB mode; 1 counts their bits fully, which VMAF does not see)
 qp_offset:             6.47 # The settings are derived at QP qp_offset + qp_slope * qp, so that the PSNR at a QP matches x265's (all-intra, qp=) at the same QP at encoding budgets of 2-4 s (with qp; 0 and 1 derive them at qp itself)
 qp_slope:              0.767 # See qp_offset
 init_scale:            2.25 # Initial Gaussian scale in number of pixels (with init_scale_knn 0)

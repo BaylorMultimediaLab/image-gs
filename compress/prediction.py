@@ -47,6 +47,14 @@ def fixed_point_steps(steps, exponents):
     return np.rint(np.ldexp(ratios[None, :] * QUARTER_POWERS[exponents % 4], FRAC_BITS + exponents // 4)).astype(np.int64)
 
 
+def causal_neighbors(positions):
+    """
+    The NUM_NEIGHBORS nearest earlier Gaussians of each Gaussian (integer positions [P, 2] in bitstream order) that predict_residuals predicts
+    from: indices [P, NUM_NEIGHBORS] (int64), -1 for none.
+    """
+    return _prediction.causal_neighbors(np.ascontiguousarray(positions, dtype=np.int64))
+
+
 def predict_residuals(indices, steps, exponents, positions, color_refs, pred_refs):
     """
     Residual indices [P, C] to code instead of the indices [P, C] of Gaussians in bitstream order (integer positions [P, 2]), with the
