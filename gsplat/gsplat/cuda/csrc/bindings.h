@@ -241,3 +241,30 @@ torch::Tensor topk_norm_loo_loss_increase_tensor(
     const bool squared,
     const double eps
 );
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rate_loss_forward_tensor(
+    const torch::Tensor &feat,
+    const torch::Tensor &rot,
+    const torch::Tensor &l1_loss,
+    const torch::Tensor &neighbors,
+    const torch::Tensor &weights,
+    const torch::Tensor &slope,
+    const std::vector<int64_t> &color_refs,
+    const std::vector<int64_t> &pred_refs,
+    const torch::Tensor &inv_steps,
+    const torch::Tensor &feat_coeffs,
+    const torch::Tensor &rot_coeffs,
+    const double inv_rot_step,
+    const double l1_ratio,
+    const double factor
+);
+
+std::tuple<torch::Tensor, torch::Tensor> rate_loss_backward_tensor(
+    const torch::Tensor &grad_loss,
+    const torch::Tensor &loss_weight,
+    const torch::Tensor &own_grad,
+    const torch::Tensor &rot_grad,
+    const torch::Tensor &offsets,
+    const torch::Tensor &sources,
+    const torch::Tensor &source_weights
+);

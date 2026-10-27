@@ -9,6 +9,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("nd_rasterize_forward_topk_norm",  &nd_rasterize_forward_topk_norm_tensor);
     m.def("nd_rasterize_backward_topk_norm", &nd_rasterize_backward_topk_norm_tensor);
     m.def("topk_norm_loo_loss_increase", &topk_norm_loo_loss_increase_tensor);
+    m.def("rate_loss_forward", &rate_loss_forward_tensor);
+    m.def("rate_loss_backward", &rate_loss_backward_tensor);
 
     m.def("nd_rasterize_forward_no_tiles", &nd_rasterize_forward_no_tiles_tensor);
     m.def("nd_rasterize_backward_no_tiles", &nd_rasterize_backward_no_tiles_tensor);

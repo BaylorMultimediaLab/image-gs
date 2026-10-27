@@ -34,7 +34,7 @@ from compress.quantization import (
     get_step_symbols,
     symbols_to_numpy,
 )
-from compress.rate import estimated_bits, rate_bits, rate_model
+from compress.rate import estimated_bits, rate_loss, rate_model
 from gsplat import (
     compute_cumulative_intersects,
     project_gaussians_2d_scale_rot,
@@ -532,7 +532,7 @@ class GaussianSplatting2D(nn.Module):
         if self.color_space == "yuv":
             self.rate_channel_weights[self.uv_channels] = args.rate_uv_weight if args.rate_uv_weight >= 0.0 else self.uv_weight
         self.rate_model, self.rate_key, self.rate_loss = None, None, None
-        self.rate_inv_rot_step = 1.0 / self.quant_steps[2] if self.rate_weight > 0.0 else None
+        self.rate_inv_rot_step = 1.0 / self.quant_steps[2].item() if self.rate_weight > 0.0 else None
 
     def _init_optimization(self, args):
         self.disable_tiles = args.disable_tiles
@@ -748,11 +748,11 @@ class GaussianSplatting2D(nn.Module):
         with torch.no_grad():
             symbols = self._get_symbols(self.xy, *self._canonicalize(self._get_scale(), self.rot), self.feat)
             model = rate_model(symbols[0][0].cpu().numpy().astype(np.int64), self._dequantize_symbols(symbols)[3], dequantize(*symbols[1]),
-                               symbols[2][0][:, 0], self.rate_color_refs, self.feat_prediction_refs, self.quant_steps[3], self.dtype,
-                               self.device)
-            if self.rate_model is not None and self.rate_model[0].shape == model[0].shape:
+                               symbols[2][0][:, 0], self.rate_color_refs, self.feat_prediction_refs, self.quant_steps[3],
+                               self.rate_channel_weights, self.dtype, self.device)
+            if self.rate_model is not None and self.rate_model.neighbors.shape == model.neighbors.shape:
                 for buffer, value in zip(self.rate_model, model):
-                    if isinstance(buffer, torch.Tensor):  # Not the channel operands, which never change
+                    if isinstance(buffer, torch.Tensor):  # Not the channel references, which never change
                         buffer.copy_(value)
             else:
                 self.rate_model = model
@@ -1195,9 +1195,8 @@ class GaussianSplatting2D(nn.Module):
         if self.rate_weight > 0.0:
             # Lambda is the increase of the squared error (8-bit units, summed over pixels) per bit; near the current mean absolute error,
             # a squared error increase dSSE changes the L1 loss by dSSE / (2 255^2 pixels L1)
-            l1 = (self.l1_loss / self.l1_loss_ratio).detach().clamp(min=1e-4)
-            bits = rate_bits(self.feat, self.rot, self.rate_model, self.rate_inv_rot_step, self.rate_channel_weights)
-            self.rate_loss = self.rate_weight * self.rate_lambda / (2.0 * 255.0**2 * self.num_pixels * l1) * (bits[0] + bits[1])
+            self.rate_loss = rate_loss(self.feat, self.rot, self.l1_loss, self.rate_model, self.rate_inv_rot_step, self.l1_loss_ratio,
+                                       self.rate_weight * self.rate_lambda / (2.0 * 255.0**2 * self.num_pixels))
             self.total_loss = self.total_loss + self.rate_loss
 
     def _evaluate(self, log=True, upsample=False, images=None):

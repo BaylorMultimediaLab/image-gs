@@ -11,10 +11,16 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <thread>
 #include <vector>
+
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 #ifndef SOURCE_HASH
 #define SOURCE_HASH "unknown"
@@ -28,6 +34,8 @@ constexpr int NUM_NEIGHBORS = 8;
 constexpr int64_t MIN_CCLM_NEIGHBORS = 3;  // Fewer neighbors predict from their mean
 constexpr double MAX_SLOPE = 4.0;
 constexpr double POINTS_PER_CELL = 2.0;   // Of the search grid
+constexpr int64_t QUERIES_PER_TASK = 256;  // Gaussians per task of the neighbor search
+constexpr int64_t MIN_QUERIES_PER_THREAD = 1024;  // Fewer Gaussians per thread are searched by fewer threads
 
 using IntArray = py::array_t<int64_t, py::array::c_style | py::array::forcecast>;
 
@@ -40,10 +48,22 @@ struct Candidate {
     }
 };
 
+// Threads of the neighbor search: the CPUs this process may run on
+int available_threads() {
+#ifdef __linux__
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        return std::max(1, CPU_COUNT(&set));
+    }
+#endif
+    return std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+}
+
 // The NUM_NEIGHBORS nearest earlier Gaussians of each Gaussian (integer positions [P, 2] in bitstream order), by squared distance and then
-// by index, -1 where there are fewer: a uniform grid holds the Gaussians before the current one, and square rings of cells around it are
-// searched until no cell of the next ring can hold a nearer Gaussian (the ring at Chebyshev cell distance r >= 1 is at least
-// (r - 1) * cell + 1 away)
+// by index, -1 where there are fewer: a uniform grid holds all Gaussians, each cell in increasing index order, and square rings of cells
+// around a Gaussian are searched (each cell up to the Gaussian's own index, so only earlier ones) until no cell of the next ring can hold a
+// nearer one (the ring at Chebyshev cell distance r >= 1 is at least (r - 1) * cell + 1 away). The Gaussians are searched in parallel in
+// tasks of QUERIES_PER_TASK; each one's result depends only on the positions.
 std::vector<int64_t> causal_neighbors(const int64_t* positions, int64_t num) {
     std::vector<int64_t> neighbors(num * NUM_NEIGHBORS, -1);
     if (num == 0) {
@@ -59,10 +79,20 @@ std::vector<int64_t> causal_neighbors(const int64_t* positions, int64_t num) {
     const double area = static_cast<double>(max_x - min_x + 1) * static_cast<double>(max_y - min_y + 1);
     const int64_t cell = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(std::sqrt(POINTS_PER_CELL * area / static_cast<double>(num)))));
     const int64_t grid_w = (max_x - min_x) / cell + 1, grid_h = (max_y - min_y) / cell + 1;
-    std::vector<std::vector<int64_t>> grid(grid_w * grid_h);
-    std::vector<Candidate> best;
-    best.reserve(NUM_NEIGHBORS + 1);
+    // Members of each cell (counting sort by cell, in increasing index order): members[cell_start[c]:cell_start[c + 1]]
+    std::vector<int64_t> cell_of(num), cell_start(grid_w * grid_h + 1, 0), members(num);
     for (int64_t i = 0; i < num; ++i) {
+        cell_of[i] = (positions[2 * i + 1] - min_y) / cell * grid_w + (positions[2 * i] - min_x) / cell;
+        ++cell_start[cell_of[i] + 1];
+    }
+    for (int64_t c = 0; c < grid_w * grid_h; ++c) {
+        cell_start[c + 1] += cell_start[c];
+    }
+    std::vector<int64_t> fill(cell_start.begin(), cell_start.end() - 1);
+    for (int64_t i = 0; i < num; ++i) {
+        members[fill[cell_of[i]]++] = i;
+    }
+    auto search = [&](int64_t i, std::vector<Candidate>& best) {
         const int64_t x = positions[2 * i], y = positions[2 * i + 1];
         const int64_t cx = (x - min_x) / cell, cy = (y - min_y) / cell;
         best.clear();
@@ -81,7 +111,9 @@ std::vector<int64_t> causal_neighbors(const int64_t* positions, int64_t num) {
                     if (gx < 0 || gx >= grid_w) {
                         continue;
                     }
-                    for (int64_t j : grid[gy * grid_w + gx]) {
+                    const int64_t c = gy * grid_w + gx;
+                    for (int64_t m = cell_start[c]; m < cell_start[c + 1] && members[m] < i; ++m) {
+                        const int64_t j = members[m];
                         const int64_t dx = positions[2 * j] - x, dy = positions[2 * j + 1] - y;
                         const Candidate candidate{dx * dx + dy * dy, j};
                         if (static_cast<int64_t>(best.size()) < NUM_NEIGHBORS || candidate < best.back()) {
@@ -97,7 +129,25 @@ std::vector<int64_t> causal_neighbors(const int64_t* positions, int64_t num) {
         for (size_t n = 0; n < best.size(); ++n) {
             neighbors[i * NUM_NEIGHBORS + n] = best[n].index;
         }
-        grid[cy * grid_w + cx].push_back(i);
+    };
+    std::atomic<int64_t> next_task{0};
+    auto worker = [&]() {
+        std::vector<Candidate> best;
+        best.reserve(NUM_NEIGHBORS + 1);
+        for (int64_t start = next_task.fetch_add(QUERIES_PER_TASK); start < num; start = next_task.fetch_add(QUERIES_PER_TASK)) {
+            for (int64_t i = start; i < std::min(num, start + QUERIES_PER_TASK); ++i) {
+                search(i, best);
+            }
+        }
+    };
+    const int64_t num_threads = std::max<int64_t>(1, std::min<int64_t>(available_threads(), num / MIN_QUERIES_PER_THREAD));
+    std::vector<std::thread> threads;
+    for (int64_t t = 1; t < num_threads; ++t) {
+        threads.emplace_back(worker);
+    }
+    worker();
+    for (std::thread& thread : threads) {
+        thread.join();
     }
     return neighbors;
 }

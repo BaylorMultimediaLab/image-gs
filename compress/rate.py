@@ -2,22 +2,44 @@
 Differentiable rate estimates of the Gaussian parameters for a rate term in the training loss: code lengths in bits under discretized
 Laplace distributions of the features as residuals of their prediction (as compress.prediction codes them) and of the canonical rotations
 around zero with one scale per aspect-ratio class (the context a coder would take from the decoded scales). The neighbors, the aspect
-classes, and the distribution scales come from the current parameters and are held fixed between updates (rate_model), so that the estimate
-fits into a captured optimization step with few kernels.
+classes, and the distribution scales come from the current parameters and are held fixed between updates (rate_model). The training loss
+takes the rate from fused CUDA kernels (rate_loss, gsplat/cuda/csrc/rate.cu), which compute rate_bits in three kernels, so that the term
+costs little in a captured optimization step.
 """
 import math
+from typing import NamedTuple
 
 import numpy as np
 import torch
 
 from compress.common import morton_order
 from compress.prediction import NUM_NEIGHBORS, causal_neighbors
+from gsplat.cuda import rate_loss_backward, rate_loss_forward
 
 # Aspect-ratio classes of the rotation: boundaries of |log2 s0 - log2 s1| in octaves (aspect ratios 1.19, 1.41, 2, 4)
 ASPECT_BOUNDARIES = (0.25, 0.5, 1.0, 2.0)
 MIN_SCALE = 0.3  # Lower bound of the distribution scales in quantization steps
 MIN_CCLM_NEIGHBORS = 3  # As compress/csrc/prediction.cpp
 MAX_SLOPE = 4.0
+
+
+class RateModel(NamedTuple):
+    """
+    Fixed inputs of the rate estimates (rate_model), for P Gaussians with C feature channels and K neighbors each.
+    """
+    neighbors: torch.Tensor  # [P, K] int32, missing ones clamped to 0
+    weights: torch.Tensor  # [P, K]: 1 / the number of neighbors, 0 for missing ones
+    slope: torch.Tensor  # [P, C]: CCLM slopes, 0 without a prediction reference
+    inv_steps: torch.Tensor  # [C]: inverse quantization steps
+    inv_feat: torch.Tensor  # [C]: 1 / (scale ln 2) of the feature channels
+    feat_coeffs: torch.Tensor  # [C]: inv_feat times the channel weights of the rate term
+    inv_rot: torch.Tensor  # [P, 1]: 1 / (scale ln 2) of each Gaussian's rotation by its aspect class
+    offsets: torch.Tensor  # [P + 1] int32: the Gaussians that predict from Gaussian j are sources[offsets[j]:offsets[j + 1]]
+    sources: torch.Tensor  # [E] int32
+    source_weights: torch.Tensor  # [E]: their weights of Gaussian j
+    operands: tuple  # channel_operands
+    color_refs: tuple  # Per channel, the channel subtracted from it before the prediction (-1: none)
+    pred_channels: tuple  # Per channel, the reference channel of its CCLM term (itself without one)
 
 
 def laplace_bits(x, scale):
@@ -85,20 +107,35 @@ def smooth_laplace_bits(x, inv_scale_ln2):
     """
     Code length in bits of x (in quantization steps) under a Laplace distribution with 1 / (scale ln 2) = inv_scale_ln2, without its constant
     log2(2 scale) and smoothed within half a step of zero (where the discretized distribution is flat): (sqrt(x^2 + 1/4) - 1/2) / (scale ln 2).
-    For the gradients of a rate term: the same slope as laplace_bits away from zero, in a few kernels.
+    For the gradients of a rate term: the same slope as laplace_bits away from zero.
     """
     return (torch.sqrt(x.square() + 0.25) - 0.5) * inv_scale_ln2
 
 
-def rate_model(q_xy, feat, log2_scale, q_rot, color_refs, pred_refs, steps, dtype, device):
+def predicting_sources(neighbors, dtype):
     """
-    The fixed inputs of rate_bits from the current quantized Gaussians: integer positions q_xy [P, 2] (numpy int64), dequantized features
-    [P, C] (the uniform steps [C]), canonical log2 scales [P, 2], and rotation indices [P]. Returns (neighbors [P, K] clamped, their weights
-    [P, K], the CCLM slopes [P, C], channel_operands, the inverse steps [C], 1 / (scale ln 2) of the feature channels [C], and of each
-    Gaussian's rotation [P, 1] by its aspect class), each scale the maximum-likelihood one (mean absolute residual index, at least MIN_SCALE).
+    For each Gaussian, the Gaussians that predict from it, from the neighbors [P, K] (-1 for none): offsets [P + 1] and sources [E] (int32, in
+    increasing order per Gaussian) and their weights of it [E] (1 / their number of neighbors), as RateModel.
+    """
+    num = len(neighbors)
+    valid = neighbors >= 0
+    rows = torch.arange(num, device=neighbors.device)[:, None].expand_as(neighbors)[valid]  # Row-major, so in increasing order
+    targets = neighbors[valid]
+    sources = rows[torch.argsort(targets, stable=True)]
+    offsets = torch.zeros(num + 1, dtype=torch.int64, device=neighbors.device)
+    offsets[1:] = torch.cumsum(torch.bincount(targets, minlength=num), dim=0)
+    return offsets.to(torch.int32), sources.to(torch.int32), 1.0 / valid.sum(dim=1)[sources].to(dtype)
+
+
+def rate_model(q_xy, feat, log2_scale, q_rot, color_refs, pred_refs, steps, channel_weights, dtype, device):
+    """
+    The fixed inputs of the rate estimates (RateModel) from the current quantized Gaussians: integer positions q_xy [P, 2] (numpy int64),
+    dequantized features [P, C] (the uniform steps [C]), canonical log2 scales [P, 2], and rotation indices [P], with the weights of the feature
+    channels' bits [C]. Each distribution scale is the maximum-likelihood one (mean absolute residual index, at least MIN_SCALE).
     """
     with torch.no_grad():
         neighbors = torch.from_numpy(bitstream_neighbors(q_xy)).to(device)
+        offsets, sources, source_weights = predicting_sources(neighbors, dtype)
         valid = (neighbors >= 0).to(dtype)
         count = valid.sum(dim=1, keepdim=True)
         weights = valid / count.clamp(min=1.0)
@@ -114,35 +151,61 @@ def rate_model(q_xy, feat, log2_scale, q_rot, color_refs, pred_refs, steps, dtyp
         slope = (cov / (var + steps.square())).clamp(-MAX_SLOPE, MAX_SLOPE) * has_ref * (count >= MIN_CCLM_NEIGHBORS)
         inv_steps = 1.0 / steps
         residuals = torch.round(feature_residuals(feat, neighbors, weights, slope, operands, inv_steps))
-        feat_scales = residuals.abs().mean(dim=0).clamp(min=MIN_SCALE)
+        inv_feat = 1.0 / (residuals.abs().mean(dim=0).clamp(min=MIN_SCALE) * math.log(2.0))
         boundaries = torch.tensor(ASPECT_BOUNDARIES, dtype=log2_scale.dtype, device=device)
         classes = torch.bucketize((log2_scale[:, 0] - log2_scale[:, 1]).abs(), boundaries)
         sums = torch.zeros(len(ASPECT_BOUNDARIES) + 1, dtype=dtype, device=device).index_add_(0, classes, q_rot.abs().to(dtype))
         counts = torch.bincount(classes, minlength=len(ASPECT_BOUNDARIES) + 1).to(dtype)
         class_scales = torch.where(counts > 0, sums / counts.clamp(min=1.0), q_rot.abs().to(dtype).mean()).clamp(min=MIN_SCALE)
-        return (neighbors, weights, slope, operands, inv_steps, 1.0 / (feat_scales * math.log(2.0)),
-                1.0 / (class_scales[classes][:, None] * math.log(2.0)))
+        return RateModel(neighbors.to(torch.int32), weights, slope, inv_steps, inv_feat, inv_feat * channel_weights,
+                         1.0 / (class_scales[classes][:, None] * math.log(2.0)), offsets, sources, source_weights, operands,
+                         tuple(int(ref) for ref in color_refs), tuple(c if ref < 0 else int(ref) for c, ref in enumerate(pred_refs)))
 
 
-def rate_bits(feat, rot, model, inv_rot_step, channel_weights):
+def rate_bits(feat, rot, model, inv_rot_step):
     """
     Differentiable estimate of the coded size in bits (smooth_laplace_bits, without constants) of the features [P, C] (residuals of their
-    prediction, each channel's bits times channel_weights [C]) and of the rotations [P, 1] (canonical, by aspect class), with the fixed inputs
-    of rate_model. Returns both totals.
+    prediction, each channel's bits times its channel weight) and of the rotations [P, 1] (canonical, by aspect class), with the fixed inputs of
+    rate_model, in PyTorch operations: the definition of what the kernels of rate_loss compute. Returns both totals.
     """
-    neighbors, weights, slope, operands, inv_steps, inv_feat, inv_rot = model
-    residuals = feature_residuals(feat, neighbors, weights, slope, operands, inv_steps)
-    feat_bits = (smooth_laplace_bits(residuals, inv_feat * channel_weights)).sum()
-    return feat_bits, smooth_laplace_bits(canonical_rotation(rot, inv_rot_step), inv_rot).sum()
+    residuals = feature_residuals(feat, model.neighbors, model.weights, model.slope, model.operands, model.inv_steps)
+    feat_bits = smooth_laplace_bits(residuals, model.feat_coeffs).sum()
+    return feat_bits, smooth_laplace_bits(canonical_rotation(rot, inv_rot_step), model.inv_rot).sum()
+
+
+class _RateLoss(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, feat, rot, l1_loss, model, inv_rot_step, l1_ratio, factor):
+        loss, loss_weight, own_grad, rot_grad = rate_loss_forward(
+            feat.contiguous(), rot.contiguous(), l1_loss.contiguous(), model.neighbors, model.weights, model.slope, list(model.color_refs),
+            list(model.pred_channels), model.inv_steps, model.feat_coeffs, model.inv_rot, inv_rot_step, l1_ratio, factor)
+        ctx.save_for_backward(loss_weight, own_grad, rot_grad)
+        ctx.model, ctx.rot_shape = model, rot.shape
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss):
+        loss_weight, own_grad, rot_grad = ctx.saved_tensors
+        model = ctx.model
+        grad_feat, grad_rot = rate_loss_backward(grad_loss.contiguous(), loss_weight, own_grad, rot_grad, model.offsets, model.sources,
+                                                 model.source_weights)
+        return grad_feat, grad_rot.view(ctx.rot_shape), None, None, None, None, None
+
+
+def rate_loss(feat, rot, l1_loss, model, inv_rot_step, l1_ratio, factor):
+    """
+    The rate term factor / max(l1_loss / l1_ratio, 1e-4) times the sum of rate_bits, with the L1 loss (a 0-dim tensor) treated as a constant,
+    in fused CUDA kernels (float32): a 0-dim tensor, differentiable with respect to the features and rotations.
+    """
+    return _RateLoss.apply(feat, rot, l1_loss.detach(), model, inv_rot_step, l1_ratio, factor)
 
 
 def estimated_bits(feat, rot, model, inv_rot_step):
     """
     Code lengths in bits (laplace_bits) of the features and rotations under the distributions of rate_model, for logging: both totals.
     """
-    neighbors, weights, slope, operands, inv_steps, inv_feat, inv_rot = model
     with torch.no_grad():
-        residuals = feature_residuals(feat, neighbors, weights, slope, operands, inv_steps)
-        feat_bits = laplace_bits(residuals, 1.0 / (inv_feat * math.log(2.0))).sum()
-        rot_bits = laplace_bits(canonical_rotation(rot, inv_rot_step), 1.0 / (inv_rot * math.log(2.0))).sum()
+        residuals = feature_residuals(feat, model.neighbors, model.weights, model.slope, model.operands, model.inv_steps)
+        feat_bits = laplace_bits(residuals, 1.0 / (model.inv_feat * math.log(2.0))).sum()
+        rot_bits = laplace_bits(canonical_rotation(rot, inv_rot_step), 1.0 / (model.inv_rot * math.log(2.0))).sum()
     return feat_bits, rot_bits

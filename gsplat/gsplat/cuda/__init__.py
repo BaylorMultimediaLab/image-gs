@@ -23,6 +23,8 @@ nd_rasterize_backward_simple = _make_lazy_cuda_func("nd_rasterize_backward_simpl
 nd_rasterize_forward_topk_norm = _make_lazy_cuda_func("nd_rasterize_forward_topk_norm")
 nd_rasterize_backward_topk_norm = _make_lazy_cuda_func("nd_rasterize_backward_topk_norm")
 topk_norm_loo_loss_increase = _make_lazy_cuda_func("topk_norm_loo_loss_increase")
+rate_loss_forward = _make_lazy_cuda_func("rate_loss_forward")
+rate_loss_backward = _make_lazy_cuda_func("rate_loss_backward")
 
 rasterize_forward = _make_lazy_cuda_func("rasterize_forward")
 rasterize_backward = _make_lazy_cuda_func("rasterize_backward")
