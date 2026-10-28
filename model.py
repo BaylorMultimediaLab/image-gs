@@ -58,7 +58,7 @@ from utils.image_utils import (
     visualize_gaussian_footprint,
     visualize_gaussian_position,
 )
-from utils.init_utils import STRUCTURE_TENSOR_SIGMA, find_fine_blobs, initial_shapes
+from utils.init_utils import STRUCTURE_TENSOR_SIGMA, find_fine_blobs, initial_shapes, local_std_density
 from utils.misc_utils import clean_dir, get_latest_ckpt_step, save_cfg, set_random_seed
 from utils.saliency_utils import get_smap
 from utils.stall_utils import StallTracer
@@ -603,6 +603,8 @@ class GaussianSplatting2D(nn.Module):
                 self.smap_filter_size = args.smap_filter_size
                 self._compute_smap(path="models")
                 xy = self._sample_pos(prob=self.saliency, num=num)
+            elif self.init_mode == 'local-std':
+                xy = self._sample_pos(prob=local_std_density(images, args.init_std_gamma), num=num)
             else:
                 xy = self.pixel_xy.detach().clone()[self._sample_pixels(num)]
             # Scale and rotation: the others' from their spacing among themselves, the fine Gaussians isotropic at their blob's scale

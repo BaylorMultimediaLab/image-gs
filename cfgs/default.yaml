@@ -75,8 +75,9 @@ max_scale:             0.0 # Upper bound of the Gaussian scales in pixels (0 dis
 ckpt_file:             ""
 disable_color_init:    False
 add_color_init:        "target" # Features of Gaussians added by densification, valid values include "residual" (the error of the rendered image at the pixel) and "target" (the target at the pixel, as at initialization)
-init_mode:             "gradient" # Gaussian position initialization mode, valid values include "gradient", "saliency", and "random"
-init_random_ratio:     0.3 # Ratio of Gaussians with randomly initialized position
+init_mode:             "local-std" # Gaussian position initialization mode (of the Gaussians other than the fine blobs), valid values include "gradient" (density by the squared image gradient), "saliency", "random", and "local-std" (density by the local luma standard deviation to the power init_std_gamma, about the allocation that optimization ends with at every rate; with init_fine_ratio 0, one population whose spacing sets the scales at every scale)
+init_std_gamma:        0.8 # init_mode "local-std": exponent of the local standard deviation in the density of initial positions
+init_random_ratio:     0.0 # Share of the Gaussians other than the fine blobs placed uniformly at random instead of by init_mode
 smap_filter_size:      20 # Gaussian filter size for smoothing saliency maps
 
 # Loss functions

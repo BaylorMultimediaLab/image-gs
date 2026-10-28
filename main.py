@@ -72,6 +72,8 @@ def get_gaussian_cfg(args):
     if not args.disable_topk_norm:
         gaussian_cfg += f"_top-{args.topk:d}"
     gaussian_cfg += f"_{args.init_mode[0]}-{args.init_random_ratio:.1f}"
+    if args.init_mode == "local-std":
+        gaussian_cfg += f"-g{args.init_std_gamma:g}"
     return gaussian_cfg
 
 
