@@ -1,6 +1,7 @@
 """
 Encoding time at which image-gs overtakes HEVC: RD curves of rate-control arms at a series of time budgets in real-time mode (wall-clock
-budgets, persistent process), at 480p/720p on the UVG test frames (or at 1080p, their source resolution, with the QP arms or --rates).
+budgets, persistent process), at 480p/720p on the UVG test frames (or at 1080p and 2160p, the UVG source resolutions, with the QP
+arms or --rates).
 Arms (settings loaded from the earlier sweeps):
   fixed-n            fixed numbers of Gaussians, 10% pruned at 1/6 of the budget (slurm/lowres/sweep.py, arm step-feat64)
   fixed-n-noprune    the same without pruning (no rounds, so no CUDA graph recaptures either)
@@ -27,6 +28,8 @@ Locally:  slurm/realtime/sweep.py --phase <name> [--res ...] [--images ...] [--a
           --set overrides a setting of every arm, e.g., --set cuda_graph=true)
 Slurm:    slurm/realtime/sweep.py --task <i> [...]   runs only task i (one per array task, see slurm/realtime/sweep.slurm)
 Count:    slurm/realtime/sweep.py --count [...]      prints the number of tasks (the array size)
+          slurm/realtime/sweep.py --minutes [...]    prints the minutes that all tasks take one after another (an upper estimate, for the
+                                                     time limit of a single job)
 Analysis: .venv/bin/python experiments/realtime/analyze.py <phase> [<phase> ...]
           experiments/realtime/qp_refit.py <phase> (QP remap to x265's quality, from a dense grid of --rates)
           experiments/realtime/stalls.py <phase> (stalls traced with --set stall_trace=<seconds>)
@@ -34,6 +37,7 @@ Analysis: .venv/bin/python experiments/realtime/analyze.py <phase> [<phase> ...]
 import argparse
 import csv
 import importlib.util
+import math
 import os
 import socket
 import sys
@@ -52,9 +56,10 @@ def load_module(name, path):
 LOWRES = load_module("lowres_sweep", "slurm/lowres/sweep.py")
 QP = load_module("qp_sweep", "slurm/qp/sweep.py")
 BUDGETS = [0.5, 1.0, 2.0, 4.0]
-RESOLUTIONS = [*LOWRES.NUM_GAUSSIANS, "1080p"]  # 1080p: no numbers of Gaussians for the fixed-N arms (only with --rates)
+RESOLUTIONS = [*LOWRES.NUM_GAUSSIANS, "1080p", "2160p"]  # 1080p, 2160p: no numbers of Gaussians for the fixed-N arms (only with --rates)
 QP_RATES = {res: QP.QPS for res in RESOLUTIONS}
 WARMUP_BUDGET = 2.0
+ENCODE_OVERHEAD_S = 3.0  # Wall-clock time of an encode beyond its budget (initialization, saving, CUDA graph captures), generous at 2160p
 # Settings, the option that sets the rate, and its values per resolution
 ARMS = {
     "fixed-n": ({**LOWRES.FIXED, **LOWRES.ARMS["step-feat64"]}, "num_gaussians", LOWRES.NUM_GAUSSIANS),
@@ -126,6 +131,7 @@ def parse_args():
                         help="Override a setting of every arm (YAML value), e.g., --set cuda_graph=true")
     parser.add_argument("--task", type=int, default=None, help="Run only this task index (Slurm array task)")
     parser.add_argument("--count", action="store_true", help="Print the number of tasks and exit")
+    parser.add_argument("--minutes", action="store_true", help="Print the minutes that all tasks take one after another and exit")
     args = parser.parse_args()
     args.res, args.arms, args.images = args.res.split(","), args.arms.split(","), args.images.split(",")
     args.rates = args.rates.split(",") if args.rates else []
@@ -152,6 +158,9 @@ if __name__ == "__main__":
             for rate in (args.rates or ARMS[arm][2][res])]
     if args.count:
         print(len(jobs))
+        sys.exit(0)
+    if args.minutes:
+        print(math.ceil(len(jobs) * (WARMUP_BUDGET + sum(args.budgets) + ENCODE_OVERHEAD_S * (len(args.budgets) + 1)) / 60.0))
         sys.exit(0)
     os.chdir(REPO)
     sys.path.insert(0, REPO)

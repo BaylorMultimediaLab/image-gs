@@ -3,7 +3,8 @@
  * Gaussian, and per channel the predicted index from their fixed-point values: their mean, or with a reference channel the least-squares
  * line between the channel and the reference over the neighbors (CCLM-style), evaluated at the Gaussian's own reference value. The sums
  * are integers and the rest is a fixed sequence of IEEE double operations on exactly representable values (built with -ffp-contract=off),
- * so that encoders and decoders compute the same predictions.
+ * so that encoders and decoders compute the same predictions. Also the squared distances to the k nearest Gaussians, from which
+ * compress/scale_prediction.py predicts the scales.
  * Build: pip install compress/csrc --no-build-isolation (from the repository root)
  */
 #include <pybind11/numpy.h>
@@ -59,15 +60,17 @@ int available_threads() {
     return std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
 }
 
-// The NUM_NEIGHBORS nearest earlier Gaussians of each Gaussian (integer positions [P, 2] in bitstream order), by squared distance and then
-// by index, -1 where there are fewer: a uniform grid holds all Gaussians, each cell in increasing index order, and square rings of cells
-// around a Gaussian are searched (each cell up to the Gaussian's own index, so only earlier ones) until no cell of the next ring can hold a
-// nearer one (the ring at Chebyshev cell distance r >= 1 is at least (r - 1) * cell + 1 away). The Gaussians are searched in parallel in
-// tasks of QUERIES_PER_TASK; each one's result depends only on the positions.
-std::vector<int64_t> causal_neighbors(const int64_t* positions, int64_t num) {
-    std::vector<int64_t> neighbors(num * NUM_NEIGHBORS, -1);
+// The NUM_NEIGHBORS nearest earlier Gaussians of each Gaussian (integer positions [P, 2] in bitstream order; with causal false, the nearest
+// other Gaussians), by squared distance and then by index, -1 where there are fewer: their indices and squared distances [P, NUM_NEIGHBORS].
+// A uniform grid holds all Gaussians, each cell in increasing index order, and square rings of cells around a Gaussian are searched (each
+// cell up to the Gaussian's own index when causal) until no cell of the next ring can hold a nearer one (the ring at Chebyshev cell distance
+// r >= 1 is at least (r - 1) * cell + 1 away). The Gaussians are searched in parallel in tasks of QUERIES_PER_TASK; each one's result
+// depends only on the positions.
+void nearest_neighbors(const int64_t* positions, int64_t num, bool causal, std::vector<int64_t>& neighbors, std::vector<int64_t>& dist2) {
+    neighbors.assign(num * NUM_NEIGHBORS, -1);
+    dist2.assign(num * NUM_NEIGHBORS, -1);
     if (num == 0) {
-        return neighbors;
+        return;
     }
     int64_t min_x = positions[0], max_x = positions[0], min_y = positions[1], max_y = positions[1];
     for (int64_t i = 1; i < num; ++i) {
@@ -112,8 +115,11 @@ std::vector<int64_t> causal_neighbors(const int64_t* positions, int64_t num) {
                         continue;
                     }
                     const int64_t c = gy * grid_w + gx;
-                    for (int64_t m = cell_start[c]; m < cell_start[c + 1] && members[m] < i; ++m) {
+                    for (int64_t m = cell_start[c]; m < cell_start[c + 1] && (!causal || members[m] < i); ++m) {
                         const int64_t j = members[m];
+                        if (j == i) {
+                            continue;
+                        }
                         const int64_t dx = positions[2 * j] - x, dy = positions[2 * j + 1] - y;
                         const Candidate candidate{dx * dx + dy * dy, j};
                         if (static_cast<int64_t>(best.size()) < NUM_NEIGHBORS || candidate < best.back()) {
@@ -128,6 +134,7 @@ std::vector<int64_t> causal_neighbors(const int64_t* positions, int64_t num) {
         }
         for (size_t n = 0; n < best.size(); ++n) {
             neighbors[i * NUM_NEIGHBORS + n] = best[n].index;
+            dist2[i * NUM_NEIGHBORS + n] = best[n].dist2;
         }
     };
     std::atomic<int64_t> next_task{0};
@@ -149,6 +156,11 @@ std::vector<int64_t> causal_neighbors(const int64_t* positions, int64_t num) {
     for (std::thread& thread : threads) {
         thread.join();
     }
+}
+
+std::vector<int64_t> causal_neighbors(const int64_t* positions, int64_t num) {
+    std::vector<int64_t> neighbors, dist2;
+    nearest_neighbors(positions, num, true, neighbors, dist2);
     return neighbors;
 }
 
@@ -259,7 +271,7 @@ IntArray reconstruct_indices(const IntArray& residuals, const IntArray& steps, c
     return indices;
 }
 
-// The neighbors themselves (for tests and analysis)
+// The causal neighbors themselves (for the rate term, tests, and analysis)
 IntArray neighbors_of(const IntArray& positions) {
     if (positions.ndim() != 2 || positions.shape(1) != 2) {
         throw std::invalid_argument("Expected positions [P, 2]");
@@ -268,6 +280,19 @@ IntArray neighbors_of(const IntArray& positions) {
     const std::vector<int64_t> neighbors = causal_neighbors(positions.data(), num);
     IntArray out({num, static_cast<int64_t>(NUM_NEIGHBORS)});
     std::copy(neighbors.begin(), neighbors.end(), out.mutable_data());
+    return out;
+}
+
+// Squared distances [P, NUM_NEIGHBORS] to the nearest other Gaussians (any order of the positions [P, 2]), increasing, -1 where there are fewer
+IntArray nearest_distances(const IntArray& positions) {
+    if (positions.ndim() != 2 || positions.shape(1) != 2) {
+        throw std::invalid_argument("Expected positions [P, 2]");
+    }
+    const int64_t num = positions.shape(0);
+    std::vector<int64_t> neighbors, dist2;
+    nearest_neighbors(positions.data(), num, false, neighbors, dist2);
+    IntArray out({num, static_cast<int64_t>(NUM_NEIGHBORS)});
+    std::copy(dist2.begin(), dist2.end(), out.mutable_data());
     return out;
 }
 
@@ -280,4 +305,5 @@ PYBIND11_MODULE(igs_prediction, module) {
     module.def("predict_residuals", &predict_residuals, py::arg("indices"), py::arg("steps"), py::arg("refs"), py::arg("positions"));
     module.def("reconstruct_indices", &reconstruct_indices, py::arg("residuals"), py::arg("steps"), py::arg("refs"), py::arg("positions"));
     module.def("causal_neighbors", &neighbors_of, py::arg("positions"));
+    module.def("nearest_distances", &nearest_distances, py::arg("positions"));
 }

@@ -63,10 +63,20 @@ def get_gaussian_cfg(args):
         gaussian_cfg += "_wrap-rot"
     if args.canonical_rot:
         gaussian_cfg += "_canon-rot"
-    if args.quant_mode == "step" and args.feat_step_adapt != "none":
-        gaussian_cfg += f"_adapt-{args.feat_step_adapt}-{args.feat_step_gamma:g}"
-        if args.color_space == "yuv" and args.uv_step_gamma >= 0.0:
-            gaussian_cfg += f"-uv-{args.uv_step_gamma:g}"
+    if args.quant_mode == "step":  # Per-Gaussian feature (w: weight, a: area), rotation (r), and position (p) steps, and the scale prediction (s)
+        adapt = ""
+        if args.feat_step_adapt != "none":
+            adapt += f"-{args.feat_step_adapt[0]}{args.feat_step_gamma:g}"
+            if args.color_space == "yuv" and args.uv_step_gamma >= 0.0:
+                adapt += f"-uv-{args.uv_step_gamma:g}"
+        if args.rot_step_adapt != "none":
+            adapt += f"-r{args.rot_step_aspect:g}-{args.rot_step_gamma:g}"
+        if args.pos_step_adapt != "none":
+            adapt += f"-p{args.pos_step_gamma:g}"
+        if args.scale_prediction:
+            adapt += "-s"
+        if adapt:
+            gaussian_cfg += f"_adapt{adapt}"
     if args.color_space == "yuv" and args.uv_weight != 1.0:
         gaussian_cfg += f"_uvw-{args.uv_weight:g}"
     if not args.disable_topk_norm:

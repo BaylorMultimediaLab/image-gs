@@ -12,7 +12,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from compress.common import morton_order
+from compress import bitstream_order
 from compress.prediction import NUM_NEIGHBORS, causal_neighbors
 from gsplat.cuda import rate_loss_backward, rate_loss_forward
 
@@ -53,12 +53,13 @@ def laplace_bits(x, scale):
     return -torch.where(a < 0.5, torch.log(inner.clamp(min=1e-12)), outer) / math.log(2.0)
 
 
-def bitstream_neighbors(q_xy):
+def bitstream_neighbors(q_xy, refine_bits=0):
     """
-    The neighbors that compress.prediction predicts each Gaussian from (the NUM_NEIGHBORS nearest earlier ones in bitstream order), for the
-    integer positions q_xy [P, 2] (numpy int64): indices [P, NUM_NEIGHBORS] (int64) into the Gaussians in their given order, -1 for none.
+    The neighbors that compress.prediction predicts each Gaussian from (the NUM_NEIGHBORS nearest earlier ones in bitstream order, with
+    refine_bits of two-stage positions), for the integer positions q_xy [P, 2] (numpy int64): indices [P, NUM_NEIGHBORS] (int64) into the
+    Gaussians in their given order, -1 for none.
     """
-    _, order, _ = morton_order(q_xy)
+    _, order, _ = bitstream_order(q_xy, refine_bits)
     sorted_neighbors = causal_neighbors(q_xy[order])
     neighbors = np.full((len(q_xy), NUM_NEIGHBORS), -1, dtype=np.int64)
     neighbors[order] = np.where(sorted_neighbors >= 0, order[sorted_neighbors.clip(min=0)], -1)
@@ -127,14 +128,15 @@ def predicting_sources(neighbors, dtype):
     return offsets.to(torch.int32), sources.to(torch.int32), 1.0 / valid.sum(dim=1)[sources].to(dtype)
 
 
-def rate_model(q_xy, feat, log2_scale, q_rot, color_refs, pred_refs, steps, channel_weights, dtype, device):
+def rate_model(q_xy, feat, log2_scale, q_rot, color_refs, pred_refs, steps, channel_weights, dtype, device, refine_bits=0):
     """
     The fixed inputs of the rate estimates (RateModel) from the current quantized Gaussians: integer positions q_xy [P, 2] (numpy int64),
     dequantized features [P, C] (the uniform steps [C]), canonical log2 scales [P, 2], and rotation indices [P], with the weights of the feature
-    channels' bits [C]. Each distribution scale is the maximum-likelihood one (mean absolute residual index, at least MIN_SCALE).
+    channels' bits [C] and the refinement bits of two-stage positions (the bitstream order). Each distribution scale is the maximum-likelihood
+    one (mean absolute residual index, at least MIN_SCALE).
     """
     with torch.no_grad():
-        neighbors = torch.from_numpy(bitstream_neighbors(q_xy)).to(device)
+        neighbors = torch.from_numpy(bitstream_neighbors(q_xy, refine_bits)).to(device)
         offsets, sources, source_weights = predicting_sources(neighbors, dtype)
         valid = (neighbors >= 0).to(dtype)
         count = valid.sum(dim=1, keepdim=True)

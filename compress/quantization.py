@@ -1,8 +1,10 @@
 """
 Quantization of the Gaussian parameters: uniform quantizers, canonical parameters, quantization indices ("symbols") of the position, scale,
-rotation, and features with their dequantization, per-Gaussian feature steps, and the inputs of the bitstream and its size estimate.
-Each attribute's symbols are (indices [P, C], steps [C], origins [C]). Scales are in pixels; "step" quantization (and its rate estimate
-without quantization) codes them in log2 pixels.
+rotation, and features with their dequantization, per-Gaussian feature, rotation, and position steps, and the inputs of the bitstream and its
+size estimate. Each attribute's symbols are (indices [P, C], steps [C], origins [C]). Scales are in pixels; "step" quantization (and its
+rate estimate without quantization) codes them in log2 pixels. Per-Gaussian rotation and position steps are powers of 2 times the base
+steps, so their grids are nested in the base grid: their indices stay in base steps (multiples of 2^e), and only the bitstream codes them
+divided by 2^e.
 """
 import math
 import struct
@@ -14,6 +16,9 @@ from compress import estimate_bits
 
 FEAT_STEP_ADAPT_DIVISIONS = 4  # Per-Gaussian feature step multipliers are powers of 2^(1/4) ...
 FEAT_STEP_ADAPT_OCTAVES = 2  # ... between 2^-2 and 2^2
+ROT_STEP_ADAPT_OCTAVES = 2  # Per-Gaussian rotation steps are rot_step times 2^e, 0 <= e <= 2
+POS_REFINE_BITS = 3  # Two-stage positions: coarse steps of 2^3 position steps, and per-axis position steps of pos_step times 2^e, 0 <= e <= 3
+EXPONENT_TABLE_OCTAVES = 16  # Rows of the step exponent tables: differences of the log2 scales up to 16 octaves (larger ones take the last)
 
 
 def quantize_minmax(x: torch.Tensor, num_bits: int = 16):
@@ -71,16 +76,100 @@ def canonicalize(scale, rot, quarter_turns, wrap_rot, log_scale):
     return scale, rot
 
 
-def get_step_symbols(xy, scale, rot, feat, steps, feat_step_multipliers=None):
+def rot_step_exponent_table(scale_step, aspect, gamma):
+    """
+    Exponents e [D] (int64) of the per-Gaussian rotation steps rot_step * 2^e by the absolute difference d of a Gaussian's two log2-scale
+    indices (scale_step in octaves): the rotation sensitivity of a Gaussian footprint is proportional to (r - 1/r)^2 for its axis ratio
+    r = 2^(d scale_step), so a Gaussian rounder than the reference axis ratio 2^aspect takes a step coarser by
+    floor(gamma * log2 of the ratio of the sensitivities), up to 2^ROT_STEP_ADAPT_OCTAVES. Computed in double precision with Python's math
+    module (rows up to EXPONENT_TABLE_OCTAVES).
+    """
+    reference = (2.0**aspect - 2.0**-aspect) ** 2
+    exponents = []
+    for d in range(int(EXPONENT_TABLE_OCTAVES / scale_step) + 1):
+        ratio = 2.0 ** (d * scale_step)
+        sensitivity = (ratio - 1.0 / ratio) ** 2
+        exponent = ROT_STEP_ADAPT_OCTAVES if sensitivity == 0.0 else math.floor(gamma * math.log2(reference / sensitivity))
+        exponents.append(min(max(exponent, 0), ROT_STEP_ADAPT_OCTAVES))
+    return np.array(exponents, dtype=np.int64)
+
+
+def pos_step_exponent_table(scale_step, rot_step, gamma):
+    """
+    Exponents e [D, Q + 1] (int64) of the per-Gaussian position step pos_step * 2^e along the pixel axis nearer a Gaussian's major axis, by
+    the absolute difference d of its two log2-scale indices (scale_step in octaves) and its absolute canonical rotation index a <= Q (rot_step
+    in radians, Q = half the rotation indices per quarter turn): the position sensitivity of a Gaussian footprint along a direction at angle
+    theta to its major axis, relative to the one along its minor axis, is cos^2(theta) / r^2 + sin^2(theta) for its axis ratio
+    r = 2^(d scale_step), so the step grows by floor(gamma / 2 * -log2 of it) at theta = a rot_step, up to 2^POS_REFINE_BITS. Computed in
+    double precision with Python's math module (rows up to EXPONENT_TABLE_OCTAVES).
+    """
+    max_index = round(0.5 * math.pi / rot_step) // 2
+    exponents = []
+    for d in range(int(EXPONENT_TABLE_OCTAVES / scale_step) + 1):
+        inv_ratio2 = 2.0 ** (-2.0 * d * scale_step)
+        row = []
+        for a in range(max_index + 1):
+            relative = math.cos(a * rot_step) ** 2 * inv_ratio2 + math.sin(a * rot_step) ** 2
+            row.append(min(max(math.floor(-0.5 * gamma * math.log2(relative)), 0), POS_REFINE_BITS))
+        exponents.append(row)
+    return np.array(exponents, dtype=np.int64)
+
+
+def rot_step_exponents(q_scale, table):
+    """
+    Exponents [P] (int64) of the per-Gaussian rotation steps from the log2-scale indices [P, 2] and rot_step_exponent_table (a tensor).
+    """
+    d = (q_scale[:, 0] - q_scale[:, 1]).abs().long().clamp(max=len(table) - 1)
+    return table[d]
+
+
+def pos_step_exponents(q_scale, q_rot, table, quarter):
+    """
+    Exponents [P, 2] (int64) of the per-Gaussian position steps of the x and y axes from the log2-scale indices [P, 2], the rotation indices
+    [P] in base steps (quarter of them per quarter turn), and pos_step_exponent_table (a tensor): the table's exponent on the pixel axis
+    nearer the major axis, 0 on the other. Rotations outside [-pi/4, pi/4] are canonicalized first (a quarter turn swaps the axes), so that a
+    Gaussian gets the same exponents in either form; at exactly pi/4, where the two forms disagree on the nearer axis, the exponent is 0
+    (for gamma <= 2).
+    """
+    a = q_rot.long()
+    turns = torch.round(a.double() / quarter).long()
+    canonical = (a - turns * quarter).abs().clamp(max=table.shape[1] - 1)
+    swapped = torch.remainder(turns, 2) == 1
+    s0, s1 = torch.where(swapped, q_scale[:, 1], q_scale[:, 0]), torch.where(swapped, q_scale[:, 0], q_scale[:, 1])
+    d = (s0 - s1).abs().long().clamp(max=table.shape[0] - 1)
+    exponents = table[d, canonical]
+    near_x = s0 >= s1  # Canonical axis 0 is within 45 degrees of the x axis
+    return torch.stack([torch.where(near_x, exponents, 0), torch.where(near_x, 0, exponents)], dim=1)
+
+
+def quantize_nested(x, step, exponents):
+    """
+    Indices in base steps of x on per-Gaussian grids of step * 2^exponents (exponents broadcast against x): multiples of 2^exponents.
+    """
+    multipliers = torch.exp2(exponents.to(x.dtype))
+    return torch.round(x / (step * multipliers)) * multipliers
+
+
+def get_step_symbols(xy, scale, rot, feat, steps, feat_step_multipliers=None, rot_exponents=None, pos_exponents=None):
     """
     Symbols of "step" quantization of the canonicalized Gaussian parameters (scale in pixels, quantized in log2 pixels), with the per-channel
     steps of position, log2 scale, rotation, and features. feat_step_multipliers(geometry_symbols) gives per-Gaussian multipliers [P, C] of
-    the feature steps, which the returned feature steps (the base steps) do not include.
+    the feature steps, which the returned feature steps (the base steps) do not include. rot_exponents(q_scale) and
+    pos_exponents(q_scale, q_rot) give per-Gaussian exponents of the rotation [P] and position [P, 2] steps, whose indices stay in base steps.
     """
     with torch.no_grad():
+        q_scale = quantize_step(torch.log2(scale), steps[1])
+        if rot_exponents is None:
+            q_rot = quantize_step(rot, steps[2])
+        else:
+            q_rot = (quantize_nested(rot, steps[2], rot_exponents(q_scale[0])[:, None]), steps[2], torch.zeros_like(steps[2]))
+        if pos_exponents is None:
+            q_xy = quantize_step(xy, steps[0])
+        else:
+            q_xy = (quantize_nested(xy, steps[0], pos_exponents(q_scale[0], q_rot[0][:, 0])), steps[0], torch.zeros_like(steps[0]))
+        symbols = [q_xy, q_scale, q_rot]
         if feat_step_multipliers is None:
-            return [quantize_step(x, x_steps) for x, x_steps in zip([xy, torch.log2(scale), rot, feat], steps)]
-        symbols = [quantize_step(x, x_steps) for x, x_steps in zip([xy, torch.log2(scale), rot], steps[:3])]
+            return symbols + [quantize_step(feat, steps[3])]
         q_feat = torch.round(feat / (steps[3] * feat_step_multipliers(symbols)))
         return symbols + [(q_feat, steps[3], torch.zeros_like(steps[3]))]
 
@@ -186,15 +275,24 @@ def symbols_to_numpy(symbols):
             for q, steps, origins in symbols]
 
 
-def bitstream_meta(img_h, img_w, quant_mode, color_space, feat_prediction, feat_step_adapt, feat_step_gamma, uv_step_gamma):
+def bitstream_meta(img_h, img_w, quant_mode, color_space, feat_prediction, feat_step_adapt, feat_step_gamma, uv_step_gamma, geometry=None):
     """
     Model metadata of the bitstream: image size, quantization mode, color space, whether the features are coded as residuals of their
     prediction (compress.prediction with get_prediction_refs), and the per-Gaussian feature steps (feat_step_adapt "none", "area", or
-    "weight" with feat_step_gamma, and in YUV mode uv_step_gamma for U and V), which a decoder computes from the decoded geometry.
+    "weight" with feat_step_gamma, and in YUV mode uv_step_gamma for U and V), which a decoder computes from the decoded geometry. With
+    geometry options (scale_prediction, rot_step_adapt "aspect" with rot_step_aspect and rot_step_gamma, pos_step_adapt "major" with
+    pos_step_gamma; all float32 values), a byte of flags and their parameters follow.
     """
     meta = struct.pack("<IIBBB", img_h, img_w, ["minmax", "step"].index(quant_mode), ["rgb", "yuv"].index(color_space), int(feat_prediction))
     if feat_step_adapt != "none":
         meta += struct.pack("<Bf", ["area", "weight"].index(feat_step_adapt) + 1, feat_step_gamma)
         if color_space == "yuv":
             meta += struct.pack("<f", uv_step_gamma)
+    if geometry is not None:
+        scale_prediction, rot_step, pos_step = geometry
+        meta += struct.pack("<B", int(scale_prediction) | int(rot_step is not None) << 1 | int(pos_step is not None) << 2)
+        if rot_step is not None:
+            meta += struct.pack("<ff", *rot_step)
+        if pos_step is not None:
+            meta += struct.pack("<f", pos_step)
     return meta

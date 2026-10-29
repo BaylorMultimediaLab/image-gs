@@ -15,12 +15,13 @@ from fused_ssim import fused_l1_ssim, fused_ssim
 from lpips import LPIPS
 from pytorch_msssim import MS_SSIM
 
-from compress import decode_bitstream, encode_bitstream
-from compress.common import morton_order
+from compress import bitstream_order, decode_bitstream, encode_bitstream
 from compress.prediction import get_prediction_refs, predict_residuals, reconstruct_indices
 from compress.pruning import add_probabilities, contribution, keep_gaussians, loo_loss_increase, select_lambda_pruning
 from compress.quantization import (
     FEAT_STEP_ADAPT_DIVISIONS,
+    POS_REFINE_BITS,
+    ROT_STEP_ADAPT_OCTAVES,
     bitstream_meta,
     canonicalize,
     dequantize,
@@ -32,9 +33,14 @@ from compress.quantization import (
     get_channel_refs,
     get_minmax_symbols,
     get_step_symbols,
+    pos_step_exponent_table,
+    pos_step_exponents,
+    rot_step_exponent_table,
+    rot_step_exponents,
     symbols_to_numpy,
 )
 from compress.rate import estimated_bits, rate_loss, rate_model
+from compress.scale_prediction import predicted_sums, reconstruct_scales, scale_residuals
 from gsplat import (
     compute_cumulative_intersects,
     project_gaussians_2d_scale_rot,
@@ -289,6 +295,7 @@ class GaussianSplatting2D(nn.Module):
         # The per-Gaussian feature steps apply to the saved model and in evaluation; optimization uses the uniform steps
         self.feat_step_adapt_active = self.feat_step_adapt != "none" and self.evaluate
         self.feat_step_multiplier_cache = None
+        self._init_geometry_steps(args)
         self.wrap_rot = args.wrap_rot
         self.canonical_rot = args.canonical_rot
         # The saved model and evaluation also render the canonical rotation; optimization renders the rotation as it is (the same ellipses)
@@ -303,6 +310,59 @@ class GaussianSplatting2D(nn.Module):
         self.color_transform = args.color_transform if self.color_space == "rgb" else "none"  # YUV features are coded as they are
         self.feat_prediction = args.feat_prediction
         self.feat_prediction_refs = get_prediction_refs(self.input_channels, self.color_space)
+
+    def _init_geometry_steps(self, args):
+        """
+        Per-Gaussian rotation and position steps and the scale prediction (step mode only, ignored otherwise): exponent tables of
+        compress.quantization on the GPU, and the refinement bits of two-stage positions in the bitstream.
+        """
+        if args.rot_step_adapt not in ["none", "aspect"]:
+            raise ValueError(f"Unsupported rotation step adaptation '{args.rot_step_adapt}', valid values include 'none' and 'aspect'")
+        if args.pos_step_adapt not in ["none", "major"]:
+            raise ValueError(f"Unsupported position step adaptation '{args.pos_step_adapt}', valid values include 'none' and 'major'")
+        step_mode = self.quant_mode == "step"
+        self.rot_step_adapt = args.rot_step_adapt if step_mode else "none"
+        self.pos_step_adapt = args.pos_step_adapt if step_mode else "none"
+        self.scale_prediction = args.scale_prediction and step_mode
+        # The values that the bitstream stores
+        self.rot_step_aspect, self.rot_step_gamma = float(np.float32(args.rot_step_aspect)), float(np.float32(args.rot_step_gamma))
+        self.pos_step_gamma = float(np.float32(args.pos_step_gamma))
+        self.rot_step_table, self.pos_step_table, self.rot_quarter = None, None, 0
+        if self.rot_step_adapt != "none" or self.pos_step_adapt != "none":
+            # Integer rotation indices per quarter turn, so that the nested grids (and canonical rotations) are exact
+            self.rot_quarter = round(0.5 * math.pi / self.rot_step)
+            min_quarter = 2**ROT_STEP_ADAPT_OCTAVES if self.rot_step_adapt != "none" else 1
+            if abs(self.rot_quarter * self.rot_step - 0.5 * math.pi) > 1e-9 or self.rot_quarter % min_quarter:
+                raise ValueError(f"Per-Gaussian rotation or position steps require a rot_step that divides 90 degrees (rotation steps: "
+                                 f"{90 / min_quarter:g} degrees) but got: {args.rot_step:g}")
+        if self.rot_step_adapt != "none":
+            table = rot_step_exponent_table(self.scale_step, self.rot_step_aspect, self.rot_step_gamma)
+            self.rot_step_table = torch.from_numpy(table).to(self.device)
+        if self.pos_step_adapt != "none":
+            if not 0.0 < self.pos_step_gamma <= 2.0:
+                raise ValueError(f"pos_step_gamma must be in (0, 2] but got: {self.pos_step_gamma:g}")
+            self.pos_step_table = torch.from_numpy(pos_step_exponent_table(self.scale_step, self.rot_step, self.pos_step_gamma)).to(self.device)
+        self.pos_refine_bits = POS_REFINE_BITS if self.pos_step_adapt != "none" else 0
+        # Like the per-Gaussian feature steps, the rotation and position steps apply to the saved model and in evaluation
+        self.geometry_step_adapt = self.rot_step_adapt != "none" or self.pos_step_adapt != "none"
+        self.geometry_step_adapt_active = self.geometry_step_adapt and self.evaluate
+
+    def _get_rot_step_exponents(self, q_scale):
+        """
+        Exponents [P] (int64) of the per-Gaussian rotation steps of the log2-scale indices [P, 2] (zeros without rot_step_adapt).
+        """
+        if self.rot_step_table is None:
+            return torch.zeros(len(q_scale), dtype=torch.int64, device=q_scale.device)
+        return rot_step_exponents(q_scale, self.rot_step_table)
+
+    def _get_pos_step_exponents(self, q_scale, q_rot):
+        """
+        Exponents [P, 2] (int64) of the per-Gaussian position steps of the log2-scale indices [P, 2] and the rotation indices [P] in base steps
+        (zeros without pos_step_adapt).
+        """
+        if self.pos_step_table is None:
+            return torch.zeros(len(q_scale), 2, dtype=torch.int64, device=q_scale.device)
+        return pos_step_exponents(q_scale, q_rot, self.pos_step_table, self.rot_quarter)
 
     def _get_feat_groups(self):
         """
@@ -333,7 +393,9 @@ class GaussianSplatting2D(nn.Module):
             feat_groups = [(channels, bits) for channels, bits, _ in self._get_feat_groups()]
             return get_minmax_symbols(xy, scale, rot, feat, [self.pos_bits, self.scale_bits, self.rot_bits], feat_groups)
         multipliers = self._get_feat_step_multipliers if self.feat_step_adapt_active else None
-        return get_step_symbols(xy, scale, rot, feat, self.quant_steps, multipliers)
+        if not self.geometry_step_adapt_active:
+            return get_step_symbols(xy, scale, rot, feat, self.quant_steps, multipliers)
+        return get_step_symbols(xy, scale, rot, feat, self.quant_steps, multipliers, self._get_rot_step_exponents, self._get_pos_step_exponents)
 
     def _dequantize_symbols(self, symbols):
         """
@@ -699,6 +761,7 @@ class GaussianSplatting2D(nn.Module):
     def _save_model(self, final=False):
         if self.quant_mode != "none":
             self.feat_step_adapt_active = self.feat_step_adapt != "none"
+            self.geometry_step_adapt_active = self.geometry_step_adapt
             self.canonical_rot_active = self.canonical_rot and final  # Intermediate saves keep the axes that the optimizer state belongs to
             self._quantize()
         if self.quant_mode != "step" or not self.realtime:  # Fixed-length size of the Gaussians (float32 without quantization)
@@ -727,8 +790,9 @@ class GaussianSplatting2D(nn.Module):
         self.worklog.info(
             f"PSNR: {psnr:.2f} | SSIM: {ssim:.4f} | LPIPS: {self.lpips_final:.4f} | FLIP: {self.flip_final:.4f} | MS-SSIM: {self.msssim_final:.4f}")
         self.worklog.info("***********************************************")
-        if not final:  # Optimization continues with the uniform feature steps
+        if not final:  # Optimization continues with the uniform feature, rotation, and position steps
             self.feat_step_adapt_active = False
+            self.geometry_step_adapt_active = False
 
     def _quantize(self):
         """
@@ -751,7 +815,7 @@ class GaussianSplatting2D(nn.Module):
             symbols = self._get_symbols(self.xy, *self._canonicalize(self._get_scale(), self.rot), self.feat)
             model = rate_model(symbols[0][0].cpu().numpy().astype(np.int64), self._dequantize_symbols(symbols)[3], dequantize(*symbols[1]),
                                symbols[2][0][:, 0], self.rate_color_refs, self.feat_prediction_refs, self.quant_steps[3],
-                               self.rate_channel_weights, self.dtype, self.device)
+                               self.rate_channel_weights, self.dtype, self.device, self.pos_refine_bits)
             if self.rate_model is not None and self.rate_model.neighbors.shape == model.neighbors.shape:
                 for buffer, value in zip(self.rate_model, model):
                     if isinstance(buffer, torch.Tensor):  # Not the channel references, which never change
@@ -777,19 +841,33 @@ class GaussianSplatting2D(nn.Module):
             symbols = self._get_symbols(self.xy, *self._canonicalize(self._get_scale(), self.rot), self.feat)
             attributes = symbols_to_numpy(symbols)
             meta = bitstream_meta(self.img_h, self.img_w, self.quant_mode, self.color_space, self.feat_prediction, self.feat_step_adapt,
-                                  self.feat_step_gamma, self.uv_step_gamma)
+                                  self.feat_step_gamma, self.uv_step_gamma, self._geometry_meta())
             channel_refs = get_channel_refs(self.input_channels, self.color_transform)
             coded = list(attributes)
+            q_xy, q_scale, q_rot = attributes[0][0], attributes[1][0], attributes[2][0]
+            _, order, _ = bitstream_order(q_xy, self.pos_refine_bits)
+            if self.scale_prediction:  # From the positions that a decoder has before the scales (coarse with two-stage positions)
+                predicted = predicted_sums(q_xy >> self.pos_refine_bits, self.scale_step)
+                coded[1] = (scale_residuals(q_scale, predicted),) + attributes[1][1:]
+            refine_exponents = None
+            if self.geometry_step_adapt:  # Rotation indices divided by their per-Gaussian steps, and the position refinement exponents
+                if not self.geometry_step_adapt_active:
+                    raise RuntimeError("A bitstream with per-Gaussian rotation or position steps requires them in the quantization")
+                rot_exponents = self._get_rot_step_exponents(symbols[1][0]).cpu().numpy()[:, None]
+                if np.any(q_rot & ((1 << rot_exponents) - 1)):
+                    raise RuntimeError("Rotation indices must be multiples of their per-Gaussian steps")
+                coded[2] = (q_rot >> rot_exponents,) + attributes[2][1:]
+                refine_exponents = self._get_pos_step_exponents(symbols[1][0], symbols[2][0][:, 0]).cpu().numpy()
             if self.feat_prediction:
                 # Residuals of the features predicted in bitstream order (the order of encode_bitstream), which include the reference
                 # subtraction of the color transform
-                _, order, _ = morton_order(attributes[0][0])
                 q_feat, feat_steps, feat_origins = attributes[3]
                 residuals = np.empty_like(q_feat)
                 residuals[order] = predict_residuals(q_feat[order], feat_steps, self._get_feat_step_exponents(symbols[:3])[order],
                                                      attributes[0][0][order], channel_refs[3], self.feat_prediction_refs)
                 coded[3], channel_refs[3] = (residuals, feat_steps, feat_origins), None
-            data, order, attribute_bytes = encode_bitstream(coded, meta, codec=self.bitstream_codec, channel_refs=channel_refs)
+            data, order, attribute_bytes = encode_bitstream(coded, meta, codec=self.bitstream_codec, channel_refs=channel_refs,
+                                                            refine_bits=self.pos_refine_bits, refine_exponents=refine_exponents)
             with open(path, "wb") as file:
                 file.write(data)
             if not self.realtime:
@@ -817,11 +895,36 @@ class GaussianSplatting2D(nn.Module):
         self.worklog.info("***********************************************")
         return len(data)
 
+    def _geometry_meta(self):
+        """
+        The geometry options of the bitstream metadata (compress.quantization.bitstream_meta), None if all are off.
+        """
+        if not (self.scale_prediction or self.geometry_step_adapt):
+            return None
+        rot_step = (self.rot_step_aspect, self.rot_step_gamma) if self.rot_step_adapt != "none" else None
+        return self.scale_prediction, rot_step, self.pos_step_gamma if self.pos_step_adapt != "none" else None
+
+    def _reconstruct_geometry(self, attributes):
+        """
+        Reconstruction of the geometry in decode_bitstream (bitstream order, numpy): the log2-scale indices from their prediction
+        (scale_prediction, from the positions decoded so far: the coarse ones of two-stage positions), the rotation indices from their values
+        divided by the per-Gaussian steps, and the refinement exponents of two-stage positions.
+        """
+        (q_xy, *_), (q_scale, *scale_params), (q_rot, *rot_params) = attributes[:3]
+        if self.scale_prediction:
+            q_scale = reconstruct_scales(q_scale, predicted_sums(q_xy >> self.pos_refine_bits, self.scale_step))
+        refine_exponents = None
+        if self.geometry_step_adapt:
+            scale_tensor = torch.from_numpy(q_scale).to(self.device)
+            q_rot = q_rot << self._get_rot_step_exponents(scale_tensor).cpu().numpy()[:, None]
+            refine_exponents = self._get_pos_step_exponents(scale_tensor, torch.from_numpy(q_rot[:, 0]).to(self.device)).cpu().numpy()
+        return [attributes[0], (q_scale, *scale_params), (q_rot, *rot_params)] + list(attributes[3:]), refine_exponents
+
     def _decode_bitstream(self, data):
         """
         Quantization symbols (GPU tensors) of a bitstream of _write_bitstream, with the Gaussians in bitstream order.
         """
-        decoded, _ = decode_bitstream(data)
+        decoded, _ = decode_bitstream(data, reconstruct=self._reconstruct_geometry)
         symbols = [[torch.from_numpy(x).to(dtype=self.dtype, device=self.device) for x in attribute] for attribute in decoded]
         if self.feat_prediction:
             residuals, feat_steps, _ = decoded[3]

@@ -7,7 +7,8 @@
 # Set SKIP_SETUP=1 to reuse an environment built earlier by slurm/setup.slurm (only if gsplat and compress/csrc have not changed since), with
 # AFTER=<job id> to start only after that job succeeded (e.g., one setup job for several sweeps), and PARTITION=<name> to submit to another
 # partition than the job's own (gpu_a100). Debug partitions (*_debug, e.g., gpu_a100_debug) take no job arrays, so there a sweep is one job
-# that runs its tasks one after the other (~11 s each with the default budgets 0.5-4 s, as a warm-up encode adds 2 s).
+# that runs its tasks one after the other (~11 s each with the default budgets 0.5-4 s, as a warm-up encode adds 2 s), with the time limit
+# of slurm/realtime/sweep.py --minutes plus 5 minutes; a job that runs out of time can be submitted again, as tasks skip finished budgets.
 set -eo pipefail
 
 mode=${1:-}
@@ -33,7 +34,7 @@ elif [ -n "${AFTER:-}" ]; then
     dependency=(--dependency="afterok:${AFTER}")
 fi
 if [ "${mode}" = "sweep" ] && [[ "${PARTITION:-}" == *_debug ]]; then
-    sbatch "${options[@]}" "${dependency[@]}" --time="$((5 + (num_tasks + 2) / 3))" slurm/realtime/sweep.slurm "$@"
+    sbatch "${options[@]}" "${dependency[@]}" --time="$((5 + $(python3 slurm/realtime/sweep.py --minutes "$@")))" slurm/realtime/sweep.slurm "$@"
     echo "Sweep of ${num_tasks} tasks submitted as one job (logs in results/slurm-logs)"
 elif [ "${mode}" = "sweep" ]; then
     sbatch "${options[@]}" "${dependency[@]}" --array="0-$((num_tasks - 1))" slurm/realtime/sweep.slurm "$@"
