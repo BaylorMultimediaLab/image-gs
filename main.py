@@ -1,4 +1,7 @@
 import argparse
+import copy
+import os
+import tempfile
 
 import torch
 
@@ -84,11 +87,22 @@ def get_log_dir(args):
         folder += f"_decay-{args.max_decay_times:d}-{args.decay_ratio:.1f}"
     if args.max_time > 0.0:
         folder += f"_time-{args.max_time:g}"
-    return f"{args.log_root}/{args.exp_name}/{folder}"
+    image = os.path.splitext(args.input_path)[0]
+    return f"{args.log_root}/{args.exp_name}/{image}/{folder}"
+
+
+def warm_up(args):
+    warmup_args = copy.copy(args)
+    with tempfile.TemporaryDirectory() as log_dir:
+        warmup_args.max_time, warmup_args.log_dir = args.warmup, log_dir
+        GaussianSplatting2D(warmup_args).optimize()
+    torch.cuda.empty_cache()
 
 
 def main(args):
     args.log_dir = get_log_dir(args)
+    if args.warmup > 0.0 and args.realtime and not args.eval:
+        warm_up(args)
     ImageGS = GaussianSplatting2D(args)
     if args.eval:
         ImageGS.render(render_height=args.render_height)

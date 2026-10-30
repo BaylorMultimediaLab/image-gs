@@ -3,6 +3,7 @@ device:                "cuda:0"
 realtime:              False # Real-time encoding
 stall_trace:           0.0 # Log pruning rounds and CUDA graph captures that take longer than this many seconds
 cuda_graph:            False # Replay each step from a CUDA graph; requires realtime, quant_mode step or none
+warmup:                2.0 # realtime: discarded encode of this many seconds before the real one, so that first-use costs (kernel loading, the first graph capture and rounds) stay out of the budget; 0 disables it
 # Evaluation
 eval:                  False # Render the optimized Image-GS representation
 render_height:         480 # Image height for rendering (aspect ratio is maintained)

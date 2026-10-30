@@ -37,8 +37,8 @@ By default, most compression-related options are guided by an HEVC-like QP, pass
 Every option has a default in `cfgs/default.yaml` and can be overridden on the command line as `--<key> <value>`. Boolean options are
 flags: `--<key>` switches one on and `--no-<key>` off. Input images are read from `data_root` (default `media/`), and `input_path` is an
 image file or a directory with a texture stack. Each run writes its log, config, checkpoints, renders, and bitstream to
-`results/<exp_name>/<folder named after the main settings>/`. To render a trained model, rerun with the same options plus
-`--eval --render_height <height>`.
+`results/<exp_name>/<input_path without extension>/<folder named after the main settings>/`. To render a trained model, rerun with the
+same options plus `--eval --render_height <height>`.
 
 In the tables below, the column *Set by `--qp`* is *yes* for options that `--qp` derives (a given value is ignored), *qp only* for options
 that only take effect with `--qp`, and *no* for options independent of it.
@@ -205,4 +205,5 @@ collection during optimization. At low resolutions on fast GPUs, a step is then 
 | `decay_time_ratio` | (0, 1] | `0.8333` | no | With `max_time`: fraction of the budget after which the learning rate decays once by `decay_ratio` |
 | `realtime` | bool | `false` | no | Real-time encoding |
 | `cuda_graph` | bool | `false` | no | Replay each step from a CUDA graph; requires `realtime`, `quant_mode step` or `none` |
+| `warmup` | ≥ 0 | `2.0` | no | With `realtime`: discarded encode of this many seconds before the real one, so that first-use costs (kernel loading, the first graph capture and rounds) stay out of the budget; `0` disables it |
 | `max_scale` | ≥ 0 | `0.0` | no | Upper bound of the Gaussian scales in pixels (`0` disables it); large Gaussians slow down rasterization |
