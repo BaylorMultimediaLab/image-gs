@@ -1,5 +1,5 @@
 """
-Pruning and adding Gaussians: leave-one-out and contribution scores, the Gaussians of a lambda (rate-distortion) pruning round, keeping a
+Pruning and adding Gaussians: leave-one-out scores, the Gaussians of a lambda (rate-distortion) pruning round, keeping a
 subset of the Gaussians with their optimizer state, and where to add Gaussians.
 """
 import numpy as np
@@ -25,18 +25,6 @@ def loo_loss_increase(xy, conics, feat, pixel_topk, target, eps, metric="l1", tr
         feat, target = feat @ transform.T, torch.einsum("dc,chw->dhw", transform, target)
     increase = topk_norm_loo_loss_increase(img_h, img_w, xy, conics, feat.contiguous(), pixel_topk, target.contiguous(), metric == "sse", eps)
     return increase * (255.0**2 / num_channels if metric == "sse" else 1.0 / target.numel())
-
-
-def contribution(render_features, num_gaussians, dtype, device):
-    """
-    Contribution of each Gaussian to the rendered image, measured as its total blending weight summed over all pixels. Rendered images are
-    linear in the features, so these weights are the gradients of the image sum w.r.t. all-one features (render_features(feat [N, 1])).
-    """
-    ones = torch.ones(num_gaussians, 1, dtype=dtype, device=device, requires_grad=True)
-    with torch.enable_grad():
-        images = render_features(ones)
-        weights, = torch.autograd.grad(images.sum(), ones)
-    return weights.squeeze(dim=-1)
 
 
 def select_lambda_pruning(sse_increase, bits_per_gaussian, prune_lambda, max_ratio):
@@ -74,7 +62,7 @@ def keep_gaussians(optimizer, keep):
 def add_probabilities(images, gt_images, transform=None):
     """
     Sampling probabilities [H*W] of the pixels where Gaussians are added, and the error [C, H, W] of the rendered images [C, H, W] against
-    the target gt_images [C, H, W] (both RGB, gamma-corrected), the target smoothed with a Gaussian whose kernel grows with the resolution:
+    the target gt_images [C, H, W] (both RGB), the target smoothed with a Gaussian whose kernel grows with the resolution:
     the squared mean absolute error over the channels, mapped by transform [C, C] if given (e.g., to the space of the losses).
     """
     img_h, img_w = gt_images.shape[1:]

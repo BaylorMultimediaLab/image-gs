@@ -24,12 +24,7 @@ def get_gaussian_cfg(args):
                 gaussian_cfg += f"-add-{args.prune_add_ratio:g}"
         elif args.prune_ratio > 0.0:
             gaussian_cfg += f"_prune-{args.prune_ratio:.2f}"
-    if args.relocate_ratio > 0.0:
-        gaussian_cfg += f"_reloc-{args.relocate_ratio:.2f}"
-    if args.disable_inverse_scale:
-        gaussian_cfg += f"_scale-{args.init_scale:.1f}"
-    else:
-        gaussian_cfg += f"_inv-{args.init_scale:.1f}"
+    gaussian_cfg += f"_init-{args.init_scale:.1f}"
     if args.init_scale_knn > 0.0:
         gaussian_cfg += f"-knn-{args.init_scale_knn:g}"
     if args.init_aspect > 1.0:
@@ -59,11 +54,7 @@ def get_gaussian_cfg(args):
     if args.quant_mode == "none" and (args.qp > 0.0 or args.prune_mode == "lambda"):  # The steps estimate the bits for lambda pruning
         feat_step = "qp" if args.qp > 0.0 else f"{args.feat_step:g}"
         gaussian_cfg += f"_rate-steps-{args.pos_step:g}-{args.scale_step:g}-{args.rot_step:g}-{feat_step}"
-    if args.quant_mode != "none" and args.wrap_rot:
-        gaussian_cfg += "_wrap-rot"
-    if args.canonical_rot:
-        gaussian_cfg += "_canon-rot"
-    if args.quant_mode == "step":  # Per-Gaussian feature (w: weight, a: area), rotation (r), and position (p) steps, and the scale prediction (s)
+    if args.quant_mode == "step":  # Per-Gaussian feature (w: weight), rotation (r), and position (p) steps, and the scale prediction (s)
         adapt = ""
         if args.feat_step_adapt != "none":
             adapt += f"-{args.feat_step_adapt[0]}{args.feat_step_gamma:g}"
@@ -79,8 +70,6 @@ def get_gaussian_cfg(args):
             gaussian_cfg += f"_adapt{adapt}"
     if args.color_space == "yuv" and args.uv_weight != 1.0:
         gaussian_cfg += f"_uvw-{args.uv_weight:g}"
-    if not args.disable_topk_norm:
-        gaussian_cfg += f"_top-{args.topk:d}"
     gaussian_cfg += f"_{args.init_mode[0]}-{args.init_random_ratio:.1f}"
     if args.init_mode == "local-std":
         gaussian_cfg += f"-g{args.init_std_gamma:g}"
@@ -89,16 +78,12 @@ def get_gaussian_cfg(args):
 
 def get_log_dir(args):
     gaussian_cfg = get_gaussian_cfg(args)
-    loss_cfg = f"l1-{args.l1_loss_ratio:.1f}_l2-{args.l2_loss_ratio:.1f}_ssim-{args.ssim_loss_ratio:.1f}"
+    loss_cfg = f"l1-{args.l1_loss_ratio:.1f}_ssim-{args.ssim_loss_ratio:.1f}"
     folder = f"{gaussian_cfg}_{loss_cfg}"
-    if args.downsample:
-        folder += f"_ds-{args.downsample_ratio:.1f}"
     if not args.disable_lr_schedule:
         folder += f"_decay-{args.max_decay_times:d}-{args.decay_ratio:.1f}"
     if args.max_time > 0.0:
         folder += f"_time-{args.max_time:g}"
-    if not args.disable_prog_optim:
-        folder += "_prog"
     return f"{args.log_root}/{args.exp_name}/{folder}"
 
 

@@ -62,7 +62,7 @@ mkdir -p results/lowres
 python -m pip freeze --all > results/lowres/freeze_a100.txt  # Compare with the local environment (pip freeze)
 
 # Smoke test: a short time-budgeted run that writes and verifies a bitstream, then the time per optimization step
-python main.py --data_root=media/uvg --input_path=480p/Beauty_0001.png --num_gaussians=1000 --disable_prog_optim --max_steps=100000 \
+python main.py --data_root=media/uvg --input_path=480p/Beauty_0001.png --num_gaussians=1000 --max_steps=100000 \
     --max_time=5 --bitstream_codec=rans --color_transform=subtract-green --exp_name=slurm-smoke | tail -n 12
 grep -q "Lossless decoding verified" results/slurm-smoke/*/log_train.txt
 python slurm/lowres/calib.py results/lowres/calib_a100.csv \

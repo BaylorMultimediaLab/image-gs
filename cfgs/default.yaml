@@ -1,45 +1,43 @@
 seed:                  123
 device:                "cuda:0"
-realtime:              False # Real-time encoding: skip what an encoder does not need (saved images, LPIPS/MS-SSIM/FLIP, periodic evaluation unless the adaptive learning rate schedule uses it, bitstream verification, PSNR measurement of pruning rounds), use fused Adam, and charge the time budget (max_time) by wall-clock time without synchronizing at every step
-stall_trace:           0.0 # Pruning rounds and CUDA graph captures that take longer than this many seconds write samples of the Python stack of the main thread (one per this many seconds) to stalls.txt in the log directory and log their CPU time, context switches, page faults, and CPU throttling (0 disables it)
-cuda_graph:            False # Real-time mode only: replay each optimization step from a CUDA graph (one launch instead of about 110 kernels, so that a step costs its GPU time rather than its CPU time), captured again whenever pruning or densification replaces the Gaussians or the tile intersections outgrow their fixed-capacity buffers; requires quant_mode "step" or "none" and tiles
+realtime:              False # Real-time encoding
+stall_trace:           0.0 # Log pruning rounds and CUDA graph captures that take longer than this many seconds
+cuda_graph:            False # Replay each step from a CUDA graph; requires realtime, quant_mode step or none
 # Evaluation
 eval:                  False # Render the optimized Image-GS representation
 render_height:         480 # Image height for rendering (aspect ratio is maintained)
 
 # Bit precision
-quant_mode:            "step" # Quantization of Gaussian parameters, valid values include "none" (float32; the *_step values still estimate the bits for lambda pruning and qp), "minmax" (2^bits levels over the range of each attribute, set by the *_bits values), and "step" (fixed steps anchored at zero, set by the *_step values)
+quant_mode:            "step" # {step, minmax, none} Quantization mode; --qp requires step or none
 # quant_mode: "minmax" configuration:
-pos_bits:              16 # Bit precision of individual coordinate dimension
-scale_bits:            16 # Bit precision of individual scale dimension
-rot_bits:              16 # Bit precision of Gaussian orientation angle
-feat_bits:             16 # Bit precision of individual feature dimension (RGB mode, and single-channel images in YUV mode)
-y_bits:                16 # Bit precision of the Y feature dimension (YUV mode only)
-uv_bits:               16 # Bit precision of individual U and V feature dimensions (YUV mode only)
+pos_bits:              16 # minmax: bit depth of the positions
+scale_bits:            16 # minmax: bit depth of the scales
+rot_bits:              16 # minmax: bit depth of the rotations
+feat_bits:             16 # minmax: bit depth of the features (RGB)
+y_bits:                16 # minmax: bit depth of Y (YUV)
+uv_bits:               16 # minmax: bit depth of U and V (YUV)
 # quant_mode: "step" configuration:
-pos_step:              0.125 # Position step in pixels ("step" mode)
+pos_step:              0.125 # Position step in pixels
 scale_step:            0.03125 # Scale step in octaves
-rot_step:              0.703125 # Rotation step in degrees
-feat_step:             0.015625 # Step of individual feature dimensions
-y_step:                0.015625 # Step of the Y feature dimension
-uv_step:               0.015625 # Step of individual U and V feature dimensions
-uv_step_ratio:         2.0 # With qp in YUV mode: factor of the U and V step over the one that gives them the error of RGB features at the qp's step (without qp, y_step and uv_step set the steps)
-y_step_ratio:          1.0 # With qp in YUV mode: factor of the Y step over the one that gives Y the error of RGB features at the qp's step
-feat_step_adapt:       "weight" # Per-Gaussian feature steps of the saved model with quant_mode "step" (optimization uses the uniform steps), valid values include "none", "area" (by Gaussian area), and "weight" (by the sum of the Gaussian's squared normalized blending weights over the pixels); computed from the quantized geometry, so decoders repeat them
-feat_step_gamma:       0.25 # feat_step_adapt multiplies the feature steps by (proxy / its geometric mean)^(-feat_step_gamma), snapped to powers of 2^(1/4) between 1/4 and 4
-uv_step_gamma:         -1.0 # YUV mode with feat_step_adapt: feat_step_gamma of the U and V channels (negative: feat_step_gamma); above feat_step_gamma, chroma steps grow faster than luma steps on Gaussians with small feature weights
-rot_step_adapt:        "aspect" # Per-Gaussian rotation steps of the saved model with quant_mode "step" (optimization uses the uniform step), valid values include "none" and "aspect": rot_step times 2^e (0 <= e <= 2) with e = floor(rot_step_gamma * log2 of the rotation sensitivity (r - 1/r)^2 at the axis ratio 2^rot_step_aspect over the one at the Gaussian's axis ratio r), i.e., coarser steps for rounder Gaussians, whose rotation matters less; computed from the quantized scales, so decoders repeat them; requires a rot_step that divides 22.5 degrees
-rot_step_aspect:       3.0 # rot_step_adapt "aspect": reference aspect ratio in octaves (Gaussians at least this elongated keep rot_step)
-rot_step_gamma:        0.5 # rot_step_adapt "aspect": exponent on the sensitivity ratio
-pos_step_adapt:        "major" # Per-Gaussian position steps of the saved model with quant_mode "step" (optimization uses the uniform step), valid values include "none" and "major": two-stage positions in the bitstream (the coarse positions on a grid of 8 position steps first, refinement bits after the scales and rotations), with pos_step times 2^e (0 <= e <= 3) along the pixel axis nearer the Gaussian's major axis, e = floor(pos_step_gamma / 2 * -log2(cos^2 / r^2 + sin^2)) of the angle to that axis and its axis ratio r (the position sensitivity along that axis relative to the minor axis); computed from the quantized scales and rotation, so decoders repeat them; requires a rot_step that divides 90 degrees
-pos_step_gamma:        1.0 # pos_step_adapt "major": exponent on the sensitivity ratio (at most 2)
-scale_prediction:      True # With quant_mode "step": code the sum of each Gaussian's two quantized log2 scales as the residual of a prediction from the distances to its nearest Gaussians (compress.scale_prediction; dense regions hold small Gaussians) and their halved difference; decoders repeat it from the positions they have before the scales
+rot_step:              0.703125 # Rotation step in degrees; per-Gaussian rotation steps require it to divide 22.5°, per-Gaussian position steps 90°
+feat_step:             0.015625 # Feature step (RGB); set by --qp
+y_step:                0.015625 # Y step (YUV); set by --qp
+uv_step:               0.015625 # U and V step (YUV); set by --qp
+uv_step_ratio:         2.0 # YUV: factor on the U and V step that gives the error of RGB features; only with --qp
+y_step_ratio:          1.0 # YUV: factor on the Y step that gives the error of RGB features; only with --qp
+feat_step_adapt:       "weight" # {weight, none} Per-Gaussian feature steps by the sum of the squared blending weights, or uniform
+feat_step_gamma:       0.25 # Strength: steps scale as (proxy / its geometric mean)^−γ, snapped to powers of 2^(1/4) in [1/4, 4]
+uv_step_gamma:         -1.0 # YUV: feat_step_gamma of U and V; negative uses feat_step_gamma
+rot_step_adapt:        "aspect" # {aspect, none} Per-Gaussian rotation steps by aspect ratio, or uniform
+rot_step_aspect:       3.0 # Aspect ratio in octaves from which Gaussians keep rot_step
+rot_step_gamma:        0.5 # Exponent on the rotation sensitivity ratio
+pos_step_adapt:        "major" # {major, none} Per-Gaussian position steps along the major axis with two-stage positions, or uniform
+pos_step_gamma:        1.0 # Exponent on the position sensitivity ratio
+scale_prediction:      True # step: code the scales as residuals of their prediction
 
-wrap_rot:              False # Wrap Gaussian orientations to [0, pi) before quantization
-canonical_rot:         True # Store each Gaussian (saved model, bitstream, rate estimates) with its orientation in [-pi/4, pi/4]: rotated by a multiple of pi/2, with its axes swapped for odd multiples (the same ellipse), which makes the rotation cheaper to code; with a rot_step that divides 90 degrees, the quantization grid of the ellipses is unchanged, so optimization renders the rotation as it is
-bitstream_codec:       "rans" # Write a compressed bitstream of the quantized Gaussians after optimization (or with eval) and verify that it decodes losslessly, valid values include "none", "lzma", and "rans"
-color_transform:       "subtract-green" # Lossless transform of quantized RGB features before entropy coding (any bitstream_codec; YUV features are coded as they are), valid values include "none" and "subtract-green" (R-G, G, B-G as in WebP lossless)
-feat_prediction:       True # Code the quantized features as residuals of a lossless prediction from the nearest earlier Gaussians in bitstream order (compress.prediction): Y, or G, from their mean, and U from Y, V from U, or R-G and B-G from G, by a local linear fit (CCLM-style); decoders repeat it after decoding the geometry
+bitstream_codec:       "rans" # {rans, none} Entropy coder (none: no bitstream); requires quantization
+color_transform:       "subtract-green" # {subtract-green, none} RGB: code R−G, G, B−G; ignored in YUV
+feat_prediction:       True # Code the features as residuals of their prediction
 
 # Logging
 log_root:              "results"
@@ -53,47 +51,37 @@ save_ckpt_steps:       100000 # Frequency of checkpointing during optimization
 eval_steps:            100
 
 # Target images
-color_space:           "yuv" # Color space of Gaussian features and training losses, valid values include "yuv" and "rgb" (metrics and saved images are always RGB); the uv_* and y_* settings apply to YUV only
-uv_weight:             0.25 # YUV mode: the training losses, the error of lambda pruning, and the error map that places added Gaussians compare the RGB images of Y and uv_weight times U and V (1: RGB images as in RGB mode; below 1 favors luma, e.g., for VMAF, while a luma error counts as in RGB)
-gamma:                 1.0 # Optimize in a gamma-corrected space, modify with caution
+color_space:           "yuv" # {yuv, rgb} Color space of the Gaussian features and losses
+uv_weight:             0.25 # YUV: weight of chroma in the losses, the pruning error, and the error map of densification; 1 matches RGB
 data_root:             "media"
 input_path:            "uvg/480p/Beauty_0001.png" # Path to an image file or a directory containing a texture stack
-downsample:            False # Load a downsampled version of the input image or texture stack as the optimization target to evaluate image upsampling performance
-downsample_ratio:      2.0
 
 # Gaussians
-num_gaussians:         1000 # Number of Gaussians (with qp 0; e.g., "--qp 0 --num_gaussians 2000 --prune_times 1" for a fixed number with 10% pruned in one round)
-qp:                    32.0 # Quantization parameter as in HEVC (0 disables it and uses num_gaussians); sets num_gaussians, prune_mode "lambda", prune_lambda, and the feature steps
-qp_overestimate:       0.6 # Factor on the number of Gaussians that paid off at most for the test images at the QP (with qp)
-qp_lambda_scale:       4.0 # Factor on HEVC's lambda for pruning (with qp)
-rate_weight:           0.25 # With qp and quant_mode "step": weight of a rate term in the training loss, relative to the pruning lambda (converted from squared error to the L1 loss at its current value): estimated bits of the features as residuals of their prediction and of the canonical rotations by aspect class (compress.rate), 0 is off
-rate_uv_weight:        -1.0 # YUV mode with rate_weight: weight of the U and V bits in the rate term (negative: uv_weight, which trades chroma off as in RGB mode; 1 counts their bits fully, which VMAF does not see)
-qp_offset:             6.47 # The settings are derived at QP qp_offset + qp_slope * qp, so that the PSNR at a QP matches x265's (all-intra, qp=) at the same QP at encoding budgets of 2-4 s (with qp; 0 and 1 derive them at qp itself)
-qp_slope:              0.767 # See qp_offset
-init_scale:            2.25 # Initial Gaussian scale in number of pixels (with init_scale_knn 0)
-init_scale_knn:        0.4 # With a positive value: the initial scale of each Gaussian, also of those added by densification, is this factor times the RMS distance to its 3 nearest Gaussians in pixels instead of init_scale, so that sparse Gaussians cover the image from the start (0 uses init_scale)
-init_fine_ratio:       0.5 # Fraction of the initial Gaussians placed on the strongest fine blobs of the target luma (determinant-of-Hessian maxima up to 1.4 px scale), isotropic at the blob's scale; the others are placed and sized as without it, among themselves (0 is off)
-init_aspect:           4.0 # Maximum aspect ratio of initial and added Gaussians: elongated along the edges of the target by the coherence of its structure tensor, at the same area (1 keeps them isotropic)
-topk:                  10 # Warning: Must match hardcoded value in CUDA kernel, modify with caution
-disable_topk_norm:     False # Disable top-K normalization
-disable_inverse_scale: False # Disable inverse Gaussian scale optimization
-max_scale:             0.0 # Upper bound of the Gaussian scales in pixels (0 disables it), enforced after each optimization step; large Gaussians slow down rasterization
+num_gaussians:         1000 # Number of Gaussians without --qp; set by --qp
+qp:                    32.0 # HEVC-like quantization parameter; 0 disables QP rate control
+qp_overestimate:       0.6 # Factor on the content-agnostic number of Gaussians before pruning; only with --qp
+qp_lambda_scale:       4.0 # Factor on HEVC's λ for pruning and the rate term; only with --qp
+rate_weight:           0.25 # Weight of the rate term in the loss, relative to λ; 0 disables it; requires quant_mode step; only with --qp
+rate_uv_weight:        -1.0 # YUV: weight of the U and V bits in the rate term; negative uses uv_weight; only with --qp
+qp_offset:             6.47 # Offset of the QP mapping (0 with qp_slope 1 derives the settings at the QP itself); only with --qp
+qp_slope:              0.767 # Slope of the QP mapping; only with --qp
+init_scale:            2.25 # Initial size in pixels (with init_scale_knn 0)
+init_scale_knn:        0.4 # Initial size as a factor of the RMS distance to the 3 nearest Gaussians; 0 uses init_scale
+init_fine_ratio:       0.5 # Fraction of the Gaussians placed on fine blobs; 0 disables it
+init_aspect:           4.0 # Maximum aspect ratio of initial and added Gaussians along edges; 1 keeps them isotropic
+max_scale:             0.0 # Upper bound of the Gaussian scales in pixels (0 disables it); large Gaussians slow down rasterization
 ckpt_file:             ""
-disable_color_init:    False
-add_color_init:        "target" # Features of Gaussians added by densification, valid values include "residual" (the error of the rendered image at the pixel) and "target" (the target at the pixel, as at initialization)
-init_mode:             "local-std" # Gaussian position initialization mode (of the Gaussians other than the fine blobs), valid values include "gradient" (density by the squared image gradient), "saliency", "random", and "local-std" (density by the local luma standard deviation to the power init_std_gamma, about the allocation that optimization ends with at every rate; with init_fine_ratio 0, one population whose spacing sets the scales at every scale)
-init_std_gamma:        0.8 # init_mode "local-std": exponent of the local standard deviation in the density of initial positions
-init_random_ratio:     0.0 # Share of the Gaussians other than the fine blobs placed uniformly at random instead of by init_mode
-smap_filter_size:      20 # Gaussian filter size for smoothing saliency maps
+add_color_init:        "target" # {target, residual} Features of added Gaussians: the target, or the error of the rendered image at the pixel
+init_mode:             "local-std" # {local-std, gradient, random} Position density of the Gaussians that are not on fine blobs: local luma standard deviation, squared image gradient, or uniform
+init_std_gamma:        0.8 # local-std: exponent of the local standard deviation
+init_random_ratio:     0.0 # Fraction of the other Gaussians placed uniformly at random instead of by init_mode
 
 # Loss functions
 l1_loss_ratio:         1.0
-l2_loss_ratio:         0.0
 ssim_loss_ratio:       0.1
 
 # Optimization
-disable_tiles:         False # Disable tile-based rendering (warning: optimization and rendering without tiles will be way slower)
-max_steps:             10000 # Maximum number of optimization steps
+max_steps:             10000 # Maximum number of steps; set it high with max_time, so that the budget decides
 pos_lr:                5.0e-4
 scale_lr:              2.0e-3
 rot_lr:                2.0e-3
@@ -103,23 +91,17 @@ decay_ratio:           10.0
 check_decay_steps:     1000
 max_decay_times:       1
 decay_threshold:       1.0e-3
-max_time:              0.0 # Time budget of the optimization in seconds (0 disables it): GPU-synchronized optimization steps plus densification and pruning, without evaluation and logging; optimization stops at max_time or max_steps, whichever comes first
-prune_time_ratio:      0.1667 # With max_time: fraction of the time budget before each pruning round (replaces prune_steps)
-decay_time_ratio:      0.8333 # With max_time: fraction of the time budget after which the learning rate decays once by decay_ratio (replaces the adaptive schedule)
-disable_prog_optim:    True # Disable error-guided progressive optimization (start with all Gaussians; --no-disable_prog_optim enables it)
-initial_ratio:         0.5
-add_steps:             500
-add_times:             4
-post_min_steps:        3000
+max_time:              0.0 # Optimization time budget in seconds; 0 disables it and decays the learning rate when PSNR stops improving
+prune_time_ratio:      0.1667 # With max_time: fraction of the budget before each round
+decay_time_ratio:      0.8333 # With max_time: fraction of the budget after which the learning rate decays once by decay_ratio
+post_min_steps:        3000 # Minimum number of optimization steps after the last pruning round without max_time (raises max_steps if needed)
 
 # Pruning
-prune_mode:            "ratio" # How many Gaussians to prune, valid values include "ratio" (prune_ratio of num_gaussians) and "lambda" (the Gaussians whose removal costs less than prune_lambda times their bits; requires prune_score "loo")
-prune_ratio:           0.1 # Fraction of num_gaussians with the lowest score to prune once progressive optimization has added all Gaussians (prune_mode "ratio"; the compression rate is based on the remaining Gaussians)
-prune_lambda:          0.0 # Rate-distortion trade-off of prune_mode "lambda": increase of the squared error (summed over pixels, averaged over channels, in 8-bit units, i.e., MSE x pixels) per bit; HEVC uses 0.57 * 2^((QP-12)/3)
-prune_max_ratio:       0.25 # Maximum fraction of the Gaussians removed per round with prune_mode "lambda" (leave-one-out scores ignore that removed neighbors compensate each other)
-prune_add_ratio:       0.25 # With prune_mode "lambda" (ignored otherwise): after each pruning round but the last, add this fraction of the Gaussians at high-error pixels, which the next round keeps only if they pay off (so the number of Gaussians can grow)
-prune_times:           4 # Number of pruning rounds, each removing an equal share (prune_mode "ratio"), or maximum number of rounds, which stop early once a round finds no Gaussian to remove (prune_mode "lambda")
-prune_steps:           500 # Optimization steps before each pruning round
-prune_min_steps:       20 # With max_time: minimum number of optimization steps before each pruning round (since the previous one or the start), so that a stall does not set off several rounds at consecutive steps; rounds still due at the learning rate decay (decay_time_ratio) are skipped
-prune_score:           "loo" # Ranking of Gaussians for pruning, valid values include "contribution" (total blending weight) and "loo" (leave-one-out increase of the L1 loss)
-relocate_ratio:        0.0 # Fraction of the Gaussians with the lowest score to replace at each densification step by additional error-guided Gaussians (keeps the number of Gaussians unchanged)
+prune_mode:            "ratio" # {lambda, ratio} Rate–distortion pruning with densification, or a fixed fraction; --qp sets lambda
+prune_ratio:           0.1 # ratio: fraction of num_gaussians removed in total
+prune_lambda:          0.0 # lambda: squared-error increase per bit below which a Gaussian is removed; set by --qp
+prune_max_ratio:       0.25 # lambda: maximum fraction of the Gaussians removed per round
+prune_add_ratio:       0.25 # lambda: Gaussians added after each round but the last, as a fraction of the remaining ones; 0 disables densification
+prune_times:           4 # Number of rounds (ratio), or maximum number of rounds (lambda)
+prune_steps:           500 # Optimization steps before each round (without max_time)
+prune_min_steps:       20 # With max_time: minimum steps before each round, so that a stall does not trigger several rounds in a row

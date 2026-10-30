@@ -106,7 +106,7 @@ def find_blobs(image, num, scales, max_scale):
     return pixels, torch.tensor(scales, dtype=image.dtype, device=image.device)[level[pixels]]
 
 
-def load_images(load_path, downsample_ratio=None, gamma=None):
+def load_images(load_path):
     """
     Load target images or textures from a directory or a single file.
     """
@@ -152,17 +152,12 @@ def load_images(load_path, downsample_ratio=None, gamma=None):
             if image.dtype != np.float32:
                 raise ValueError(f"Unsupported image dtype: {image.dtype}")
             bit_depth_list.append(32)
-        if downsample_ratio is not None:
-            height, width = image.shape[:2]
-            image = cv2.resize(image, (round(width/downsample_ratio), round(height/downsample_ratio)), interpolation=cv2.INTER_LANCZOS4)
-        if gamma is not None and gamma != 1.0:  # np.power(image, 1.0) copies the image unchanged
-            image = np.power(image, gamma)
         image = image.transpose(2, 0, 1)
         image_list.append(image)
     return np.concatenate(image_list, axis=0), num_channels_list, image_fname_list, bit_depth_list
 
 
-def to_output_format(image, image_format, gamma):
+def to_output_format(image, image_format):
     if image_format not in ALLOWED_IMAGE_FILE_FORMATS:
         raise ValueError(f"Invalid image format: {image_format}")
     if len(image.shape) not in [2, 3]:
@@ -176,8 +171,6 @@ def to_output_format(image, image_format, gamma):
     if len(image.shape) == 3 and image.shape[2] == 1:
         image = image.squeeze(axis=2)
     image = image.astype(np.float32)
-    if gamma is not None:
-        image = np.power(image, 1.0/gamma)
     if image_format in [".jpeg", ".jpg"]:
         image = np.clip(image, 0.0, 1.0)
         image = (255.0 * image).astype(np.uint8)
@@ -187,9 +180,9 @@ def to_output_format(image, image_format, gamma):
     return image
 
 
-def save_image(image, save_path, gamma=None, zoom=None):
+def save_image(image, save_path, zoom=None):
     image_format = os.path.splitext(save_path)[1].lower()
-    image = to_output_format(image, image_format, gamma)
+    image = to_output_format(image, image_format)
     if zoom is not None and zoom > 0.0:
         height, width = image.shape[:2]
         image = cv2.resize(image, (round(width*zoom), round(height*zoom)), interpolation=cv2.INTER_NEAREST)
@@ -209,7 +202,7 @@ def separate_image_channels(images, input_channels):
     return image_list
 
 
-def visualize_gaussian_footprint(filepath, xy, scale, rot, feat, img_h, img_w, input_channels, alpha=0.8, gamma=None, save_image_format="jpg"):
+def visualize_gaussian_footprint(filepath, xy, scale, rot, feat, img_h, img_w, input_channels, alpha=0.8, save_image_format="jpg"):
     """
     Visualize the footprint of Gaussians using colored elliptical disks.
     """
@@ -219,8 +212,6 @@ def visualize_gaussian_footprint(filepath, xy, scale, rot, feat, img_h, img_w, i
     y, x = xy[:, 1] * img_h, xy[:, 0] * img_w
     scale = GAUSSIAN_ZOOM * scale.detach().cpu().clone().numpy()
     rot = rot.detach().cpu().clone().numpy()
-    if gamma is not None:
-        feat = torch.pow(feat, 1.0/gamma)
     feat = np.clip(feat.detach().cpu().clone().numpy(), 0.0, 1.0)
 
     curr_channel = 0
@@ -246,7 +237,7 @@ def visualize_gaussian_footprint(filepath, xy, scale, rot, feat, img_h, img_w, i
         curr_channel += num_channels
 
 
-def visualize_gaussian_position(filepath, images, xy, input_channels, color="#7bf1a8", size=700, every_n=10, alpha=0.8, gamma=None, save_image_format="jpg"):
+def visualize_gaussian_position(filepath, images, xy, input_channels, color="#7bf1a8", size=700, every_n=10, alpha=0.8, save_image_format="jpg"):
     """
     Visualize the position of Gaussians using dots.
     """
@@ -259,7 +250,7 @@ def visualize_gaussian_position(filepath, images, xy, input_channels, color="#7b
     curr_channel = 0
     for image_id, num_channels in enumerate(input_channels, 1):
         image = images[curr_channel:curr_channel+num_channels]
-        image = to_output_format(image, f".{save_image_format}", gamma)
+        image = to_output_format(image, f".{save_image_format}")
         fig = plt.figure()
         fig.set_dpi(PLOT_DPI)
         fig.set_size_inches(w=image_width/PLOT_DPI, h=image_height/PLOT_DPI, forward=False)
@@ -275,9 +266,9 @@ def visualize_gaussian_position(filepath, images, xy, input_channels, color="#7b
         curr_channel += num_channels
 
 
-def visualize_added_gaussians(filepath, images, old_xy, new_xy, input_channels, size=500, every_n=5, alpha=0.8, gamma=None, save_image_format="jpg"):
+def visualize_added_gaussians(filepath, images, old_xy, new_xy, input_channels, size=500, every_n=5, alpha=0.8, save_image_format="jpg"):
     """
-    Visualize the positions of added Gaussians during error-guided progressive optimization.
+    Visualize the positions of the Gaussians new_xy (added or removed) among the Gaussians old_xy.
     """
     if len(images) != sum(input_channels):
         raise ValueError(f"Incompatible number of channels: {len(images):d} vs {sum(input_channels):d}")
@@ -290,7 +281,7 @@ def visualize_added_gaussians(filepath, images, old_xy, new_xy, input_channels, 
     curr_channel = 0
     for image_id, num_channels in enumerate(input_channels, 1):
         image = images[curr_channel:curr_channel+num_channels]
-        image = to_output_format(image, f".{save_image_format}", gamma)
+        image = to_output_format(image, f".{save_image_format}")
         fig = plt.figure()
         fig.set_dpi(PLOT_DPI)
         fig.set_size_inches(w=image_width/PLOT_DPI, h=image_height/PLOT_DPI, forward=False)
@@ -307,9 +298,8 @@ def visualize_added_gaussians(filepath, images, old_xy, new_xy, input_channels, 
         curr_channel += num_channels
 
 
-def save_error_maps(path, images, gt_images, channels, gamma, save_image_format="jpg"):
-    images = torch.pow(torch.clamp(images, 0.0, 1.0), 1.0/gamma)
-    gt_images = torch.pow(gt_images, 1.0/gamma)
+def save_error_maps(path, images, gt_images, channels, save_image_format="jpg"):
+    images = torch.clamp(images, 0.0, 1.0)
     images_sep = separate_image_channels(images, channels)
     gt_images_sep = separate_image_channels(gt_images, channels)
     for idx, (image, gt_image) in enumerate(zip(images_sep, gt_images_sep), 1):

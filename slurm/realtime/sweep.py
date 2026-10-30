@@ -7,9 +7,9 @@ Arms (settings loaded from the earlier sweeps):
   fixed-n-noprune    the same without pruning (no rounds, so no CUDA graph recaptures either)
   qp-lam4            QP rate control, lambda x4 pruning from an overestimate (slurm/qp/sweep.py, arm cap25x4-lam4)
   qp-lam4-mid-add25  the same, starting in the middle and adding Gaussians between the rounds (slurm/qp/sweep.py, cap25x4-lam4-mid-add25)
-  qp-lam4-mid-add25-weight, qp-lam4-mid-add25-area
-                     the same with per-Gaussian feature steps in the saved model (feat_step_adapt "weight" or "area"; the other arms keep
-                     the uniform step of the earlier sweeps); not in the default arms
+  qp-lam4-mid-add25-weight
+                     the same with per-Gaussian feature steps in the saved model (feat_step_adapt "weight"; the other arms keep the uniform
+                     step of the earlier sweeps); not in the default arms
   qp-lam4-mid-add25-weight-map
                      the weight arm with the settings derived at the mapped QP 6.47 + 0.767 * QP, so that the PSNR matches x265's at the
                      same QP (the default configuration; the other QP arms derive them at the QP itself); not in the default arms
@@ -70,8 +70,6 @@ ARMS = {
                                  QP_RATES),
     "qp-lam4-mid-add25-weight-map": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "feat_step_adapt": "weight", "feat_step_gamma": 0.25,
                                      "qp_offset": 6.47, "qp_slope": 0.767}, "qp", QP_RATES),
-    "qp-lam4-mid-add25-area": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "feat_step_adapt": "area", "feat_step_gamma": 0.3}, "qp",
-                               QP_RATES),
     "qp-lam4-mid-add25-float": ({**QP.FIXED, **QP.ARMS["cap25x4-lam4-mid-add25"], "quant_mode": "none", "bitstream_codec": "none"}, "qp",
                                 QP_RATES),
 }

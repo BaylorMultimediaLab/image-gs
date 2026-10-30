@@ -1,8 +1,7 @@
 """
-Bitstream container of quantized Gaussian attributes. The steps are independent of the entropy coder: Gaussians are sorted along the
-Morton curve of their positions, positions are coded as gaps between sorted Morton codes, optional lossless channel transforms are
-applied (e.g., subtract-green), and the quantization parameters are stored in a bit-packed header. The resulting integer streams are
-entropy-coded with LZMA (compress.lzma_codec) or rANS (compress.rans_codec).
+Bitstream container of quantized Gaussian attributes: Gaussians are sorted along the Morton curve of their positions, positions are coded
+as gaps between sorted Morton codes, optional lossless channel transforms are applied (e.g., subtract-green), and the quantization
+parameters are stored in a bit-packed header. The resulting integer streams are entropy-coded with rANS (compress.rans_codec).
 
 Two-stage positions (refine_bits > 0): the Morton curve and the gaps are those of coarse positions (the position indices shifted right by
 refine_bits), and the low bits of each coordinate follow as raw refinement bits, of which a Gaussian may omit the lowest e (per-axis
@@ -13,13 +12,12 @@ import struct
 
 import numpy as np
 
-import compress.lzma_codec as lzma_codec
 import compress.rans_codec as rans_codec
 from compress.common import BitReader, BitWriter, add_channels, morton_decode, morton_encode, morton_order, subtract_channels
 
 MAGIC = b"IGS1"
 HEADER = "<4sBIBB"  # Magic, codec (low 4 bits) and refinement bits (high 4 bits), number of Gaussians, metadata length, number of attributes
-CODECS = {"lzma": lzma_codec, "rans": rans_codec}  # Codec ids follow this order
+CODECS = {"rans": (1, rans_codec)}  # Entropy coders by name: id in the header, module
 
 
 def _write_params(writer, steps, origins):
@@ -103,9 +101,9 @@ def _unpack_bits(data, bit_pos, lengths):
     return values
 
 
-def encode_bitstream(attributes, meta=b"", codec="lzma", channel_refs=None, refine_bits=0, refine_exponents=None):
+def encode_bitstream(attributes, meta=b"", codec="rans", channel_refs=None, refine_bits=0, refine_exponents=None):
     """
-    Encode quantized Gaussian attributes into a bitstream with the given entropy coder ("lzma" or "rans").
+    Encode quantized Gaussian attributes into a bitstream with the given entropy coder (CODECS).
     attributes: list of (indices [P, C] int64, steps [C] float64, origins [C] float64), where the first attribute is the position (C = 2).
     channel_refs: optional reference channels per attribute (None or a list [C], see compress.common.subtract_channels), e.g.,
     [None, None, None, [1, -1, 1]] codes the features as R-G, G, B-G.
@@ -150,8 +148,9 @@ def encode_bitstream(attributes, meta=b"", codec="lzma", channel_refs=None, refi
         writer.write_ue(total)
         writer.write(value, total)
         header_bits[0] += writer.num_bits - num_bits
-    payload, group_bits = CODECS[codec].encode_streams(groups, writer)
-    header = struct.pack(HEADER, MAGIC, list(CODECS).index(codec) | refine_bits << 4, len(order), len(meta), len(attributes)) + meta
+    codec_id, module = CODECS[codec]
+    payload, group_bits = module.encode_streams(groups, writer)
+    header = struct.pack(HEADER, MAGIC, codec_id | refine_bits << 4, len(order), len(meta), len(attributes)) + meta
     data = header + writer.to_bytes() + payload
     return data, order, [(bits + coded_bits) / 8.0 for bits, coded_bits in zip(header_bits, group_bits)]
 
@@ -181,7 +180,8 @@ def decode_bitstream(data, reconstruct=None):
     """
     magic, codec_byte, num_gaussians, meta_len, num_attributes = struct.unpack_from(HEADER, data)
     codec_id, refine_bits = codec_byte & 15, codec_byte >> 4
-    if magic != MAGIC or codec_id >= len(CODECS):
+    modules = dict(CODECS.values())
+    if magic != MAGIC or codec_id not in modules:
         raise ValueError("Not an Image-GS bitstream")
     pos = struct.calcsize(HEADER)
     meta = data[pos:pos+meta_len]
@@ -200,7 +200,7 @@ def decode_bitstream(data, reconstruct=None):
         refine_pos = reader.bit_pos
         reader.bit_pos += refine_total
     num_streams = [1] + [num_channels for num_channels, _, _, _ in params[1:]]
-    groups = list(CODECS.values())[codec_id].decode_streams(reader, data, num_streams, num_gaussians)
+    groups = modules[codec_id].decode_streams(reader, data, num_streams, num_gaussians)
     attributes = []
     for idx, ((_, steps, origins, extra), streams) in enumerate(zip(params, groups)):
         if idx == 0:
