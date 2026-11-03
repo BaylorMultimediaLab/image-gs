@@ -11,8 +11,8 @@ from utils.misc_utils import load_cfg
 
 def get_gaussian_cfg(args):
     if args.qp > 0.0:  # The number of Gaussians, the feature step, and lambda are derived from the (mapped) QP
-        gaussian_cfg = (f"qp-{args.qp:g}-at-{get_mapped_qp(args):.4g}-over-{args.qp_overestimate:g}_prune-x{args.prune_times:d}-"
-                        f"max-{args.prune_max_ratio:g}")
+        gaussian_cfg = (f"qp-{args.qp:g}-at-{get_mapped_qp(args):.4g}-over-{args.qp_overestimate:g}_prune-iv{args.prune_max_interval:d}-"
+                        f"{args.prune_end_ratio:.2g}-max-{args.prune_max_ratio:g}")
         if args.qp_lambda_scale != 1.0:
             gaussian_cfg += f"-lam-x{args.qp_lambda_scale:g}"
         if args.prune_add_ratio > 0.0:
@@ -21,12 +21,11 @@ def get_gaussian_cfg(args):
             gaussian_cfg += f"_rw-{args.rate_weight:g}" + (f"-uv-{args.rate_uv_weight:g}" if args.rate_uv_weight >= 0.0 else "")
     else:
         gaussian_cfg = f"num-{args.num_gaussians:d}"
-        if args.prune_mode == "lambda":
-            gaussian_cfg += f"_prune-lambda-{args.prune_lambda:g}-x{args.prune_times:d}-max-{args.prune_max_ratio:g}"
+        if args.prune_lambda > 0.0:
+            gaussian_cfg += (f"_prune-lambda-{args.prune_lambda:g}-iv{args.prune_max_interval:d}-{args.prune_end_ratio:.2g}-"
+                             f"max-{args.prune_max_ratio:g}")
             if args.prune_add_ratio > 0.0:
                 gaussian_cfg += f"-add-{args.prune_add_ratio:g}"
-        elif args.prune_ratio > 0.0:
-            gaussian_cfg += f"_prune-{args.prune_ratio:.2f}"
     gaussian_cfg += f"_init-{args.init_scale:.1f}"
     if args.init_scale_knn > 0.0:
         gaussian_cfg += f"-knn-{args.init_scale_knn:g}"
@@ -54,7 +53,7 @@ def get_gaussian_cfg(args):
         gaussian_cfg += f"_bits-{args.pos_bits:d}-{args.scale_bits:d}-{args.rot_bits:d}-{args.feat_bits:d}"
         if args.color_space == "yuv":
             gaussian_cfg += f"_yuv-{args.y_bits:d}-{args.uv_bits:d}"
-    if args.quant_mode == "none" and (args.qp > 0.0 or args.prune_mode == "lambda"):  # The steps estimate the bits for lambda pruning
+    if args.quant_mode == "none" and (args.qp > 0.0 or args.prune_lambda > 0.0):  # The steps estimate the bits for lambda pruning
         feat_step = "qp" if args.qp > 0.0 else f"{args.feat_step:g}"
         gaussian_cfg += f"_rate-steps-{args.pos_step:g}-{args.scale_step:g}-{args.rot_step:g}-{feat_step}"
     if args.quant_mode == "step":  # Per-Gaussian feature (w: weight), rotation (r), and position (p) steps, and the scale prediction (s)
@@ -84,9 +83,9 @@ def get_log_dir(args):
     loss_cfg = f"l1-{args.l1_loss_ratio:.1f}_ssim-{args.ssim_loss_ratio:.1f}"
     folder = f"{gaussian_cfg}_{loss_cfg}"
     if not args.disable_lr_schedule:
-        folder += f"_decay-{args.max_decay_times:d}-{args.decay_ratio:.1f}"
-    if args.max_time > 0.0:
-        folder += f"_time-{args.max_time:g}"
+        schedule = {"step": "", "after": f"a{args.decay_after_steps:d}-"}.get(args.lr_schedule, f"{args.lr_schedule}-")
+        folder += f"_lr-{schedule}{args.decay_ratio:.1f}"
+    folder += f"_iters-{args.max_steps:d}" if args.max_steps > 0 else f"_time-{args.max_time:g}"
     image = os.path.splitext(args.input_path)[0]
     return f"{args.log_root}/{args.exp_name}/{image}/{folder}"
 
@@ -94,7 +93,7 @@ def get_log_dir(args):
 def warm_up(args):
     warmup_args = copy.copy(args)
     with tempfile.TemporaryDirectory() as log_dir:
-        warmup_args.max_time, warmup_args.log_dir = args.warmup, log_dir
+        warmup_args.max_time, warmup_args.max_steps, warmup_args.log_dir = args.warmup, 0, log_dir
         GaussianSplatting2D(warmup_args).optimize()
     torch.cuda.empty_cache()
 

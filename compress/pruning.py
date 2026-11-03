@@ -27,15 +27,15 @@ def loo_loss_increase(xy, conics, feat, pixel_topk, target, eps, metric="l1", tr
     return increase * (255.0**2 / num_channels if metric == "sse" else 1.0 / target.numel())
 
 
-def select_lambda_pruning(sse_increase, bits_per_gaussian, prune_lambda, max_ratio):
+def select_lambda_pruning(sse_increase, bits_per_gaussian, prune_lambda, max_num):
     """
     The Gaussians of a lambda pruning round: those whose removal increases the squared error (sse_increase [N]) by less than prune_lambda
-    times the bits per Gaussian, at most max_ratio of them (the lowest increases). Returns their indices, the number of Gaussians below the
+    times the bits per Gaussian, at most max_num of them (the lowest increases). Returns their indices, the number of Gaussians below the
     threshold, and the threshold.
     """
     threshold = prune_lambda * bits_per_gaussian
     num_below = int((sse_increase < threshold).sum().item())
-    num = min(num_below, round(max_ratio * len(sse_increase)))
+    num = min(num_below, max_num)
     pruned = torch.topk(sse_increase, num, largest=False).indices if num > 0 else torch.zeros(0, dtype=torch.long, device=sse_increase.device)
     return pruned, num_below, threshold
 

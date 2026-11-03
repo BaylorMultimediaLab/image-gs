@@ -24,13 +24,23 @@ pip install ./compress/csrc --no-build-isolation
 ## Running with the default configuration
 
 ```bash
-# default with all logging enabled, no fixed time budget
-python main.py --input_path uvg/480p/Beauty_0001.png --qp 32
-# real-time mode with a fixed time budget
-python main.py --input_path uvg/480p/Beauty_0001.png --realtime --cuda_graph --max_time 4 --qp 32
+# real-time mode with a time budget and the pruning interval for it (see below)
+python main.py --input_path uvg/<see-below>/Beauty_0001.png --realtime --cuda_graph --max_time <see-below> --prune_max_interval <see-below> --qp 32
 ```
 
-By default, most compression-related options are guided by an HEVC-like QP, passed via the command line as `--qp <value>` (default: 32). For time-budgeted experiments, enable real-time mode and cuda graph capture (see [Speed Improvements](#speed-improvements)). The default config is the one that provides the highest BD-rate w.r.t. x265.
+By default, most compression-related options are guided by an HEVC-like QP, passed via the command line as `--qp <value>` (default: 32). Encoding stops after a time budget of `max_time` seconds (default: 4), or after a budget of `max_steps` steps when given, which then ignores `max_time`. For time-budgeted experiments, enable real-time mode and cuda graph capture (see [Speed Improvements](#speed-improvements)). The default config is the one that provides the highest BD-rate w.r.t. x265.
+
+Pruning rounds are at most `prune_max_interval` steps apart (default: 100, see [Pruning and Densification](#pruning-and-densification)).
+The best interval depends on the resolution and the budget. With the best VMAF BD-rate vs x265 on an A100, it is:
+
+| Resolution | 2 s | 4 s | 10 s | 20 s |
+|---|---|---|---|---|
+| 480p | 100 | 100 | 100 | 200 |
+| 720p | 100 | 200 | 400 | 200 |
+| 1080p | 50 | 100 | 200 | 400 |
+| 2160p | 50\* | 50 | 50 | 50 |
+
+\* With `--prune_max_ratio 0.25 --prune_add_ratio 0.25`: the 4 rounds that fit are too few to prune to λ's number of Gaussians in rounds of 12.5%.
 
 ## Configurations
 
@@ -104,9 +114,10 @@ at the target color at each Gaussian's position. Gaussians added by [densificati
 
 ### Pruning and Densification
 
-Optimization alternates between fitting the Gaussians and changing how many there are. The run is split into rounds, `prune_steps`
-steps apart, or, with `max_time`, at every `prune_time_ratio` of the budget (1/6, 2/6, 3/6, and 4/6 by default). With `--qp`
-(`prune_mode lambda`), each round:
+Optimization alternates between fitting the Gaussians and changing how many there are. The rounds are spread evenly over the
+first `prune_end_ratio` of the budget, in seconds or with `max_steps` in steps: as many as keep them at most `prune_max_interval` steps
+apart (at the step rate so far with a time budget), so that longer budgets and faster steps get more rounds. With `--qp` (or
+`prune_lambda` without it), each round:
 
 1. **Prunes** by rate–distortion: every Gaussian is scored by how much the squared error increases without it (leave-one-out, 8-bit
    units, summed over pixels), and removed if that increase is below λ times the average bits per Gaussian. A round removes at most
@@ -115,23 +126,21 @@ steps apart, or, with `max_time`, at every `prune_time_ratio` of the budget (1/6
    error of the current rendering, shaped as at [initialization](#initialization). The next round keeps them only if they pay off.
 
 The number of Gaussians thus shrinks or grows toward the number that λ pays for, from the start number that `--qp` derives. Pruning
-ends after `prune_times` rounds, or, with `prune_add_ratio 0`, once a round removes none. Optimization then continues with the kept
-Gaussians, and with `max_time`, the learning rate decays once at `decay_time_ratio` of the budget.
+ends after the last round, or, with `prune_add_ratio 0`, once a round removes none. Optimization then continues with the kept
+Gaussians, and the learning rate decays once at `decay_time_ratio` of the budget (`lr_schedule step`), once `decay_after_steps` steps
+after the last round (`lr_schedule after`), exponentially over the whole budget (`lr_schedule exp`), or in cycles that restart at every
+round (`lr_schedule cycle`).
 
-Without `--qp`, `prune_mode ratio` removes a fixed fraction of `num_gaussians` with the lowest leave-one-out increase of the L1 loss in `prune_times` equal rounds,
-without densification.
+Without `--qp` and `prune_lambda`, the `num_gaussians` Gaussians are kept, without pruning or densification.
 
 | Option | Values | Default | Set by `--qp` | Description |
 |---|---|---|---|---|
-| `prune_mode` | `lambda`, `ratio` | `ratio` | yes (`lambda`) | Rate–distortion pruning with densification, or a fixed fraction |
-| `prune_lambda` | > 0 | `0.0` | yes | `lambda`: squared-error increase per bit below which a Gaussian is removed |
-| `prune_max_ratio` | (0, 1) | `0.25` | no | `lambda`: maximum fraction of the Gaussians removed per round |
-| `prune_add_ratio` | ≥ 0 | `0.25` | no | `lambda`: Gaussians added after each round but the last, as a fraction of the remaining ones; `0` disables densification |
-| `prune_times` | int ≥ 1 | `4` | no | Number of rounds (`ratio`), or maximum number of rounds (`lambda`) |
-| `prune_steps` | int | `500` | no | Optimization steps before each round (without `max_time`) |
-| `prune_time_ratio` | (0, 1] | `0.1667` | no | With `max_time`: fraction of the budget before each round |
-| `prune_min_steps` | int ≥ 0 | `20` | no | With `max_time`: minimum steps before each round, so that a stall does not trigger several rounds in a row |
-| `prune_ratio` | [0, 1) | `0.1` | no | `ratio`: fraction of `num_gaussians` removed in total |
+| `prune_lambda` | ≥ 0 | `0.0` | yes | Squared-error increase per bit below which a Gaussian is removed; without `--qp`, `0` disables pruning |
+| `prune_max_ratio` | (0, 1) | `0.125` | no | Maximum fraction of the Gaussians removed per round |
+| `prune_add_ratio` | ≥ 0 | `0.125` | no | Gaussians added after each round but the last, as a fraction of the remaining ones; `0` disables densification |
+| `prune_max_interval` | int ≥ 1 | `100` | no | As many rounds as keep them at most this many steps apart over the first `prune_end_ratio` of the budget (at the step rate so far with `max_time`); best values per resolution and budget in [Running](#running-with-the-default-configuration) |
+| `prune_end_ratio` | (0, 1] | `0.6667` | no | Fraction of the budget over which the rounds are spread evenly |
+| `prune_min_interval` | int ≥ 0 | `20` | no | Minimum steps between rounds (and before the first), so that a stall does not trigger several rounds in a row |
 | `add_color_init` | `target`, `residual` | `target` | no | Features of added Gaussians: the target, or the error of the rendered image at the pixel |
 
 ### Quantization
@@ -192,17 +201,19 @@ the encoder decodes the bitstream and checks that it reproduces the quantized pa
 
 ### Speed Improvements
 
-Encoding is bounded by a time budget (`max_time`) rather than a number of steps; pruning rounds and the single learning-rate decay happen
-at fractions of the budget. `--realtime` (default off) skips what an encoder does not need (saved images, extra metrics, periodic evaluation, bitstream
+Encoding is bounded by a time budget (`max_time`) rather than a number of steps; pruning rounds and the learning-rate decay happen
+at fractions of the budget. `max_steps` sets a budget in steps instead, for runs that do not depend on the speed of the GPU. `--realtime` (default off) skips what an encoder does not need (saved images, extra metrics, periodic evaluation, bitstream
 verification), uses fused Adam, charges the budget by wall-clock time without synchronizing every step, and pauses Python's garbage
 collection during optimization. At low resolutions on fast GPUs, a step is then limited by the CPU launching about 110 kernels;
 `--cuda_graph` (default off) replays each step from a CUDA graph instead, captured again after every pruning or densification round.
 
 | Option | Values | Default | Set by `--qp` | Description |
 |---|---|---|---|---|
-| `max_time` | ≥ 0 | `0.0` | no | Optimization time budget in seconds; `0` disables it and decays the learning rate when PSNR stops improving |
-| `max_steps` | int | `10000` | no | Maximum number of steps; set it high with `max_time`, so that the budget decides |
-| `decay_time_ratio` | (0, 1] | `0.8333` | no | With `max_time`: fraction of the budget after which the learning rate decays once by `decay_ratio` |
+| `max_time` | > 0 | `4.0` | no | Optimization time budget in seconds; ignored with `max_steps` |
+| `max_steps` | int ≥ 0 | `0` | no | Budget in steps instead of `max_time` (which is then ignored), with the same schedule at fractions of it; `0` uses `max_time` |
+| `decay_time_ratio` | (0, 1] | `0.8333` | no | Fraction of the budget after which the learning rate decays once by `decay_ratio` |
+| `lr_schedule` | `step`, `after`, `exp`, `cycle` | `step` | no | A single decay by `decay_ratio` at `decay_time_ratio` of the budget, a single one `decay_after_steps` steps after the last pruning round (at the latest at `decay_time_ratio`), an exponential decay by `decay_ratio` over the budget, or one from the start and from each pruning round to the next round (the last one to the end) |
+| `decay_after_steps` | int ≥ 0 | `500` | no | `lr_schedule after`: steps between the last pruning round and the learning rate decay |
 | `realtime` | bool | `false` | no | Real-time encoding |
 | `cuda_graph` | bool | `false` | no | Replay each step from a CUDA graph; requires `realtime`, `quant_mode step` or `none` |
 | `warmup` | ≥ 0 | `2.0` | no | With `realtime`: discarded encode of this many seconds before the real one, so that first-use costs (kernel loading, the first graph capture and rounds) stay out of the budget; `0` disables it |

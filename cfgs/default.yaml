@@ -82,27 +82,22 @@ l1_loss_ratio:         1.0
 ssim_loss_ratio:       0.1
 
 # Optimization
-max_steps:             10000 # Maximum number of steps; set it high with max_time, so that the budget decides
+max_steps:             0 # Budget in steps instead of max_time (which is then ignored), so that a run does not depend on the speed of the GPU; 0 uses max_time
 pos_lr:                5.0e-4
 scale_lr:              2.0e-3
 rot_lr:                2.0e-3
 feat_lr:               5.0e-3
-disable_lr_schedule:   False # Disable learning rate schedule and early stopping
-decay_ratio:           10.0
-check_decay_steps:     1000
-max_decay_times:       1
-decay_threshold:       1.0e-3
-max_time:              0.0 # Optimization time budget in seconds; 0 disables it and decays the learning rate when PSNR stops improving
-prune_time_ratio:      0.1667 # With max_time: fraction of the budget before each round
-decay_time_ratio:      0.8333 # With max_time: fraction of the budget after which the learning rate decays once by decay_ratio
-post_min_steps:        3000 # Minimum number of optimization steps after the last pruning round without max_time (raises max_steps if needed)
+disable_lr_schedule:   False # Disable the learning rate decay
+decay_ratio:           10.0 # Factor of the learning rate decay
+max_time:              4.0 # Optimization time budget in seconds (without max_steps)
+decay_time_ratio:      0.8333 # Fraction of the budget after which the learning rate decays once by decay_ratio
+lr_schedule:           "step" # {step, after, exp, cycle} A single decay by decay_ratio at decay_time_ratio of the budget, a single one decay_after_steps steps after the last pruning round (at the latest at decay_time_ratio), an exponential decay by decay_ratio over the budget, or one from the start and from each pruning round to the next round (the last one to the end)
+decay_after_steps:     500 # lr_schedule after: steps between the last pruning round and the learning rate decay
 
 # Pruning
-prune_mode:            "ratio" # {lambda, ratio} Rate–distortion pruning with densification, or a fixed fraction; --qp sets lambda
-prune_ratio:           0.1 # ratio: fraction of num_gaussians removed in total
-prune_lambda:          0.0 # lambda: squared-error increase per bit below which a Gaussian is removed; set by --qp
-prune_max_ratio:       0.25 # lambda: maximum fraction of the Gaussians removed per round
-prune_add_ratio:       0.25 # lambda: Gaussians added after each round but the last, as a fraction of the remaining ones; 0 disables densification
-prune_times:           4 # Number of rounds (ratio), or maximum number of rounds (lambda)
-prune_steps:           500 # Optimization steps before each round (without max_time)
-prune_min_steps:       20 # With max_time: minimum steps before each round, so that a stall does not trigger several rounds in a row
+prune_lambda:          0.0 # Rate–distortion pruning: squared-error increase per bit below which a Gaussian is removed; set by --qp; without --qp, 0 keeps the num_gaussians Gaussians
+prune_max_ratio:       0.125 # Maximum fraction of the Gaussians removed per round
+prune_add_ratio:       0.125 # Gaussians added after each round but the last, as a fraction of the remaining ones; 0 disables densification
+prune_max_interval:    100 # As many rounds as keep them at most this many steps apart over the first prune_end_ratio of the budget (at the step rate so far with max_time)
+prune_end_ratio:       0.6667 # Fraction of the budget over which the rounds are spread evenly
+prune_min_interval:    20 # Minimum steps between rounds (and before the first), so that a stall does not trigger several rounds in a row
