@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=igs_setup
 #SBATCH --output=results/slurm-logs/%x.%j.out
+#SBATCH --error=results/slurm-logs/%x.%j.err
 #SBATCH --account=lp_h_opt_ga
 #SBATCH --cluster=wice
 #SBATCH --partition=gpu_a100
