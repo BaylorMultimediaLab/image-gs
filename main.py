@@ -82,9 +82,8 @@ def get_log_dir(args):
     gaussian_cfg = get_gaussian_cfg(args)
     loss_cfg = f"l1-{args.l1_loss_ratio:.1f}_ssim-{args.ssim_loss_ratio:.1f}"
     folder = f"{gaussian_cfg}_{loss_cfg}"
-    if not args.disable_lr_schedule:
-        schedule = {"step": "", "after": f"a{args.decay_after_steps:d}-"}.get(args.lr_schedule, f"{args.lr_schedule}-")
-        folder += f"_lr-{schedule}{args.decay_ratio:.1f}"
+    after = f"a{args.decay_after_steps:d}-" if args.decay_after_steps > 0 else ""
+    folder += f"_lr-{after}{args.decay_ratio:.1f}"
     folder += f"_iters-{args.max_steps:d}" if args.max_steps > 0 else f"_time-{args.max_time:g}"
     image = os.path.splitext(args.input_path)[0]
     return f"{args.log_root}/{args.exp_name}/{image}/{folder}"

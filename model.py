@@ -82,7 +82,6 @@ QP_DENSITY = 8.0  # Gaussians per 1000 pixels at QP 32
 QP_DENSITY_DOUBLING = 5.0  # QPs over which the number of Gaussians doubles
 QP_FEAT_STEP = 1.0 / 64.0  # Feature step at QP 37
 QP_FEAT_STEP_HALVING = 15.0  # QPs over which the feature step halves
-LR_UPDATE_RATIO = 0.98  # lr_schedule "exp": the learning rates are updated once they have fallen by this factor (~115 updates for a 10x decay)
 
 
 def get_mapped_qp(args):
@@ -442,12 +441,10 @@ class GaussianSplatting2D(nn.Module):
         self.final_num_gaussians = self.total_num_gaussians
         self.num_pruned = 0
         self.prune_rounds_done = 0
-        self.prune_round_step, self.prune_round_used = 0, 0.0  # Step and budget used (_budget) at the last pruning round
+        self.prune_round_step = 0  # Step of the last pruning round
         self.prune_finished = args.prune_lambda == 0.0
-        if args.prune_min_interval < 0 or not 0.0 < args.prune_end_ratio <= 1.0:
-            raise ValueError(f"Minimum number of steps between pruning rounds must be non-negative and the end of the rounds in (0, 1] but "
-                             f"got: {args.prune_min_interval:d}, {args.prune_end_ratio:g}")
-        self.prune_min_interval = args.prune_min_interval
+        if not 0.0 < args.prune_end_ratio <= 1.0:
+            raise ValueError(f"End of the pruning rounds must be in (0, 1] but got: {args.prune_end_ratio:g}")
         self.prune_end_ratio = args.prune_end_ratio
         if self.evaluate:
             # Checkpoints only contain the Gaussians that survived pruning
@@ -461,13 +458,13 @@ class GaussianSplatting2D(nn.Module):
         if args.prune_add_ratio < 0.0:
             raise ValueError(f"Ratio of added Gaussians per round must be non-negative but got: {args.prune_add_ratio}")
         if args.prune_max_interval < 1:
-            raise ValueError(f"Maximum steps between pruning rounds must be positive but got: {args.prune_max_interval:d}")
+            raise ValueError(f"Steps between pruning rounds must be positive but got: {args.prune_max_interval:d}")
         self.prune_lambda = args.prune_lambda
         self.prune_max_ratio = args.prune_max_ratio
         self.prune_add_ratio = args.prune_add_ratio
         self.prune_max_interval = args.prune_max_interval
         self.prune_old_num = self.total_num_gaussians  # The first Gaussians, those from before the last densification
-        self.worklog.info(f"Pruning with lambda {self.prune_lambda:g}: rounds at most {self.prune_max_interval:d} steps apart of at most "
+        self.worklog.info(f"Pruning with lambda {self.prune_lambda:g}: rounds every {self.prune_max_interval:d} steps of at most "
                           f"{100.0*self.prune_max_ratio:g}% of the Gaussians, sizes logged before pruning assume all {self.total_num_gaussians:d}"
                           + (f", adding {100.0*self.prune_add_ratio:g}% after each round but the last" if self.prune_add_ratio > 0.0 else ""))
 
@@ -559,24 +556,19 @@ class GaussianSplatting2D(nn.Module):
         # Peak number of tile intersections since the last capture, on the GPU and copied to pinned memory by every replay
         self.isect_peak = torch.zeros(1, dtype=torch.int64, device=self.device)
         self.isect_peak_host = torch.zeros(1, dtype=torch.int64, pin_memory=self.cuda_graph)
-        self.lr_factor = 1.0  # Learning rates relative to the initial ones
         self.optimizer = self._new_optimizer()
-        self.disable_lr_schedule = args.disable_lr_schedule
         self.decay_ratio = args.decay_ratio
         # Budget: counted seconds (max_time), or steps (max_steps, which replaces max_time), so that a run does not depend on the speed of
-        # the GPU; pruning rounds and the learning rate decay at fixed fractions of it
+        # the GPU; pruning rounds at fixed fractions of it
         if self.max_steps < 0:
             raise ValueError(f"Step budget must be non-negative but got: {self.max_steps:d}")
         self.max_time = args.max_time if self.max_steps == 0 else 0.0
         self.decay_time_ratio = args.decay_time_ratio
-        self.lr_schedule = args.lr_schedule
         self.decay_after_steps = args.decay_after_steps
         if self.max_steps == 0 and self.max_time <= 0.0:
             raise ValueError(f"Time budget must be positive without max_steps but got: {self.max_time}")
         if not 0.0 < self.decay_time_ratio <= 1.0:
             raise ValueError(f"Fraction of the budget before the learning rate decay must be in (0, 1] but got: {self.decay_time_ratio}")
-        if self.lr_schedule not in ["step", "exp", "cycle", "after"]:
-            raise ValueError(f"Unsupported learning rate schedule '{self.lr_schedule}', valid values include 'step', 'exp', 'cycle', and 'after'")
         if self.decay_after_steps < 0:
             raise ValueError(f"Steps between the last pruning round and the learning rate decay must be non-negative but got: "
                              f"{self.decay_after_steps:d}")
@@ -585,24 +577,24 @@ class GaussianSplatting2D(nn.Module):
         """
         Adam over the current Gaussian parameters. Real-time mode uses the fused implementation (one kernel per parameter group instead of
         about ten), which is faster but not bit-identical. For CUDA graphs, the step counts stay on the GPU (capturable) and the learning rates
-        are GPU tensors, which the schedules decay in place, so that the captured step uses the current ones.
+        are GPU tensors, which the decay changes in place, so that the captured step uses the current ones. Rounds, which create the optimizer
+        anew, all come before the decay.
         """
         groups = [(self.xy, self.pos_lr), (self.scale, self.scale_lr), (self.rot, self.rot_lr), (self.feat, self.feat_lr)]
         if self.cuda_graph:
-            return torch.optim.Adam([{'params': param, 'lr': torch.tensor(self.lr_factor * lr, device=self.device)} for param, lr in groups],
+            return torch.optim.Adam([{'params': param, 'lr': torch.tensor(lr, device=self.device)} for param, lr in groups],
                                     fused=True, capturable=True)
-        return torch.optim.Adam([{'params': param, 'lr': self.lr_factor * lr} for param, lr in groups], fused=True if self.realtime else None)
+        return torch.optim.Adam([{'params': param, 'lr': lr} for param, lr in groups], fused=True if self.realtime else None)
 
-    def _set_lr_factor(self, factor):
+    def _decay_lr(self):
         """
-        Learning rates of all parameter groups at factor times the initial ones (in place for the GPU tensors of a CUDA graph).
+        Learning rates of all parameter groups divided by decay_ratio (in place for the GPU tensors of a CUDA graph).
         """
-        self.lr_factor = factor
         for param_group, lr in zip(self.optimizer.param_groups, [self.pos_lr, self.scale_lr, self.rot_lr, self.feat_lr]):
             if isinstance(param_group['lr'], torch.Tensor):
-                param_group['lr'].fill_(factor * lr)
+                param_group['lr'].fill_(lr / self.decay_ratio)
             else:
-                param_group['lr'] = factor * lr
+                param_group['lr'] = lr / self.decay_ratio
 
     def _init_pos_scale_feat(self, args):
         self.init_mode = args.init_mode
@@ -1047,7 +1039,7 @@ class GaussianSplatting2D(nn.Module):
                 if not self.prune_finished and self._is_prune_step():
                     with self._stall_trace("pruning round"):
                         self._prune_gaussians_lambda(plot_gaussians=self.vis_gaussians)
-                    self.prune_round_step, self.prune_round_used = self.step, self._budget()[0]
+                    self.prune_round_step = self.step
                 round_time = perf_counter() - begin
                 self.round_time_accum += round_time
                 self.round_time_max = max(self.round_time_max, (round_time, self.step))
@@ -1278,67 +1270,45 @@ class GaussianSplatting2D(nn.Module):
     def _budget_text(self, amount):
         return f"{amount:.0f} steps" if self.max_steps > 0 else f"{amount:.2f} s"
 
-    def _get_num_rounds(self):
-        """
-        Number of pruning rounds: as many as keep them at most prune_max_interval steps apart over the first prune_end_ratio of the budget
-        (at the step rate so far with a time budget), at least one.
-        """
-        used, budget = self._budget()
-        if used == 0.0:  # No step rate yet
-            return 1
-        steps = self.step / used * self.prune_end_ratio * budget
-        return max(math.ceil(steps / self.prune_max_interval), 1)
-
-    def _next_round_due(self):
-        """
-        Budget used (_budget) at which the next pruning round is due: the remaining rounds (_get_num_rounds) spread evenly over the rest of
-        the first prune_end_ratio of the budget, so that a change of the step rate or a delayed round does not bunch them.
-        """
-        remaining = max(1, self._get_num_rounds() - self.prune_rounds_done)
-        return self.prune_round_used + (self.prune_end_ratio * self._budget()[1] - self.prune_round_used) / remaining
-
     def _is_prune_step(self):
         """
-        Whether the next pruning round is due (_next_round_due), at least prune_min_interval steps after the previous round (or the start), so
-        that a stall (e.g., a slow round) does not set off the next rounds at consecutive steps.
+        Whether a pruning round is due: prune_max_interval steps after the previous one (or the start), or at the end of the first
+        prune_end_ratio of the budget if there has been none, so that a budget shorter than the interval still gets one.
         """
-        return self._budget()[0] >= self._next_round_due() and self.step - self.prune_round_step >= self.prune_min_interval
+        used, budget = self._budget()
+        return (self.step - self.prune_round_step >= self.prune_max_interval
+                or (self.prune_rounds_done == 0 and used >= self.prune_end_ratio * budget))
+
+    def _is_last_round(self):
+        """
+        Whether the next pruning round would come after the first prune_end_ratio of the budget (at the step rate so far with a time budget).
+        """
+        used, budget = self._budget()
+        return used / self.step * (self.step + self.prune_max_interval) > self.prune_end_ratio * budget
 
     def _budget_schedule(self):
         """
-        The learning rate decay (lr_schedule "step": once by decay_ratio after decay_time_ratio of the budget; "after": once by decay_ratio
-        decay_after_steps steps after the last pruning round, when the Gaussians are final, or after decay_time_ratio of the budget if that
-        comes first; "exp": exponentially by decay_ratio over the budget; "cycle": exponentially by decay_ratio from the start to the first
-        pruning round, from each round to the next, and from the last one to the end of the budget, so that each round scores Gaussians that
-        have settled and restarts at the initial learning rate; the exponential ones updated whenever they have fallen by LR_UPDATE_RATIO),
-        and termination once the budget is used up. Pruning
-        rounds that are still due after decay_time_ratio of the budget are skipped (when stalls delayed them), because the steps after them
-        would not recover the image. Returns whether to terminate.
+        The learning rate decay, once by decay_ratio: decay_after_steps steps after the last pruning round, when the Gaussians are final, or
+        after decay_time_ratio of the budget if that comes first or there are no rounds or decay_after_steps is 0; and termination once the
+        budget is used up. Pruning rounds that are still due after decay_time_ratio of the budget are skipped (when stalls delayed them),
+        because the steps after them would not recover the image. Returns whether to terminate.
         """
         used, budget = self._budget()
         fraction = used / budget
         if not self.prune_finished and fraction >= self.decay_time_ratio:
             self.prune_finished = True
             self.final_num_gaussians = self.num_gaussians
-            self.worklog.info(f"Step: {self.step:d} | Pruning stopped after {self.prune_rounds_done:d} of {self._get_num_rounds():d} rounds at "
+            self.worklog.info(f"Step: {self.step:d} | Pruning stopped after {self.prune_rounds_done:d} rounds at "
                               f"{self._budget_text(used)} with {self.num_gaussians:d} Gaussians ({self.num_pruned:d} pruned)")
             self.worklog.info("***********************************************")
-        if not self.disable_lr_schedule and self.lr_schedule in ["exp", "cycle"]:
-            begin, end = 0.0, 1.0
-            if self.lr_schedule == "cycle":  # From the last round (or the start) to the next one (or the end of the budget)
-                begin = self.prune_round_used / budget
-                end = 1.0 if self.prune_finished else min(1.0, self._next_round_due() / budget)
-            factor = self.decay_ratio**-(min(max((fraction - begin) / (end - begin), 0.0), 1.0) if end > begin else 1.0)
-            if factor <= LR_UPDATE_RATIO * self.lr_factor or factor > self.lr_factor:
-                self._set_lr_factor(factor)
-        after_last_round = self.lr_schedule == "after" and self.prune_finished and self.step - self.prune_round_step >= self.decay_after_steps
-        if not self.disable_lr_schedule and not self.lr_decayed and (fraction >= self.decay_time_ratio or after_last_round):
+        after_last_round = (self.decay_after_steps > 0 and self.prune_finished and self.prune_rounds_done > 0
+                            and self.step - self.prune_round_step >= self.decay_after_steps)
+        if not self.lr_decayed and (fraction >= self.decay_time_ratio or after_last_round):
             self.lr_decayed = True
-            if self.lr_schedule in ["step", "after"]:
-                self._set_lr_factor(1.0 / self.decay_ratio)
+            self._decay_lr()
             if self.rate_weight > 0.0:
                 self._update_rate_model()  # The Gaussians have moved since the last pruning round
-            self.worklog.info(f"Step: {self.step:d} | Learning rate at {self.lr_factor:.3f} of the initial one after {self._budget_text(used)}")
+            self.worklog.info(f"Step: {self.step:d} | Learning rate at {1.0/self.decay_ratio:.3f} of the initial one after {self._budget_text(used)}")
             self.worklog.info("***********************************************")
         if used >= budget:
             self.worklog.info(f"Step: {self.step:d} | Budget of {self._budget_text(budget)} used up ({self._budget_text(used)})")
@@ -1425,10 +1395,10 @@ class GaussianSplatting2D(nn.Module):
         Pruning round: remove the Gaussians whose removal increases the squared error by less than prune_lambda times
         the bits they take (the average of the current Gaussians), at most prune_max_ratio of them. With prune_add_ratio, each round but the last
         then adds that fraction of Gaussians at high-error pixels, which the next round tests, so that the number of Gaussians can also grow.
-        Pruning finishes after _get_num_rounds rounds, or once a round finds no Gaussian to remove (without adding).
+        Pruning finishes after the last round (_is_last_round), or once a round finds no Gaussian to remove (without adding).
         """
         self.prune_rounds_done += 1
-        num_rounds = self._get_num_rounds()
+        last_round = self._is_last_round()
         sse_increase = self._get_loo_loss_increase(metric="sse")
         bits_per_gaussian = self._estimate_bits() / self.num_gaussians
         max_num = round(self.prune_max_ratio * self.num_gaussians)
@@ -1449,7 +1419,7 @@ class GaussianSplatting2D(nn.Module):
             self._remove_gaussians(pruned, prune_info, plot_gaussians=plot_gaussians)
             self.num_pruned += prune_num
             self.final_num_gaussians = self.num_gaussians
-        if (prune_num == 0 and self.prune_add_ratio == 0.0) or self.prune_rounds_done >= num_rounds:
+        if (prune_num == 0 and self.prune_add_ratio == 0.0) or last_round:
             self.prune_finished = True
             self.worklog.info(f"Step: {self.step:d} | {round_info} | Pruning finished with {self.num_gaussians:d} Gaussians "
                               f"({self.num_pruned:d} pruned in {self.prune_rounds_done:d} rounds)")

@@ -87,17 +87,14 @@ pos_lr:                5.0e-4
 scale_lr:              2.0e-3
 rot_lr:                2.0e-3
 feat_lr:               5.0e-3
-disable_lr_schedule:   False # Disable the learning rate decay
-decay_ratio:           10.0 # Factor of the learning rate decay
+decay_ratio:           10.0 # Factor of the learning rate decay; 1 disables it
 max_time:              4.0 # Optimization time budget in seconds (without max_steps)
-decay_time_ratio:      0.8333 # Fraction of the budget after which the learning rate decays once by decay_ratio
-lr_schedule:           "step" # {step, after, exp, cycle} A single decay by decay_ratio at decay_time_ratio of the budget, a single one decay_after_steps steps after the last pruning round (at the latest at decay_time_ratio), an exponential decay by decay_ratio over the budget, or one from the start and from each pruning round to the next round (the last one to the end)
-decay_after_steps:     500 # lr_schedule after: steps between the last pruning round and the learning rate decay
+decay_time_ratio:      0.8333 # Fraction of the budget at which the learning rate decays by decay_ratio, unless decay_after_steps did so before
+decay_after_steps:     500 # Steps after the last pruning round at which the learning rate decays by decay_ratio, if that comes before decay_time_ratio; 0 leaves only decay_time_ratio
 
 # Pruning
 prune_lambda:          0.0 # Rate–distortion pruning: squared-error increase per bit below which a Gaussian is removed; set by --qp; without --qp, 0 keeps the num_gaussians Gaussians
 prune_max_ratio:       0.125 # Maximum fraction of the Gaussians removed per round
 prune_add_ratio:       0.125 # Gaussians added after each round but the last, as a fraction of the remaining ones; 0 disables densification
-prune_max_interval:    100 # As many rounds as keep them at most this many steps apart over the first prune_end_ratio of the budget (at the step rate so far with max_time)
-prune_end_ratio:       0.6667 # Fraction of the budget over which the rounds are spread evenly
-prune_min_interval:    20 # Minimum steps between rounds (and before the first), so that a stall does not trigger several rounds in a row
+prune_max_interval:    50 # Steps between rounds, over the first prune_end_ratio of the budget
+prune_end_ratio:       0.6667 # Fraction of the budget with rounds; one at its end if it is shorter than prune_max_interval
