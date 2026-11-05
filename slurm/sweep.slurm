@@ -13,7 +13,7 @@
 # Runs main.py once per combination of the arguments, one after the other. Comma-separated values span a grid (here 3 x 4 x 4 = 48 runs):
 #   sbatch slurm/sweep.slurm --exp_name=my-experiment --realtime --cuda_graph --max_time=2,4,10,20 --qp=22,27,32,37 \
 #       --input_path=uvg/480p/Beauty_0001.png,uvg/480p/Bosphorus_0001.png,uvg/480p/Jockey_0001.png
-# slurm/submit.sh sets the time limit from the budgets.
+# slurm/submit.sh sets the time limit from the budgets. Results go to $VSC_DATA/image-gs/<exp_name>, off the small home partition.
 set -eo pipefail
 
 module load cluster/wice/gpu_a100 Python/3.13.1-GCCcore-14.2.0 PyTorch-bundle/2.9.1-foss-2025a-CUDA-12.8.0-whl SciPy-bundle/2025.06-gfbf-2025a
@@ -39,5 +39,5 @@ for ((task = 0; task < combinations; task++)); do
         args+=("${key}${values[i % ${#values[@]}]}")
         i=$((i / ${#values[@]}))
     done
-    python main.py "${args[@]}" || echo "Combination ${task} failed: ${args[*]}" >&2
+    python main.py --log_root="${VSC_DATA}/image-gs" "${args[@]}" || echo "Combination ${task} failed: ${args[*]}" >&2
 done
