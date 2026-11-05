@@ -14,8 +14,8 @@ from utils.image_utils import find_blobs
 STRUCTURE_TENSOR_SIGMA = 2.0  # Smoothing of the structure tensor that initial_shapes takes, in pixels
 FINE_BLOB_SCALES = (0.7, 1.0, 1.4, 2.0, 2.8, 4.0)  # Scales (pixels) of the blob detection of find_fine_blobs
 FINE_BLOB_MAX_SCALE = 1.4  # Largest scale (pixels) of the blobs that find_fine_blobs returns
-LOCAL_STD_WINDOW = 9  # Window (pixels) of the local standard deviation of local_std_density
-LOCAL_STD_FLOOR = 1.0 / 255.0  # Smallest local standard deviation that local_std_density uses (flat areas, luma in [0, 1])
+LOCAL_STD_WINDOW = 9  # Window (pixels) of the local standard deviation of local_std
+LOCAL_STD_FLOOR = 1.0 / 255.0  # Smallest local standard deviation that local_std returns (flat areas, luma in [0, 1])
 
 
 def estimate_knn_distance(points, queries, img_h, img_w, k=3):
@@ -93,15 +93,32 @@ def find_fine_blobs(images, num, scales=FINE_BLOB_SCALES, max_scale=FINE_BLOB_MA
     return find_blobs(get_luma(images), num, scales, max_scale)
 
 
-def local_std_density(images, gamma, window=LOCAL_STD_WINDOW, floor=LOCAL_STD_FLOOR):
+def local_std(images, window=LOCAL_STD_WINDOW, floor=LOCAL_STD_FLOOR):
     """
-    Sampling probabilities [H*W] of positions proportional to the local standard deviation of the luma of images [C, H, W] (over window x
-    window pixels, repeating the edge pixels; at least floor) to the power gamma. Optimized models end with about this density of Gaussians
-    at every rate (gamma ~0.8), from flat areas through smooth areas and texture to edges, so that one population sampled from it, sized by
-    its spacing, covers every scale.
+    Local standard deviation [H*W] of the luma of images [C, H, W], over window x window pixels, repeating the edge pixels, and at least floor.
     """
     luma = F.pad(get_luma(images)[None, None], (window // 2,) * 4, mode="replicate")
     mean = F.avg_pool2d(luma, window, stride=1)
     variance = (F.avg_pool2d(luma.square(), window, stride=1) - mean.square()).clamp(min=0.0)
-    density = variance.sqrt().clamp(min=floor).pow(gamma).reshape(-1)
+    return variance.sqrt().clamp(min=floor).reshape(-1)
+
+
+def local_std_density(images, gamma):
+    """
+    Sampling probabilities [H*W] of positions proportional to local_std of images [C, H, W] to the power gamma. Optimized models end with about
+    this density of Gaussians at every rate (gamma ~0.8), from flat areas through smooth areas and texture to edges, so that one population
+    sampled from it, sized by its spacing, covers every scale.
+    """
+    density = local_std(images).pow(gamma)
     return density / density.sum()
+
+
+def draw_local_std_pixels(images, gamma, std_ref, density):
+    """
+    Indices [M] of the pixels of images [C, H, W] that get a Gaussian, each independently of the others with a probability proportional to
+    local_std to the power gamma, as local_std_density, that is density at a local_std of std_ref (at most 1), so that M follows the content.
+    At least the most likely pixel.
+    """
+    prob = (density * (local_std(images) / std_ref).pow(gamma)).clamp(max=1.0)
+    pixels = torch.nonzero(torch.rand_like(prob) < prob).squeeze(dim=1)
+    return pixels if len(pixels) > 0 else prob.argmax().unsqueeze(dim=0)

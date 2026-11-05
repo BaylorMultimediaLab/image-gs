@@ -75,6 +75,8 @@ def get_gaussian_cfg(args):
     gaussian_cfg += f"_{args.init_mode[0]}-{args.init_random_ratio:.1f}"
     if args.init_mode == "local-std":
         gaussian_cfg += f"-g{args.init_std_gamma:g}"
+        if args.init_std_ref > 0.0:
+            gaussian_cfg += f"-r{args.init_std_ref:g}"
     return gaussian_cfg
 
 

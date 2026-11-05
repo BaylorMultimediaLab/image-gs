@@ -60,12 +60,12 @@ input_path:            "uvg/480p/Beauty_0001.png" # Path to an image file or a d
 # Gaussians
 num_gaussians:         1000 # Number of Gaussians without --qp; set by --qp
 qp:                    32.0 # HEVC-like quantization parameter; 0 disables QP rate control
-qp_overestimate:       0.6 # Factor on the content-agnostic number of Gaussians before pruning; only with --qp
+qp_overestimate:       1.0 # Factor on the content-agnostic number of Gaussians before pruning; only with --qp
 qp_lambda_scale:       4.0 # Factor on HEVC's λ for pruning and the rate term; only with --qp
 rate_weight:           0.25 # Weight of the rate term in the loss, relative to λ; 0 disables it; requires quant_mode step; only with --qp
 rate_uv_weight:        -1.0 # YUV: weight of the U and V bits in the rate term; negative uses uv_weight; only with --qp
-qp_offset:             6.47 # Offset of the QP mapping (0 with qp_slope 1 derives the settings at the QP itself); only with --qp
-qp_slope:              0.767 # Slope of the QP mapping; only with --qp
+qp_offset:             -2.0 # Offset of the QP mapping (0 with qp_slope 1 derives the settings at the QP itself); only with --qp
+qp_slope:              0.95 # Slope of the QP mapping; only with --qp
 init_scale:            2.25 # Initial size in pixels (with init_scale_knn 0)
 init_scale_knn:        0.4 # Initial size as a factor of the RMS distance to the 3 nearest Gaussians; 0 uses init_scale
 init_fine_ratio:       0.5 # Fraction of the Gaussians placed on fine blobs; 0 disables it
@@ -75,6 +75,7 @@ ckpt_file:             ""
 add_color_init:        "target" # {target, residual} Features of added Gaussians: the target, or the error of the rendered image at the pixel
 init_mode:             "local-std" # {local-std, gradient, random} Position density of the Gaussians that are not on fine blobs: local luma standard deviation, squared image gradient, or uniform
 init_std_gamma:        0.8 # local-std: exponent of the local standard deviation
+init_std_ref:          0.0 # Local standard deviation at which a pixel gets the density of Gaussians from the QP: each pixel then gets a Gaussian independently, at that density times (its local standard deviation / init_std_ref)^init_std_gamma, so that the number before pruning follows the content; 0 uses the content-agnostic number; only with --qp and local-std
 init_random_ratio:     0.0 # Fraction of the other Gaussians placed uniformly at random instead of by init_mode
 
 # Loss functions

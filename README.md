@@ -55,12 +55,12 @@ that only take effect with `--qp`, and *no* for options independent of it.
 
 ### Rate Control
 
-`--qp` controls the rate like the quantization parameter of HEVC. The QP is first mapped to `qp_offset + qp_slope × QP`, so that the PSNR
-roughly matches x265 all-intra at the same QP with 2–4 s encoding budgets. Three settings are derived at the mapped QP:
+`--qp` controls the rate like the quantization parameter of HEVC. The QP is first mapped to `qp_offset + qp_slope × QP`, so that the VMAF
+roughly matches x265 all-intra at the same QP at 480p–1080p with 2–4 s encoding budgets. Three settings are derived at the mapped QP:
 
-- **Number of Gaussians before pruning**: a content-agnostic density (8 per 1000 pixels at QP 32, doubling every 5 QPs down) times
-  `qp_overestimate`. [Pruning and densification](#pruning-and-densification) decide how many are kept, so this only needs to be in the
-  right range.
+- **Number of Gaussians before pruning**: a content-agnostic density (3.9 per 1000 pixels at QP 32 and 854×480, doubling every 4.9 QPs down, with a
+  number that grows as pixels^0.6) times `qp_overestimate`. [Pruning and densification](#pruning-and-densification) decide how many are kept, so this only needs to be in the
+  right range. With `init_std_ref`, the number follows the content instead (see [Initialization](#initialization)).
 - **Pruning λ**: `qp_lambda_scale` times HEVC's λ = 0.57 · 2^((QP − 12) / 3).
 - **Feature step**: halves every 15 QPs (see [Quantization](#quantization)).
 
@@ -70,9 +70,9 @@ optimization also trades distortion against rate. Distortion favors luma (see [C
 | Option | Values | Default | Set by `--qp` | Description |
 |---|---|---|---|---|
 | `qp` | ≥ 0 | `32` | – | HEVC-like quantization parameter; `0` disables QP rate control |
-| `qp_offset` | float | `6.47` | qp only | Offset of the QP mapping (`0` with `qp_slope 1` derives the settings at the QP itself) |
-| `qp_slope` | > 0 | `0.767` | qp only | Slope of the QP mapping |
-| `qp_overestimate` | > 0 | `0.6` | qp only | Factor on the content-agnostic number of Gaussians before pruning |
+| `qp_offset` | float | `-2.0` | qp only | Offset of the QP mapping (`0` with `qp_slope 1` derives the settings at the QP itself) |
+| `qp_slope` | > 0 | `0.95` | qp only | Slope of the QP mapping |
+| `qp_overestimate` | > 0 | `1.0` | qp only | Factor on the content-agnostic number of Gaussians before pruning |
 | `qp_lambda_scale` | > 0 | `4.0` | qp only | Factor on HEVC's λ for pruning and the rate term |
 | `rate_weight` | ≥ 0 | `0.25` | qp only | Weight of the rate term in the loss, relative to λ; `0` disables it; requires `quant_mode step` |
 | `num_gaussians` | int > 0 | `1000` | yes | Number of Gaussians without `--qp` |
@@ -102,10 +102,15 @@ sized at `init_scale_knn` times the RMS distance to its 3 nearest neighbors, so 
 elongated along the edges of the target by the coherence of its structure tensor (up to `init_aspect`, at the same area). Features start
 at the target color at each Gaussian's position. Gaussians added by [densification](#pruning-and-densification) are shaped the same way.
 
+With `--qp` and `init_std_ref`, each pixel gets a Gaussian independently of the others, at the density of the QP times
+(local standard deviation / `init_std_ref`)^`init_std_gamma`, so that images with more detail start with more Gaussians. Fine blobs then
+replace a random `init_fine_ratio` of them.
+
 | Option | Values | Default | Set by `--qp` | Description |
 |---|---|---|---|---|
 | `init_mode` | `local-std`, `gradient`, `random` | `local-std` | no | Position density of the Gaussians that are not on fine blobs: local luma standard deviation, squared image gradient, or uniform |
 | `init_std_gamma` | float | `0.8` | no | `local-std`: exponent of the local standard deviation |
+| `init_std_ref` | ≥ 0 | `0.0` | no | Local standard deviation at which a pixel gets the density of the QP; `0` uses the content-agnostic number of Gaussians; requires `--qp`, `init_mode local-std`, and `init_random_ratio 0` |
 | `init_fine_ratio` | [0, 1) | `0.5` | no | Fraction of the Gaussians placed on fine blobs; `0` disables it |
 | `init_random_ratio` | [0, 1] | `0.0` | no | Fraction of the other Gaussians placed uniformly at random instead of by `init_mode` |
 | `init_scale_knn` | ≥ 0 | `0.4` | no | Initial size as a factor of the RMS distance to the 3 nearest Gaussians; `0` uses `init_scale` |

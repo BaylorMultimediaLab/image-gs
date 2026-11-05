@@ -1,7 +1,8 @@
 #!/bin/bash
-# Submits a real-time sweep over QPs, resolutions (the three UVG frames), and time budgets as one job that runs the combinations one after
-# the other; other arguments go to main.py, e.g.:
-#   slurm/submit.sh --qps 22,27,32,37 --res 480p,720p --budgets 2,4,10,20 --exp_name=my-experiment --uv_weight=0.25,0.5
+# Submits a real-time sweep over QPs, resolutions, UVG sequences, and time budgets as one job that runs the combinations one after the
+# other; other arguments go to main.py, e.g.:
+#   slurm/submit.sh --qps 22,27,32,37 --res 480p,720p --sequences Beauty,Bosphorus,Jockey --budgets 2,4,10,20 --exp_name=my-experiment \
+#       --uv_weight=0.25,0.5
 # The time limit is 1.5x the estimate: the sum of the budgets plus RUN_OVERHEAD_S (default 10) per run for start-up and saving
 # (at most 1 h on gpu_a100_debug).
 # SKIP_SETUP=0 builds the venv first (slurm/setup.slurm); PARTITION=gpu_a100_debug submits to the debug partition.
@@ -11,13 +12,17 @@ set -eo pipefail
 
 qps=22,27,32,37
 res=480p,720p
+sequences=Beauty,Bosphorus,Jockey
 budgets=2,4,10,20
 exp_name=test/uvg
 args=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --qps) qps=$2; shift 2 ;;
+        --res=*) res=${1#*=}; shift ;;
         --res) res=$2; shift 2 ;;
+        --sequences=*) sequences=${1#*=}; shift ;;
+        --sequences) sequences=$2; shift 2 ;;
         --budgets) budgets=$2; shift 2 ;;
         --exp_name=*) exp_name=${1#*=}; args+=("$1"); shift ;;
         --exp_name) exp_name=$2; args+=("$1" "$2"); shift 2 ;;
@@ -25,13 +30,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-inputs=()
-for r in ${res//,/ }; do
-    for image in Beauty Bosphorus Jockey; do
-        inputs+=("uvg/${r}/${image}_0001.png")
-    done
-done
-args=(--realtime --cuda_graph --input_path="$(IFS=,; echo "${inputs[*]}")" --qp="${qps}" --max_time="${budgets}" "${args[@]}")
+args=(--realtime --cuda_graph --res="${res}" --sequences="${sequences}" --qp="${qps}" --max_time="${budgets}" "${args[@]}")
 
 combinations=1
 for arg in "${args[@]}"; do

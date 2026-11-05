@@ -64,7 +64,7 @@ from utils.image_utils import (
     visualize_gaussian_footprint,
     visualize_gaussian_position,
 )
-from utils.init_utils import STRUCTURE_TENSOR_SIGMA, find_fine_blobs, initial_shapes, local_std_density
+from utils.init_utils import STRUCTURE_TENSOR_SIGMA, draw_local_std_pixels, find_fine_blobs, initial_shapes, local_std_density
 from utils.misc_utils import clean_dir, get_latest_ckpt_step, save_cfg, set_random_seed
 from utils.stall_utils import StallTracer
 
@@ -72,14 +72,17 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=FutureWarning, module="torchvision")
 warnings.filterwarnings("ignore", category=FutureWarning, module="lpips")
 
-# Settings derived from the quantization parameter (qp), fitted on the 480p/720p UVG equal-time runs (A100, 40/90 s; experiments/qp/fit.py):
-# x265's RD slope in the units of prune_lambda is 0.9-1.1x HEVC's lambda at QP 22-37. The number of Gaussians that paid off doubles every
-# ~5 QP (4.7-5.6 per image) and varies 2.5x between images; QP_DENSITY is the most for any image. Refining the feature step paid off
-# from QP ~44 (1/32 -> 1/64) and below QP ~29 (1/64 -> 1/128), i.e., the optimal step halves every ~15 QP. The settings are derived at the
-# mapped QP qp_offset + qp_slope * qp; the default mapping matches the PSNR of x265 all-intra 4:2:0 (results/lowres/hevc.csv) at the same QP,
-# fitted on the real-time runs at QPs 16-40 with 2-4 s A100 budgets (phase qp-refit, experiments/realtime/qp_refit.py).
-QP_DENSITY = 8.0  # Gaussians per 1000 pixels at QP 32
-QP_DENSITY_DOUBLING = 5.0  # QPs over which the number of Gaussians doubles
+# Settings derived from the quantization parameter (qp). From the 480p/720p UVG equal-time runs (A100, 40/90 s; experiments/qp/fit.py):
+# x265's RD slope in the units of prune_lambda is 0.9-1.1x HEVC's lambda at QP 22-37. Refining the feature step paid off from QP ~44
+# (1/32 -> 1/64) and below QP ~29 (1/64 -> 1/128), i.e., the optimal step halves every ~15 QP. From the real-time runs at QPs 12-48 with 2-20 s
+# A100 budgets at 480p-2160p (sweep qp-range, experiments/qp/refit.py): the final number of Gaussians doubles every ~4.9 QP, grows as
+# pixels^0.6, and varies 2x between images, and QP_DENSITY is its mean. The settings are derived at the mapped QP qp_offset + qp_slope * qp;
+# the default mapping matches the VMAF of x265 all-intra 4:2:0 (results/lowres/hevc_noinfo_dense.csv) at the same QP at 480p-1080p with 2-4 s
+# budgets.
+QP_DENSITY = 3.9  # Gaussians per 1000 pixels at QP 32 and QP_DENSITY_PIXELS pixels
+QP_DENSITY_DOUBLING = 4.9  # QPs over which the number of Gaussians doubles
+QP_DENSITY_PIXELS = 854 * 480  # Number of pixels of QP_DENSITY
+QP_PIXEL_EXPONENT = 0.6  # The number of Gaussians grows with the number of pixels to this power
 QP_FEAT_STEP = 1.0 / 64.0  # Feature step at QP 37
 QP_FEAT_STEP_HALVING = 15.0  # QPs over which the feature step halves
 
@@ -169,10 +172,13 @@ class GaussianSplatting2D(nn.Module):
     def _init_qp(self, args):
         """
         Rate settings from the quantization parameter, derived at the mapped QP qp_offset + qp_slope * qp: lambda pruning with HEVC's lambda
-        at the mapped QP, starting from a content-agnostic overestimate of the number of Gaussians, and a feature step that halves every
-        QP_FEAT_STEP_HALVING QPs. In YUV mode, Y, and U and V get the error per channel of RGB features at that step (Y_STEP_SCALE and
-        UV_STEP_SCALE times it), times y_step_ratio and uv_step_ratio. The other steps are unchanged.
+        at the mapped QP, starting from an estimate of the final number of Gaussians, and a feature step that halves every
+        QP_FEAT_STEP_HALVING QPs. The estimate is content-agnostic, or with init_std_ref the number of pixels drawn at that density for
+        a local standard deviation of init_std_ref (utils.init_utils.draw_local_std_pixels). In YUV mode, Y, and U and V get the error per
+        channel of RGB features at that step (Y_STEP_SCALE and UV_STEP_SCALE times it), times y_step_ratio and uv_step_ratio. The other steps
+        are unchanged.
         """
+        self.init_pixels = None  # Pixels drawn for the Gaussians (init_std_ref)
         if args.y_step_ratio <= 0.0 or args.uv_step_ratio <= 0.0:
             raise ValueError(f"Y and UV step ratios must be positive but got: {args.y_step_ratio:g}, {args.uv_step_ratio:g}")
         if args.qp == 0.0:
@@ -185,17 +191,27 @@ class GaussianSplatting2D(nn.Module):
             raise ValueError(f"Overestimation and lambda factors must be positive but got: {args.qp_overestimate}, {args.qp_lambda_scale}")
         if args.qp_slope <= 0.0:
             raise ValueError(f"QP slope must be positive but got: {args.qp_slope}")
+        if args.init_std_ref < 0.0:
+            raise ValueError(f"Reference local standard deviation must be non-negative but got: {args.init_std_ref}")
+        if args.init_std_ref > 0.0 and (args.init_mode != "local-std" or args.init_random_ratio > 0.0):
+            raise ValueError("init_std_ref requires init_mode 'local-std' and init_random_ratio 0")
         qp = get_mapped_qp(args)
-        density = QP_DENSITY * 2.0**((32.0 - qp) / QP_DENSITY_DOUBLING)
-        args.num_gaussians = max(1, round(args.qp_overestimate * density * self.img_h * self.img_w / 1000.0))
+        pixels = self.img_h * self.img_w
+        density = QP_DENSITY * 2.0**((32.0 - qp) / QP_DENSITY_DOUBLING) * (pixels / QP_DENSITY_PIXELS)**(QP_PIXEL_EXPONENT - 1.0)
+        args.num_gaussians = max(1, round(args.qp_overestimate * density * pixels / 1000.0))
+        if args.init_std_ref > 0.0 and not self.evaluate:
+            self.init_pixels = draw_local_std_pixels(self.gt_images, args.init_std_gamma, args.init_std_ref,
+                                                     args.qp_overestimate * density / 1000.0)
+            args.num_gaussians = len(self.init_pixels)
         args.feat_step = QP_FEAT_STEP * 2.0**((qp - 37.0) / QP_FEAT_STEP_HALVING)
         args.y_step = args.y_step_ratio * Y_STEP_SCALE * args.feat_step
         args.uv_step = args.uv_step_ratio * UV_STEP_SCALE * args.feat_step
         args.prune_lambda = args.qp_lambda_scale * 0.57 * 2.0**((qp - 12.0) / 3.0)
         yuv_steps = f" (Y 1/{1.0/args.y_step:.1f}, UV 1/{1.0/args.uv_step:.1f})" if args.color_space == "yuv" else ""
+        std_ref = f" at local standard deviation {args.init_std_ref:g}" if args.init_std_ref > 0.0 else ""
         self.worklog.info(f"QP {args.qp:g} (settings of QP {qp:.2f}): {args.num_gaussians:d} Gaussians before pruning ({args.qp_overestimate:g} x "
-                          f"{density:.2f} per 1000 pixels), feature step 1/{1.0/args.feat_step:.1f}{yuv_steps}, lambda {args.prune_lambda:.2f} "
-                          f"({args.qp_lambda_scale:g} x HEVC's)")
+                          f"{density:.2f} per 1000 pixels{std_ref}), feature step 1/{1.0/args.feat_step:.1f}{yuv_steps}, "
+                          f"lambda {args.prune_lambda:.2f} ({args.qp_lambda_scale:g} x HEVC's)")
         if not self.evaluate:
             save_cfg(path=f"{self.log_dir}/cfg_train.yaml", args=args)  # Record the derived settings
 
@@ -603,10 +619,12 @@ class GaussianSplatting2D(nn.Module):
         self.init_random_ratio = args.init_random_ratio
         self.pixel_xy = get_grid(h=self.img_h, w=self.img_w).to(dtype=self.dtype, device=self.device).reshape(-1, 2)
         with torch.no_grad():
-            # Position: init_fine_ratio of the Gaussians on fine blobs, the others by init_mode
+            # Position: init_fine_ratio of the Gaussians on fine blobs, the others by init_mode, or on a random part of the drawn pixels
             fine_pixels, fine_scale = find_fine_blobs(self.gt_images, round(self.init_fine_ratio * self.num_gaussians))
             num = self.num_gaussians - len(fine_pixels)
-            if self.init_mode == 'gradient':
+            if self.init_pixels is not None:
+                xy = self.pixel_xy[self.init_pixels[torch.randperm(len(self.init_pixels), device=self.device)[:num]]]
+            elif self.init_mode == 'gradient':
                 self._compute_gmap()
                 xy = self._sample_pos(prob=self.image_gradients, num=num)
             elif self.init_mode == 'local-std':
