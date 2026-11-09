@@ -18,8 +18,8 @@ feat_bits:             16 # minmax: bit depth of the features (RGB)
 y_bits:                16 # minmax: bit depth of Y (YUV)
 uv_bits:               16 # minmax: bit depth of U and V (YUV)
 # quant_mode: "step" configuration:
-pos_step:              0.125 # Position step in pixels
-scale_step:            0.03125 # Scale step in octaves
+pos_step:              0.125 # Position step in pixels; with --qp and qp_step_split, from that mapped QP on
+scale_step:            0.03125 # Scale step in octaves; with --qp and qp_step_split, below that mapped QP
 rot_step:              0.703125 # Rotation step in degrees; per-Gaussian rotation steps require it to divide 22.5°, per-Gaussian position steps 90°
 feat_step:             0.015625 # Feature step (RGB); set by --qp
 y_step:                0.015625 # Y step (YUV); set by --qp
@@ -66,6 +66,9 @@ rate_weight:           0.25 # Weight of the rate term in the loss, relative to �
 rate_uv_weight:        -1.0 # YUV: weight of the U and V bits in the rate term; negative uses uv_weight; only with --qp
 qp_offset:             -2.0 # Offset of the QP mapping (0 with qp_slope 1 derives the settings at the QP itself); only with --qp
 qp_slope:              0.95 # Slope of the QP mapping; only with --qp
+qp_step_split:         26.5 # Mapped QP (QP 30 with the default mapping) below which positions take qp_low_pos_step, and from which scales take qp_high_scale_step; 0 keeps pos_step and scale_step at every QP; only with --qp
+qp_low_pos_step:       0.0625 # Position step in pixels below qp_step_split; only with --qp
+qp_high_scale_step:    0.0625 # Scale step in octaves from qp_step_split on; only with --qp
 init_scale:            2.25 # Initial size in pixels (with init_scale_knn 0)
 init_scale_knn:        0.4 # Initial size as a factor of the RMS distance to the 3 nearest Gaussians; 0 uses init_scale
 init_fine_ratio:       0.5 # Fraction of the Gaussians placed on fine blobs; 0 disables it
@@ -84,7 +87,7 @@ ssim_loss_ratio:       0.1
 
 # Optimization
 max_steps:             0 # Budget in steps instead of max_time (which is then ignored), so that a run does not depend on the speed of the GPU; 0 uses max_time
-pos_lr:                5.0e-4
+pos_lr_px:             1.0 # Position learning rate in pixels per step along the longer image side
 scale_lr:              2.0e-3
 rot_lr:                2.0e-3
 feat_lr:               5.0e-3

@@ -56,13 +56,15 @@ that only take effect with `--qp`, and *no* for options independent of it.
 ### Rate Control
 
 `--qp` controls the rate like the quantization parameter of HEVC. The QP is first mapped to `qp_offset + qp_slope × QP`, so that the VMAF
-roughly matches x265 all-intra at the same QP at 480p–1080p with 2–4 s encoding budgets. Three settings are derived at the mapped QP:
+roughly matches x265 all-intra at the same QP at 480p–1080p with 2–4 s encoding budgets. Four settings are derived at the mapped QP:
 
 - **Number of Gaussians before pruning**: a content-agnostic density (3.9 per 1000 pixels at QP 32 and 854×480, doubling every 4.9 QPs down, with a
   number that grows as pixels^0.6) times `qp_overestimate`. [Pruning and densification](#pruning-and-densification) decide how many are kept, so this only needs to be in the
   right range. With `init_std_ref`, the number follows the content instead (see [Initialization](#initialization)).
 - **Pruning λ**: `qp_lambda_scale` times HEVC's λ = 0.57 · 2^((QP − 12) / 3).
 - **Feature step**: halves every 15 QPs (see [Quantization](#quantization)).
+- **Position and scale steps**: below the mapped QP `qp_step_split`, positions take the finer step `qp_low_pos_step`; from it on, scales take
+  the coarser step `qp_high_scale_step`. Precise positions pay off at high rates, cheap scales at low ones.
 
 A rate term in the training loss (`rate_weight`, relative to λ) adds the estimated bits of the features and rotations, so that
 optimization also trades distortion against rate. Distortion favors luma (see [Color Space](#color-space)). `--qp 0` turns QP rate control off: `num_gaussians` sets the number of Gaussians, and pruning and steps are set explicitly.
@@ -72,6 +74,9 @@ optimization also trades distortion against rate. Distortion favors luma (see [C
 | `qp` | ≥ 0 | `32` | – | HEVC-like quantization parameter; `0` disables QP rate control |
 | `qp_offset` | float | `-2.0` | qp only | Offset of the QP mapping (`0` with `qp_slope 1` derives the settings at the QP itself) |
 | `qp_slope` | > 0 | `0.95` | qp only | Slope of the QP mapping |
+| `qp_step_split` | ≥ 0 | `26.5` | qp only | Mapped QP (QP 30 with the default mapping) below which positions take `qp_low_pos_step`, and from which scales take `qp_high_scale_step`; `0` keeps `pos_step` and `scale_step` at every QP |
+| `qp_low_pos_step` | > 0 | `0.0625` | qp only | Position step in pixels below `qp_step_split` |
+| `qp_high_scale_step` | > 0 | `0.0625` | qp only | Scale step in octaves from `qp_step_split` on |
 | `qp_overestimate` | > 0 | `1.0` | qp only | Factor on the content-agnostic number of Gaussians before pruning |
 | `qp_lambda_scale` | > 0 | `4.0` | qp only | Factor on HEVC's λ for pruning and the rate term |
 | `rate_weight` | ≥ 0 | `0.25` | qp only | Weight of the rate term in the loss, relative to λ; `0` disables it; requires `quant_mode step` |
@@ -165,8 +170,8 @@ only estimate the bits for λ pruning, and no bitstream is written).
 | Option | Values | Default | Set by `--qp` | Description |
 |---|---|---|---|---|
 | `quant_mode` | `step`, `minmax`, `none` | `step` | no | Quantization mode; `--qp` requires `step` or `none` |
-| `pos_step` | > 0 | `0.125` | no | Position step in pixels |
-| `scale_step` | > 0 | `0.03125` | no | Scale step in octaves |
+| `pos_step` | > 0 | `0.125` | no | Position step in pixels; with `--qp` and `qp_step_split`, from that mapped QP on |
+| `scale_step` | > 0 | `0.03125` | no | Scale step in octaves; with `--qp` and `qp_step_split`, below that mapped QP |
 | `rot_step` | > 0 | `0.703125` | no | Rotation step in degrees; per-Gaussian rotation steps require it to divide 22.5°, per-Gaussian position steps 90° |
 | `feat_step` | > 0 | `0.015625` | yes | Feature step (RGB) |
 | `y_step` | > 0 | `0.015625` | yes | Y step (YUV) |
@@ -215,6 +220,7 @@ collection during optimization. At low resolutions on fast GPUs, a step is then 
 | `max_steps` | int ≥ 0 | `0` | no | Budget in steps instead of `max_time` (which is then ignored), with the same schedule at fractions of it; `0` uses `max_time` |
 | `decay_time_ratio` | (0, 1] | `0.8333` | no | Fraction of the budget at which the learning rate decays by `decay_ratio`, unless `decay_after_steps` did so before |
 | `decay_after_steps` | int ≥ 0 | `500` | no | Steps after the last pruning round at which the learning rate decays by `decay_ratio`, if that comes before `decay_time_ratio`; `0` leaves only `decay_time_ratio` |
+| `pos_lr_px` | > 0 | `1.0` | no | Position learning rate in pixels per step along the longer image side, the same at every resolution |
 | `realtime` | bool | `false` | no | Real-time encoding |
 | `cuda_graph` | bool | `false` | no | Replay each step from a CUDA graph; requires `realtime`, `quant_mode step` or `none` |
 | `warmup` | ≥ 0 | `2.0` | no | With `realtime`: discarded encode of this many seconds before the real one, so that first-use costs (kernel loading, the first graph capture and rounds) stay out of the budget; `0` disables it |

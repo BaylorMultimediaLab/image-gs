@@ -94,6 +94,18 @@ def get_mapped_qp(args):
     return args.qp_offset + args.qp_slope * args.qp
 
 
+def get_geometry_steps(args):
+    """
+    Position and scale steps of the run: with qp and qp_step_split, qp_low_pos_step below that mapped QP and qp_high_scale_step from it on;
+    otherwise pos_step and scale_step.
+    """
+    if args.qp <= 0.0 or args.qp_step_split <= 0.0:
+        return args.pos_step, args.scale_step
+    if get_mapped_qp(args) < args.qp_step_split:
+        return args.qp_low_pos_step, args.scale_step
+    return args.pos_step, args.qp_high_scale_step
+
+
 class GaussianSplatting2D(nn.Module):
     isect_capacity_ratio = 2.0  # Tile intersection buffers of CUDA graphs, relative to the number at capture time
 
@@ -175,8 +187,9 @@ class GaussianSplatting2D(nn.Module):
         at the mapped QP, starting from an estimate of the final number of Gaussians, and a feature step that halves every
         QP_FEAT_STEP_HALVING QPs. The estimate is content-agnostic, or with init_std_ref the number of pixels drawn at that density for
         a local standard deviation of init_std_ref (utils.init_utils.draw_local_std_pixels). In YUV mode, Y, and U and V get the error per
-        channel of RGB features at that step (Y_STEP_SCALE and UV_STEP_SCALE times it), times y_step_ratio and uv_step_ratio. The other steps
-        are unchanged.
+        channel of RGB features at that step (Y_STEP_SCALE and UV_STEP_SCALE times it), times y_step_ratio and uv_step_ratio. Below the mapped
+        QP qp_step_split, positions take the finer step qp_low_pos_step, and from it on scales take the coarser step qp_high_scale_step
+        (get_geometry_steps). The rotation step is unchanged.
         """
         self.init_pixels = None  # Pixels drawn for the Gaussians (init_std_ref)
         if args.y_step_ratio <= 0.0 or args.uv_step_ratio <= 0.0:
@@ -195,6 +208,9 @@ class GaussianSplatting2D(nn.Module):
             raise ValueError(f"Reference local standard deviation must be non-negative but got: {args.init_std_ref}")
         if args.init_std_ref > 0.0 and (args.init_mode != "local-std" or args.init_random_ratio > 0.0):
             raise ValueError("init_std_ref requires init_mode 'local-std' and init_random_ratio 0")
+        if args.qp_step_split < 0.0 or args.qp_low_pos_step <= 0.0 or args.qp_high_scale_step <= 0.0:
+            raise ValueError(f"QP step split must be non-negative and the QP geometry steps positive but got: {args.qp_step_split:g}, "
+                             f"{args.qp_low_pos_step:g}, {args.qp_high_scale_step:g}")
         qp = get_mapped_qp(args)
         pixels = self.img_h * self.img_w
         density = QP_DENSITY * 2.0**((32.0 - qp) / QP_DENSITY_DOUBLING) * (pixels / QP_DENSITY_PIXELS)**(QP_PIXEL_EXPONENT - 1.0)
@@ -207,11 +223,13 @@ class GaussianSplatting2D(nn.Module):
         args.y_step = args.y_step_ratio * Y_STEP_SCALE * args.feat_step
         args.uv_step = args.uv_step_ratio * UV_STEP_SCALE * args.feat_step
         args.prune_lambda = args.qp_lambda_scale * 0.57 * 2.0**((qp - 12.0) / 3.0)
+        args.pos_step, args.scale_step = get_geometry_steps(args)
         yuv_steps = f" (Y 1/{1.0/args.y_step:.1f}, UV 1/{1.0/args.uv_step:.1f})" if args.color_space == "yuv" else ""
         std_ref = f" at local standard deviation {args.init_std_ref:g}" if args.init_std_ref > 0.0 else ""
         self.worklog.info(f"QP {args.qp:g} (settings of QP {qp:.2f}): {args.num_gaussians:d} Gaussians before pruning ({args.qp_overestimate:g} x "
-                          f"{density:.2f} per 1000 pixels{std_ref}), feature step 1/{1.0/args.feat_step:.1f}{yuv_steps}, "
-                          f"lambda {args.prune_lambda:.2f} ({args.qp_lambda_scale:g} x HEVC's)")
+                          f"{density:.2f} per 1000 pixels{std_ref}), feature step 1/{1.0/args.feat_step:.1f}{yuv_steps}, position step "
+                          f"{args.pos_step:g} pixels, scale step 1/{1.0/args.scale_step:g} octave, lambda {args.prune_lambda:.2f} "
+                          f"({args.qp_lambda_scale:g} x HEVC's)")
         if not self.evaluate:
             save_cfg(path=f"{self.log_dir}/cfg_train.yaml", args=args)  # Record the derived settings
 
@@ -554,7 +572,10 @@ class GaussianSplatting2D(nn.Module):
     def _init_optimization(self, args):
         self.start_step = 1
         self.max_steps = args.max_steps
-        self.pos_lr = args.pos_lr
+        # Positions are normalized to the image size, so the learning rate in pixels per step along the longer side becomes a fraction of it
+        if args.pos_lr_px <= 0.0:
+            raise ValueError(f"Position learning rate must be positive but got: {args.pos_lr_px:g}")
+        self.pos_lr = args.pos_lr_px / max(self.img_w, self.img_h)
         self.scale_lr = args.scale_lr
         self.rot_lr = args.rot_lr
         self.feat_lr = args.feat_lr

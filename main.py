@@ -5,7 +5,7 @@ import tempfile
 
 import torch
 
-from model import GaussianSplatting2D, get_mapped_qp
+from model import GaussianSplatting2D, get_geometry_steps, get_mapped_qp
 from utils.misc_utils import load_cfg
 
 
@@ -42,9 +42,10 @@ def get_gaussian_cfg(args):
     all_bits = [args.pos_bits, args.scale_bits, args.rot_bits, args.feat_bits, args.y_bits, args.uv_bits]
     if min(all_bits) < 4 or max(all_bits) > 32:
         raise ValueError(f"Bit precision must be between 4 and 32 but got: {', '.join(f'{bits:d}' for bits in all_bits)}")
+    pos_step, scale_step = get_geometry_steps(args)  # The steps at this QP
     if args.quant_mode == "step":
         feat_step = "qp" if args.qp > 0.0 else f"{args.feat_step:g}"
-        gaussian_cfg += f"_steps-{args.pos_step:g}-{args.scale_step:g}-{args.rot_step:g}-{feat_step}"
+        gaussian_cfg += f"_steps-{pos_step:g}-{scale_step:g}-{args.rot_step:g}-{feat_step}"
         if args.color_space == "yuv":
             gaussian_cfg += f"_yuv-{args.y_step:g}-{args.uv_step:g}" if args.qp == 0.0 else f"_yuv-{args.uv_step_ratio:g}"
             if args.qp > 0.0 and args.y_step_ratio != 1.0:
@@ -55,7 +56,7 @@ def get_gaussian_cfg(args):
             gaussian_cfg += f"_yuv-{args.y_bits:d}-{args.uv_bits:d}"
     if args.quant_mode == "none" and (args.qp > 0.0 or args.prune_lambda > 0.0):  # The steps estimate the bits for lambda pruning
         feat_step = "qp" if args.qp > 0.0 else f"{args.feat_step:g}"
-        gaussian_cfg += f"_rate-steps-{args.pos_step:g}-{args.scale_step:g}-{args.rot_step:g}-{feat_step}"
+        gaussian_cfg += f"_rate-steps-{pos_step:g}-{scale_step:g}-{args.rot_step:g}-{feat_step}"
     if args.quant_mode == "step":  # Per-Gaussian feature (w: weight), rotation (r), and position (p) steps, and the scale prediction (s)
         adapt = ""
         if args.feat_step_adapt != "none":
