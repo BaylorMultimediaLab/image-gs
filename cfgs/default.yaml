@@ -61,7 +61,7 @@ input_path:            "uvg/480p/Beauty_0001.png" # Path to an image file or a d
 num_gaussians:         1000 # Number of Gaussians without --qp; set by --qp
 qp:                    32.0 # HEVC-like quantization parameter; 0 disables QP rate control
 qp_overestimate:       1.0 # Factor on the content-agnostic number of Gaussians before pruning; only with --qp
-qp_lambda_scale:       4.0 # Factor on HEVC's λ for pruning and the rate term; only with --qp
+qp_lambda_scale:       4.0 # Factor on HEVC's λ for pruning and the rate term; 0 keeps every Gaussian (no pruning or densification); only with --qp
 rate_weight:           0.25 # Weight of the rate term in the loss, relative to λ; 0 disables it; requires quant_mode step; only with --qp
 rate_uv_weight:        -1.0 # YUV: weight of the U and V bits in the rate term; negative uses uv_weight; only with --qp
 qp_offset:             -2.0 # Offset of the QP mapping (0 with qp_slope 1 derives the settings at the QP itself); only with --qp

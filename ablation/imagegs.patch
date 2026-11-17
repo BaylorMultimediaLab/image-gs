@@ -1,0 +1,17 @@
+--- a/main.py
++++ b/main.py
+@@ -1,4 +1,5 @@
+ import argparse
++import os
+ 
+ import torch
+ 
+@@ -36,7 +37,7 @@
+         folder += f"_decay-{args.max_decay_times:d}-{args.decay_ratio:.1f}"
+     if not args.disable_prog_optim:
+         folder += "_prog"
+-    return f"{args.log_root}/{args.exp_name}/{folder}"
++    return f"{args.log_root}/{args.exp_name}/{os.path.splitext(args.input_path)[0]}/{folder}"
+ 
+ 
+ def main(args):

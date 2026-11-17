@@ -78,7 +78,7 @@ optimization also trades distortion against rate. Distortion favors luma (see [C
 | `qp_low_pos_step` | > 0 | `0.0625` | qp only | Position step in pixels below `qp_step_split` |
 | `qp_high_scale_step` | > 0 | `0.0625` | qp only | Scale step in octaves from `qp_step_split` on |
 | `qp_overestimate` | > 0 | `1.0` | qp only | Factor on the content-agnostic number of Gaussians before pruning |
-| `qp_lambda_scale` | > 0 | `4.0` | qp only | Factor on HEVC's λ for pruning and the rate term |
+| `qp_lambda_scale` | ≥ 0 | `4.0` | qp only | Factor on HEVC's λ for pruning and the rate term; `0` keeps every Gaussian (no pruning or densification) |
 | `rate_weight` | ≥ 0 | `0.25` | qp only | Weight of the rate term in the loss, relative to λ; `0` disables it; requires `quant_mode step` |
 | `num_gaussians` | int > 0 | `1000` | yes | Number of Gaussians without `--qp` |
 

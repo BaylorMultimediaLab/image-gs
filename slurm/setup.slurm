@@ -2,7 +2,7 @@
 #SBATCH --job-name=igs_setup
 #SBATCH --output=results/slurm-logs/%x.%j.out
 #SBATCH --error=results/slurm-logs/%x.%j.err
-#SBATCH --account=lp_h_opt_ga
+#SBATCH --account=lp_h_ai_streaming
 #SBATCH --cluster=wice
 #SBATCH --partition=gpu_a100
 #SBATCH --nodes=1

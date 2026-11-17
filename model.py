@@ -200,8 +200,9 @@ class GaussianSplatting2D(nn.Module):
             raise ValueError(f"Quantization parameter must be positive (or 0 to disable it) but got: {args.qp}")
         if args.quant_mode not in ["step", "none"]:
             raise ValueError("The quantization parameter requires quant_mode 'step' or 'none' (qp 0 disables it)")
-        if args.qp_overestimate <= 0.0 or args.qp_lambda_scale <= 0.0:
-            raise ValueError(f"Overestimation and lambda factors must be positive but got: {args.qp_overestimate}, {args.qp_lambda_scale}")
+        if args.qp_overestimate <= 0.0 or args.qp_lambda_scale < 0.0:
+            raise ValueError(f"Overestimation factor must be positive and lambda factor non-negative but got: {args.qp_overestimate}, "
+                             f"{args.qp_lambda_scale}")
         if args.qp_slope <= 0.0:
             raise ValueError(f"QP slope must be positive but got: {args.qp_slope}")
         if args.init_std_ref < 0.0:
